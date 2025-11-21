@@ -2,8 +2,12 @@
 """
 測試 Rust WebSocket 與 Python websockets 的 API 相容性
 """
+import sys
 import asyncio
 import time
+
+# Set stdout encoding to utf-8 for Windows compatibility
+sys.stdout.reconfigure(encoding='utf-8')
 
 import websockets
 from websocket_rs import WebSocket
