@@ -1,7 +1,7 @@
 [package]
 name = "websocket_rs"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 name = "websocket_rs"
