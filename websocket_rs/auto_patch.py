@@ -38,8 +38,7 @@ class WebSocketRSFinder(importlib.abc.MetaPathFinder):
     def _create_replacement_spec(self, fullname: str) -> ModuleSpec:
         """Create a module spec for our replacement."""
         loader = WebSocketRSLoader(fullname)
-        spec = ModuleSpec(fullname, loader, origin='websocket-rs-replacement')
-        return spec
+        return ModuleSpec(fullname, loader, origin='websocket-rs-replacement')
 
 
 class WebSocketRSLoader(importlib.abc.Loader):
