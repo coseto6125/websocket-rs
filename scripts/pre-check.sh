@@ -65,7 +65,7 @@ fi
 print_section "Rust Linting (cargo clippy)"
 
 # Allow certain warnings that are acceptable
-if cargo clippy -- -D warnings -A clippy::await-holding-lock -A clippy::redundant-closure 2>&1 | grep -q "error"; then
+if ! cargo clippy -- -D warnings -A clippy::await-holding-lock -A clippy::redundant-closure > /dev/null 2>&1; then
     echo -e "  ${RED}✗ Clippy found errors${NC}"
     echo -e "  ${YELLOW}  Run: cargo clippy -- -D warnings${NC}"
     FAILED=1
@@ -76,7 +76,7 @@ fi
 # 4. Check Rust compilation
 print_section "Rust Compilation Check"
 
-if cargo check --release 2>&1 | grep -q "error"; then
+if ! cargo check --release > /dev/null 2>&1; then
     echo -e "  ${RED}✗ Rust compilation failed${NC}"
     FAILED=1
 else
