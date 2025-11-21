@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream as TungsteniteWebSocketStream, connect_async,
@@ -38,7 +39,8 @@ fn get_runtime() -> &'static Runtime {
 #[pyclass]
 struct WebSocket {
     url: String,
-    stream: Arc<RwLock<Option<WebSocketStream>>>,
+    stream: Arc<AsyncMutex<Option<WebSocketStream>>>,
+    stream_sync: Arc<RwLock<bool>>, // 用於快速檢查連接狀態
     connect_timeout: f64,
     receive_timeout: f64,
 }
@@ -50,7 +52,8 @@ impl WebSocket {
     fn new(url: String, connect_timeout: Option<f64>, receive_timeout: Option<f64>) -> Self {
         WebSocket {
             url,
-            stream: Arc::new(RwLock::new(None)),
+            stream: Arc::new(AsyncMutex::new(None)),
+            stream_sync: Arc::new(RwLock::new(false)),
             connect_timeout: connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
         }
@@ -61,6 +64,7 @@ impl WebSocket {
         let url = self.url.clone();
         let connect_timeout = self.connect_timeout;
         let stream = self.stream.clone();
+        let stream_sync = self.stream_sync.clone();
 
         py.allow_threads(|| {
             let rt = get_runtime();
@@ -75,7 +79,10 @@ impl WebSocket {
 
             match result {
                 Ok(Ok((ws_stream, _))) => {
-                    *stream.write() = Some(ws_stream);
+                    rt.block_on(async {
+                        *stream.lock().await = Some(ws_stream);
+                    });
+                    *stream_sync.write() = true;
                     Ok(())
                 }
                 Ok(Err(e)) => Err(PyConnectionError::new_err(e.to_string())),
@@ -90,16 +97,18 @@ impl WebSocket {
     /// 關閉連接
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let stream = self.stream.clone();
+        let stream_sync = self.stream_sync.clone();
 
         py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
-                let mut guard = stream.write();
+                let mut guard = stream.lock().await;
                 if let Some(ref mut ws) = *guard {
                     let _ = ws.close(None).await;
                 }
                 *guard = None;
             });
+            *stream_sync.write() = false;
             Ok(())
         })
     }
@@ -138,16 +147,7 @@ impl WebSocket {
         py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
-                // 使用讀鎖檢查連接
-                {
-                    let guard = stream.read();
-                    if guard.is_none() {
-                        return Err(PyRuntimeError::new_err("WebSocket is not connected"));
-                    }
-                }
-
-                // 只在發送時使用寫鎖
-                let mut guard = stream.write();
+                let mut guard = stream.lock().await;
                 let ws = guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
@@ -167,7 +167,7 @@ impl WebSocket {
         let msg = py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
-                let mut guard = stream.write();
+                let mut guard = stream.lock().await;
                 let ws = guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
@@ -197,12 +197,12 @@ impl WebSocket {
     /// 批量發送 - 擴展 API
     fn send_batch(&self, py: Python<'_>, messages: Vec<String>) -> PyResult<()> {
         let stream = self.stream.clone();
-        let msgs: Vec<Message> = messages.into_iter().map(|s| Message::Text(s)).collect();
+        let msgs: Vec<Message> = messages.into_iter().map(Message::Text).collect();
 
         py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
-                let mut guard = stream.write();
+                let mut guard = stream.lock().await;
                 let ws = guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
@@ -225,7 +225,7 @@ impl WebSocket {
         let messages = py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
-                let mut guard = stream.write();
+                let mut guard = stream.lock().await;
                 let ws = guard
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
@@ -258,7 +258,7 @@ impl WebSocket {
     /// 檢查連接狀態
     #[getter]
     fn is_connected(&self) -> bool {
-        self.stream.read().is_some()
+        *self.stream_sync.read()
     }
 
     /// Context manager 支援 - 進入
@@ -268,6 +268,7 @@ impl WebSocket {
     }
 
     /// Context manager 支援 - 退出
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
         &self,
         py: Python<'_>,
