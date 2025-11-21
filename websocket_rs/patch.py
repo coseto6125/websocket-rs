@@ -240,9 +240,7 @@ def patch_all(include_async=False, force=False):
 
     _patched = True
 
-    # Log results
-    patched_libs = [lib for lib, success in results.items() if success]
-    if patched_libs:
+    if patched_libs := [lib for lib, success in results.items() if success]:
         print(f"✅ Patched: {', '.join(patched_libs)}")
 
     return results
