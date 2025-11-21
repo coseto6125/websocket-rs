@@ -31,17 +31,22 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/Cargo.toml
 
-      - name: Install maturin with uv
+      - name: Set up Python with uv
         run: |
-          uv venv
-          source .venv/bin/activate || . .venv/Scripts/activate
+          uv python install ${{ matrix.python-version }}
+          uv venv --python ${{ matrix.python-version }}
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
           uv pip install maturin
 
       - name: Build wheels
-        run: |
-          source .venv/bin/activate || . .venv/Scripts/activate
-          maturin build --release --out dist
+        run: maturin build --release --out dist
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4

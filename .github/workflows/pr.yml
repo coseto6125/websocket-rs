@@ -50,22 +50,25 @@ jobs:
         uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
-          cache-dependency-glob: "pyproject.toml"
+          cache-dependency-glob: |
+            **/pyproject.toml
+            **/Cargo.toml
+
+      - name: Set up Python with uv
+        run: |
+          uv python install ${{ matrix.python-version }}
+          uv venv --python ${{ matrix.python-version }}
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
 
       - name: Install dependencies with uv
-        run: |
-          uv venv
-          source .venv/bin/activate || . .venv/Scripts/activate
-          uv pip install maturin pytest websockets
+        run: uv pip install maturin pytest websockets
 
       - name: Build
-        run: |
-          source .venv/bin/activate || . .venv/Scripts/activate
-          maturin develop --release
+        run: maturin develop --release
 
       - name: Run tests
         run: |
-          source .venv/bin/activate || . .venv/Scripts/activate
           python tests/test_compatibility.py
           python tests/test_monkeypatch.py
 
@@ -85,17 +88,19 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
 
-      - name: Install maturin
+      - name: Set up build environment
         run: |
-          uv venv
-          source .venv/bin/activate
+          uv python install 3.12
+          uv venv --python 3.12
+          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
+          echo "$PWD/.venv/bin" >> $GITHUB_PATH
           uv pip install maturin
 
       - name: Build wheel
-        run: |
-          source .venv/bin/activate
-          maturin build --release
+        run: maturin build --release
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
