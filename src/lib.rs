@@ -1,16 +1,19 @@
 #![allow(non_local_definitions)]
 
 use futures::prelude::*;
+use parking_lot::RwLock;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::RwLock;
 use tokio::runtime::Runtime;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream as TungsteniteWebSocketStream};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream as TungsteniteWebSocketStream, connect_async,
+    tungstenite::Message,
+};
 
 const DEFAULT_CONNECT_TIMEOUT: f64 = 30.0;
 const DEFAULT_RECEIVE_TIMEOUT: f64 = 30.0;
@@ -44,11 +47,7 @@ struct WebSocket {
 impl WebSocket {
     #[new]
     #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None))]
-    fn new(
-        url: String,
-        connect_timeout: Option<f64>,
-        receive_timeout: Option<f64>,
-    ) -> Self {
+    fn new(url: String, connect_timeout: Option<f64>, receive_timeout: Option<f64>) -> Self {
         WebSocket {
             url,
             stream: Arc::new(RwLock::new(None)),
@@ -69,8 +68,9 @@ impl WebSocket {
             let result = rt.block_on(async {
                 timeout(
                     Duration::from_secs_f64(connect_timeout),
-                    connect_async(&url)
-                ).await
+                    connect_async(&url),
+                )
+                .await
             });
 
             match result {
@@ -79,7 +79,10 @@ impl WebSocket {
                     Ok(())
                 }
                 Ok(Err(e)) => Err(PyConnectionError::new_err(e.to_string())),
-                Err(_) => Err(PyTimeoutError::new_err(format!("Connection timed out ({} seconds)", connect_timeout))),
+                Err(_) => Err(PyTimeoutError::new_err(format!(
+                    "Connection timed out ({} seconds)",
+                    connect_timeout
+                ))),
             }
         })
     }
@@ -145,10 +148,12 @@ impl WebSocket {
 
                 // 只在發送時使用寫鎖
                 let mut guard = stream.write();
-                let ws = guard.as_mut()
+                let ws = guard
+                    .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
-                ws.send(msg).await
+                ws.send(msg)
+                    .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Send failed: {}", e)))
             })
         })
@@ -163,12 +168,18 @@ impl WebSocket {
             let rt = get_runtime();
             rt.block_on(async {
                 let mut guard = stream.write();
-                let ws = guard.as_mut()
+                let ws = guard
+                    .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
                 timeout(Duration::from_secs_f64(receive_timeout), ws.next())
                     .await
-                    .map_err(|_| PyTimeoutError::new_err(format!("Receive timed out ({} seconds)", receive_timeout)))?
+                    .map_err(|_| {
+                        PyTimeoutError::new_err(format!(
+                            "Receive timed out ({} seconds)",
+                            receive_timeout
+                        ))
+                    })?
                     .ok_or_else(|| PyRuntimeError::new_err("Connection closed"))?
                     .map_err(|e| PyRuntimeError::new_err(format!("Receive failed: {}", e)))
             })
@@ -186,19 +197,19 @@ impl WebSocket {
     /// 批量發送 - 擴展 API
     fn send_batch(&self, py: Python<'_>, messages: Vec<String>) -> PyResult<()> {
         let stream = self.stream.clone();
-        let msgs: Vec<Message> = messages.into_iter()
-            .map(|s| Message::Text(s))
-            .collect();
+        let msgs: Vec<Message> = messages.into_iter().map(|s| Message::Text(s)).collect();
 
         py.allow_threads(|| {
             let rt = get_runtime();
             rt.block_on(async {
                 let mut guard = stream.write();
-                let ws = guard.as_mut()
+                let ws = guard
+                    .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
                 for msg in msgs {
-                    ws.send(msg).await
+                    ws.send(msg)
+                        .await
                         .map_err(|e| PyRuntimeError::new_err(format!("Send failed: {}", e)))?;
                 }
                 Ok(())
@@ -215,14 +226,17 @@ impl WebSocket {
             let rt = get_runtime();
             rt.block_on(async {
                 let mut guard = stream.write();
-                let ws = guard.as_mut()
+                let ws = guard
+                    .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
                 let mut results = Vec::with_capacity(count);
                 for _ in 0..count {
                     match timeout(Duration::from_secs_f64(receive_timeout), ws.next()).await {
                         Ok(Some(Ok(msg))) => results.push(msg),
-                        Ok(Some(Err(e))) => return Err(PyRuntimeError::new_err(format!("Receive failed: {}", e))),
+                        Ok(Some(Err(e))) => {
+                            return Err(PyRuntimeError::new_err(format!("Receive failed: {}", e)));
+                        }
                         Ok(None) => break,
                         Err(_) => break,
                     }
@@ -231,13 +245,14 @@ impl WebSocket {
             })
         })?;
 
-        Ok(messages.into_iter().filter_map(|msg| {
-            match msg {
+        Ok(messages
+            .into_iter()
+            .filter_map(|msg| match msg {
                 Message::Text(text) => Some(text.to_object(py)),
                 Message::Binary(data) => Some(PyBytes::new_bound(py, &data).to_object(py)),
                 _ => None,
-            }
-        }).collect())
+            })
+            .collect())
     }
 
     /// 檢查連接狀態
@@ -253,7 +268,13 @@ impl WebSocket {
     }
 
     /// Context manager 支援 - 退出
-    fn __exit__(&self, py: Python<'_>, _exc_type: Option<&Bound<'_, PyAny>>, _exc_value: Option<&Bound<'_, PyAny>>, _traceback: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
         self.close(py)?;
         Ok(false)
     }
@@ -266,7 +287,13 @@ impl WebSocket {
 
     /// Async context manager 支援 - 退出
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
-    fn __aexit__(&self, py: Python<'_>, _exc_type: Option<&Bound<'_, PyAny>>, _exc_value: Option<&Bound<'_, PyAny>>, _traceback: Option<&Bound<'_, PyAny>>) -> PyResult<bool> {
+    fn __aexit__(
+        &self,
+        py: Python<'_>,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc_value: Option<&Bound<'_, PyAny>>,
+        _traceback: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
         self.close(py)?;
         Ok(false)
     }
