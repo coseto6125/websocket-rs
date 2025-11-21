@@ -41,12 +41,11 @@ jobs:
         run: |
           uv python install ${{ matrix.python-version }}
           uv venv --python ${{ matrix.python-version }}
-          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
-          echo "$PWD/.venv/bin" >> $GITHUB_PATH
-          uv pip install maturin
 
       - name: Build wheels
-        run: maturin build --release --out dist
+        run: |
+          uv pip install maturin
+          uv run maturin build --release --out dist
 
       - name: Upload wheels
         uses: actions/upload-artifact@v4
