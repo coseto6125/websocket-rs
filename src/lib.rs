@@ -1,4 +1,5 @@
 #![allow(non_local_definitions)]
+#![allow(clippy::useless_conversion)]
 
 use futures::prelude::*;
 use parking_lot::RwLock;
@@ -12,8 +13,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream as TungsteniteWebSocketStream, connect_async,
-    tungstenite::Message,
+    connect_async, tungstenite::Message, MaybeTlsStream,
+    WebSocketStream as TungsteniteWebSocketStream,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: f64 = 30.0;
