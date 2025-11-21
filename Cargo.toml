@@ -1,6 +1,6 @@
 [package]
 name = "websocket_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -8,15 +8,16 @@ name = "websocket_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.20", features = ["extension-module", "abi3-py37"] }
-pyo3-asyncio = { version = "0.20", features = ["attributes", "tokio-runtime"] }
-tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
-tokio = { version = "1.32", features = ["full"] }
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py312"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-url = "2.4"
-async-trait = "0.1"
-native-tls = "0.2"
-tungstenite = "0.13"
+parking_lot = "0.12"
 
 [lints.rust]
 non_local_definitions = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
