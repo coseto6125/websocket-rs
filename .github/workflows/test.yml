@@ -40,11 +40,16 @@ jobs:
             **/Cargo.toml
 
       - name: Set up Python with uv
+        shell: bash
         run: |
           uv python install ${{ matrix.python-version }}
           uv venv --python ${{ matrix.python-version }}
           echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
-          echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          if [ "$RUNNER_OS" == "Windows" ]; then
+            echo "$PWD/.venv/Scripts" >> $GITHUB_PATH
+          else
+            echo "$PWD/.venv/bin" >> $GITHUB_PATH
+          fi
 
       - name: Install dependencies with uv
         run: uv pip install maturin pytest websockets
