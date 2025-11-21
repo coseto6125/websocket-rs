@@ -40,25 +40,18 @@ jobs:
             **/Cargo.toml
 
       - name: Set up Python with uv
-        shell: bash
         run: |
           uv python install ${{ matrix.python-version }}
           uv venv --python ${{ matrix.python-version }}
-          echo "VIRTUAL_ENV=$PWD/.venv" >> $GITHUB_ENV
-          if [ "$RUNNER_OS" == "Windows" ]; then
-            echo "$PWD/.venv/Scripts" >> $GITHUB_PATH
-          else
-            echo "$PWD/.venv/bin" >> $GITHUB_PATH
-          fi
 
       - name: Install dependencies with uv
         run: uv pip install maturin pytest websockets
 
       - name: Build
-        run: maturin develop --release
+        run: uv run maturin develop --release
 
       - name: Run tests
-        run: python tests/test_compatibility.py
+        run: uv run python tests/test_compatibility.py
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
