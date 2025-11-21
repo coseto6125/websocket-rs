@@ -4,24 +4,22 @@ build-backend = "maturin"
 
 [project]
 name = "websocket-rs"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-performance WebSocket client library for Python using Rust"
 readme = "README.md"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
 license = {text = "MIT"}
-requires-python = ">=3.7"
+requires-python = ">=3.12"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.7",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -31,13 +29,25 @@ classifiers = [
 keywords = ["websocket", "rust", "async", "high-performance", "client"]
 
 [project.urls]
-"Homepage" = "https://github.com/yourusername/websocket-rs"
-"Bug Tracker" = "https://github.com/yourusername/websocket-rs/issues"
-"Documentation" = "https://github.com/yourusername/websocket-rs#readme"
-"Source Code" = "https://github.com/yourusername/websocket-rs"
+"Homepage" = "https://github.com/coseto6125/websocket-rs"
+"Bug Tracker" = "https://github.com/coseto6125/websocket-rs/issues"
+"Documentation" = "https://github.com/coseto6125/websocket-rs#readme"
+"Source Code" = "https://github.com/coseto6125/websocket-rs"
+
+[project.optional-dependencies]
+dev = [
+    "maturin>=1.0",
+    "pytest>=7.0",
+    "websockets>=12.0",
+    "ruff>=0.1.0",
+]
+test = [
+    "pytest>=7.0",
+    "websockets>=12.0",
+]
 
 [tool.maturin]
-python-source = "python"
+python-source = "."
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
@@ -45,3 +55,30 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v"
+
+[tool.uv]
+dev-dependencies = [
+    "maturin>=1.0",
+    "pytest>=7.0",
+    "websockets>=12.0",
+    "ruff>=0.1.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "B",  # flake8-bugbear
+    "C4", # flake8-comprehensions
+    "UP", # pyupgrade
+]
+ignore = [
+    "E501", # line too long
+    "B008", # do not perform function calls in argument defaults
+]
