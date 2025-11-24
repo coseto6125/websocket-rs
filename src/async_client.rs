@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError};
 use pyo3::prelude::*;
@@ -7,6 +8,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
@@ -620,10 +622,10 @@ impl AsyncClientConnection {
                                                 // 處理第一個命令
                                                 let mut close_requested = false;
                                                 match cmd {
-                                                    Command::Text(t) => { let _ = sink.send(Message::Text(t)).await; }
-                                                    Command::Binary(b) => { let _ = sink.send(Message::Binary(b)).await; }
-                                                    Command::Ping(d) => { let _ = sink.send(Message::Ping(d)).await; }
-                                                    Command::Pong(d) => { let _ = sink.send(Message::Pong(d)).await; }
+                                                    Command::Text(t) => { let _ = sink.send(Message::Text(Utf8Bytes::from(t))).await; }
+                                                    Command::Binary(b) => { let _ = sink.send(Message::Binary(Bytes::from(b))).await; }
+                                                    Command::Ping(d) => { let _ = sink.send(Message::Ping(Bytes::from(d))).await; }
+                                                    Command::Pong(d) => { let _ = sink.send(Message::Pong(Bytes::from(d))).await; }
                                                     Command::Close => {
                                                         let _ = sink.close().await;
                                                         close_requested = true;

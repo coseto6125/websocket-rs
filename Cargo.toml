@@ -17,13 +17,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py312"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 futures-util = "0.3"
 parking_lot = "0.12"
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 flume = "0.11"
+bytes = "1.11.0"
 
 [lints.rust]
 non_local_definitions = "allow"

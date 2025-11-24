@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
@@ -5,6 +6,7 @@ use pyo3::types::{PyBytes, PyString};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream};
 
 use crate::{
@@ -109,9 +111,9 @@ impl SyncClientConnection {
     fn send<'py>(&self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
             let text = s.to_string_lossy().to_string();
-            Message::Text(text)
+            Message::Text(Utf8Bytes::from(text))
         } else if let Ok(b) = message.cast::<PyBytes>() {
-            Message::Binary(b.as_bytes().to_vec())
+            Message::Binary(Bytes::copy_from_slice(b.as_bytes()))
         } else {
             return Err(PyRuntimeError::new_err("Message must be string or bytes"));
         };
@@ -233,7 +235,7 @@ impl SyncClientConnection {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
-                ws.send(Message::Ping(data))
+                ws.send(Message::Ping(Bytes::from(data)))
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Ping failed: {}", e)))
             })
@@ -253,7 +255,7 @@ impl SyncClientConnection {
                     .as_mut()
                     .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
-                ws.send(Message::Pong(data))
+                ws.send(Message::Pong(Bytes::from(data)))
                     .await
                     .map_err(|e| PyRuntimeError::new_err(format!("Pong failed: {}", e)))
             })
