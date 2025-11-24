@@ -4,11 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "websocket-rs"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance WebSocket client library for Python using Rust"
 readme = "README.md"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "coseto6125", email = "enorenor@gmail.com"}
 ]
 license = {text = "MIT"}
 requires-python = ">=3.12"
@@ -27,12 +27,15 @@ classifiers = [
     "Topic :: Communications",
 ]
 keywords = ["websocket", "rust", "async", "high-performance", "client"]
+dependencies = []
 
 [project.urls]
 "Homepage" = "https://github.com/coseto6125/websocket-rs"
-"Bug Tracker" = "https://github.com/coseto6125/websocket-rs/issues"
-"Documentation" = "https://github.com/coseto6125/websocket-rs#readme"
+"Documentation" = "https://github.com/coseto6125/websocket-rs/blob/main/API.md"
+"API Reference" = "https://github.com/coseto6125/websocket-rs/blob/main/API.md"
 "Source Code" = "https://github.com/coseto6125/websocket-rs"
+"Bug Tracker" = "https://github.com/coseto6125/websocket-rs/issues"
+"Changelog" = "https://github.com/coseto6125/websocket-rs/releases"
 
 [project.optional-dependencies]
 dev = [
@@ -44,6 +47,12 @@ dev = [
 test = [
     "pytest>=7.0",
     "websockets>=12.0",
+]
+benchmark = [
+    "uvloop>=0.22.1",
+    "websockets>=12.0",
+    "websocket-client>=1.9.0",
+    "picows>=0.3.0",
 ]
 
 [tool.maturin]
@@ -81,4 +90,10 @@ select = [
 ignore = [
     "E501", # line too long
     "B008", # do not perform function calls in argument defaults
+]
+
+[dependency-groups]
+dev = [
+    "websocket",
+    "uvloop>=0.22.1",
 ]
