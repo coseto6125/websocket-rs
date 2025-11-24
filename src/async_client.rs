@@ -1,14 +1,14 @@
+use futures_util::{SinkExt, StreamExt};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyStopAsyncIteration, PyConnectionError};
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
-use tokio_tungstenite::tungstenite::Message;
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
-use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
-use std::sync::OnceLock;
 
 use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
 
@@ -25,17 +25,30 @@ fn get_asyncio(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     Ok(module)
 }
 
-fn create_sys_future<'py>(_py: Python<'py>, loop_obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+fn create_sys_future<'py>(
+    _py: Python<'py>,
+    loop_obj: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
     loop_obj.call_method0("create_future")
 }
 
-fn set_future_result<'py>(_py: Python<'py>, loop_obj: &Bound<'py, PyAny>, future: &Bound<'py, PyAny>, result: Py<PyAny>) -> PyResult<()> {
+fn set_future_result<'py>(
+    _py: Python<'py>,
+    loop_obj: &Bound<'py, PyAny>,
+    future: &Bound<'py, PyAny>,
+    result: Py<PyAny>,
+) -> PyResult<()> {
     let set_result = future.getattr("set_result")?;
     loop_obj.call_method1("call_soon_threadsafe", (set_result, result))?;
     Ok(())
 }
 
-fn set_future_exception(_py: Python<'_>, loop_obj: &Bound<'_, PyAny>, future: &Bound<'_, PyAny>, exc: PyErr) -> PyResult<()> {
+fn set_future_exception(
+    _py: Python<'_>,
+    loop_obj: &Bound<'_, PyAny>,
+    future: &Bound<'_, PyAny>,
+    exc: PyErr,
+) -> PyResult<()> {
     let set_exception = future.getattr("set_exception")?;
     loop_obj.call_method1("call_soon_threadsafe", (set_exception, exc))?;
     Ok(())
@@ -58,14 +71,17 @@ fn create_failed_future<'py>(py: Python<'py>, exc: PyErr) -> PyResult<Bound<'py,
 }
 
 // Optimized version: Create a completed future with minimal overhead
-fn create_completed_future_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<Bound<'py, PyAny>> {
+fn create_completed_future_fast<'py>(
+    py: Python<'py>,
+    result: impl IntoPyObject<'py>,
+) -> PyResult<Bound<'py, PyAny>> {
     let asyncio = get_asyncio(py)?;
-    let future = asyncio.call_method0("get_event_loop")?.call_method0("create_future")?;
+    let future = asyncio
+        .call_method0("get_event_loop")?
+        .call_method0("create_future")?;
     future.call_method1("set_result", (result,))?;
     Ok(future)
 }
-
-
 
 /// Commands sent to the background actor
 #[derive(Debug)]
@@ -117,10 +133,17 @@ impl AsyncClientConnection {
     }
 
     /// Send a message (async)
-    fn send<'py>(&self, py: Python<'py>, message: Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        let tx_cloned = self.tx_cmd.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?.clone();
-        
+    fn send<'py>(
+        &self,
+        py: Python<'py>,
+        message: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let tx_cloned = self
+            .tx_cmd
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
+            .clone();
+
         let command = if let Ok(text) = message.extract::<String>() {
             Command::Text(text)
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
@@ -128,7 +151,7 @@ impl AsyncClientConnection {
         } else {
             return Err(PyRuntimeError::new_err("Message must be str or bytes"));
         };
-            // Optimistic Send: Try to send synchronously first
+        // Optimistic Send: Try to send synchronously first
         match tx_cloned.try_send(command) {
             Ok(_) => {
                 // Fast path: Use optimized future creation
@@ -154,7 +177,12 @@ impl AsyncClientConnection {
                             if res.is_ok() {
                                 let _ = set_future_result(py, loop_obj, future, py.None());
                             } else {
-                                let _ = set_future_exception(py, loop_obj, future, PyRuntimeError::new_err("Failed to send message (actor died)"));
+                                let _ = set_future_exception(
+                                    py,
+                                    loop_obj,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send message (actor died)"),
+                                );
                             }
                         });
                     });
@@ -170,8 +198,11 @@ impl AsyncClientConnection {
 
     /// Receive a message (async)
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let message_rx_arc = self.rx_msg_internal.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?.clone();
+        let message_rx_arc = self
+            .rx_msg_internal
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
+            .clone();
         let receive_timeout = self.receive_timeout;
         let close_code = self.close_code.clone();
         let close_reason = self.close_reason.clone();
@@ -189,7 +220,7 @@ impl AsyncClientConnection {
                                 Ok(())
                             })?;
                             Ok(bytes.into_any().unbind())
-                        },
+                        }
                         Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()),
                         Ok(Message::Close(c)) => {
                             if let Some(frame) = c {
@@ -197,7 +228,7 @@ impl AsyncClientConnection {
                                 *close_reason.write().unwrap() = Some(frame.reason.to_string());
                             }
                             Err(PyRuntimeError::new_err("Connection closed by server"))
-                        },
+                        }
                         Ok(_) => Err(PyRuntimeError::new_err("Received unsupported message type")),
                         Err(e) => Err(PyRuntimeError::new_err(format!("Receive failed: {}", e))),
                     };
@@ -233,8 +264,7 @@ impl AsyncClientConnection {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let mut rx = message_rx_arc.lock().await;
 
-                let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv())
-                    .await;
+                let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv()).await;
 
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
@@ -243,36 +273,61 @@ impl AsyncClientConnection {
                     match msg_result {
                         Ok(Some(msg)) => {
                             let result = match msg {
-                                Ok(Message::Text(text)) => Ok(text.into_pyobject(py).unwrap().into_any().unbind()),
+                                Ok(Message::Text(text)) => {
+                                    Ok(text.into_pyobject(py).unwrap().into_any().unbind())
+                                }
                                 Ok(Message::Binary(data)) => {
                                     let bytes = PyBytes::new_with(py, data.len(), |b| {
                                         b.copy_from_slice(&data);
                                         Ok(())
-                                    }).unwrap();
+                                    })
+                                    .unwrap();
                                     Ok(bytes.into_any().unbind())
-                                },
+                                }
                                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()),
                                 Ok(Message::Close(c)) => {
                                     if let Some(frame) = c {
                                         *close_code.write().unwrap() = Some(frame.code.into());
-                                        *close_reason.write().unwrap() = Some(frame.reason.to_string());
+                                        *close_reason.write().unwrap() =
+                                            Some(frame.reason.to_string());
                                     }
                                     Err(PyRuntimeError::new_err("Connection closed by server"))
-                                },
-                                Ok(_) => Err(PyRuntimeError::new_err("Received unsupported message type")),
-                                Err(e) => Err(PyRuntimeError::new_err(format!("Receive failed: {}", e))),
+                                }
+                                Ok(_) => Err(PyRuntimeError::new_err(
+                                    "Received unsupported message type",
+                                )),
+                                Err(e) => {
+                                    Err(PyRuntimeError::new_err(format!("Receive failed: {}", e)))
+                                }
                             };
 
                             match result {
-                                Ok(val) => { let _ = set_future_result(py, loop_obj, future, val); },
-                                Err(e) => { let _ = set_future_exception(py, loop_obj, future, e); }
+                                Ok(val) => {
+                                    let _ = set_future_result(py, loop_obj, future, val);
+                                }
+                                Err(e) => {
+                                    let _ = set_future_exception(py, loop_obj, future, e);
+                                }
                             }
-                        },
+                        }
                         Ok(None) => {
-                            let _ = set_future_exception(py, loop_obj, future, PyRuntimeError::new_err("Connection closed"));
-                        },
+                            let _ = set_future_exception(
+                                py,
+                                loop_obj,
+                                future,
+                                PyRuntimeError::new_err("Connection closed"),
+                            );
+                        }
                         Err(_) => {
-                            let _ = set_future_exception(py, loop_obj, future, PyTimeoutError::new_err(format!("Receive timed out ({} seconds)", receive_timeout)));
+                            let _ = set_future_exception(
+                                py,
+                                loop_obj,
+                                future,
+                                PyTimeoutError::new_err(format!(
+                                    "Receive timed out ({} seconds)",
+                                    receive_timeout
+                                )),
+                            );
                         }
                     }
                 });
@@ -287,7 +342,7 @@ impl AsyncClientConnection {
         let asyncio = get_asyncio(py)?;
         let loop_obj = asyncio.call_method0("get_event_loop")?;
         let future = create_sys_future(py, &loop_obj)?;
-        
+
         let future_ptr = future.clone().unbind();
         let loop_ptr = loop_obj.unbind();
 
@@ -318,14 +373,14 @@ impl AsyncClientConnection {
                 // 2. Wait for actor to close (if rx exists)
                 if let Some(rx_arc) = rx_arc_option {
                     let mut rx = rx_arc.lock().await;
-                        while let Some(msg) = rx.recv().await {
-                            match msg {
-                                Ok(Message::Close(_)) => break,
-                                Ok(_) => continue,
-                                Err(_) => break,
-                            }
+                    while let Some(msg) = rx.recv().await {
+                        match msg {
+                            Ok(Message::Close(_)) => break,
+                            Ok(_) => continue,
+                            Err(_) => break,
                         }
                     }
+                }
 
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
@@ -334,14 +389,17 @@ impl AsyncClientConnection {
                 });
             });
         });
-        
+
         Ok(future)
     }
 
     /// Ping (async)
     fn ping<'py>(&self, py: Python<'py>, data: Option<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
-        let tx_cloned = self.tx_cmd.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?.clone();
+        let tx_cloned = self
+            .tx_cmd
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
+            .clone();
         let data = data.unwrap_or_default();
 
         // Optimistic Send
@@ -368,7 +426,12 @@ impl AsyncClientConnection {
                             if res.is_ok() {
                                 let _ = set_future_result(py, loop_obj, future, py.None());
                             } else {
-                                let _ = set_future_exception(py, loop_obj, future, PyRuntimeError::new_err("Failed to send ping"));
+                                let _ = set_future_exception(
+                                    py,
+                                    loop_obj,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send ping"),
+                                );
                             }
                         });
                     });
@@ -384,8 +447,11 @@ impl AsyncClientConnection {
 
     /// Pong (async)
     fn pong<'py>(&self, py: Python<'py>, data: Option<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
-        let tx_cloned = self.tx_cmd.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?.clone();
+        let tx_cloned = self
+            .tx_cmd
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
+            .clone();
         let data = data.unwrap_or_default();
 
         // Optimistic Send
@@ -412,7 +478,12 @@ impl AsyncClientConnection {
                             if res.is_ok() {
                                 let _ = set_future_result(py, loop_obj, future, py.None());
                             } else {
-                                let _ = set_future_exception(py, loop_obj, future, PyRuntimeError::new_err("Failed to send pong"));
+                                let _ = set_future_exception(
+                                    py,
+                                    loop_obj,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send pong"),
+                                );
                             }
                         });
                     });
@@ -440,18 +511,16 @@ impl AsyncClientConnection {
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
         self.local_addr.read().unwrap().as_ref().and_then(|s| {
-            s.rsplit_once(':').and_then(|(ip, port)| {
-                port.parse().ok().map(|p| (ip.to_string(), p))
-            })
+            s.rsplit_once(':')
+                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
 
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
         self.remote_addr.read().unwrap().as_ref().and_then(|s| {
-            s.rsplit_once(':').and_then(|(ip, port)| {
-                port.parse().ok().map(|p| (ip.to_string(), p))
-            })
+            s.rsplit_once(':')
+                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
 
@@ -486,7 +555,7 @@ impl AsyncClientConnection {
         let asyncio = get_asyncio(py)?;
         let loop_obj = asyncio.call_method0("get_event_loop")?;
         let future = create_sys_future(py, &loop_obj)?;
-        
+
         let future_ptr = future.clone().unbind();
         let loop_ptr = loop_obj.unbind();
         let slf_ptr = slf.clone_ref(py);
@@ -616,7 +685,7 @@ impl AsyncClientConnection {
                 }
             });
         });
-        
+
         Ok(future)
     }
 
@@ -639,8 +708,11 @@ impl AsyncClientConnection {
 
     /// Async Iterator support - return next message
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let message_rx_arc = self.rx_msg_internal.as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?.clone();
+        let message_rx_arc = self
+            .rx_msg_internal
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
+            .clone();
         let receive_timeout = self.receive_timeout;
         let close_code = self.close_code.clone();
         let close_reason = self.close_reason.clone();
@@ -648,7 +720,7 @@ impl AsyncClientConnection {
         let asyncio = get_asyncio(py)?;
         let loop_obj = asyncio.call_method0("get_event_loop")?;
         let future = create_sys_future(py, &loop_obj)?;
-        
+
         let future_ptr = future.clone().unbind();
         let loop_ptr = loop_obj.unbind();
 
@@ -656,8 +728,7 @@ impl AsyncClientConnection {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let mut rx = message_rx_arc.lock().await;
 
-                let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv())
-                    .await;
+                let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv()).await;
 
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
@@ -666,36 +737,63 @@ impl AsyncClientConnection {
                     match msg_result {
                         Ok(Some(msg)) => {
                             let result = match msg {
-                                Ok(Message::Text(text)) => Ok(text.into_pyobject(py).unwrap().into_any().unbind()),
+                                Ok(Message::Text(text)) => {
+                                    Ok(text.into_pyobject(py).unwrap().into_any().unbind())
+                                }
                                 Ok(Message::Binary(data)) => {
                                     let bytes = PyBytes::new_with(py, data.len(), |b| {
                                         b.copy_from_slice(&data);
                                         Ok(())
-                                    }).unwrap();
+                                    })
+                                    .unwrap();
                                     Ok(bytes.into_any().unbind())
-                                },
+                                }
                                 Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()), // Should ideally skip these
                                 Ok(Message::Close(c)) => {
                                     if let Some(frame) = c {
                                         *close_code.write().unwrap() = Some(frame.code.into());
-                                        *close_reason.write().unwrap() = Some(frame.reason.to_string());
+                                        *close_reason.write().unwrap() =
+                                            Some(frame.reason.to_string());
                                     }
-                                    Err(PyStopAsyncIteration::new_err("Connection closed by server"))
-                                },
-                                Ok(_) => Err(PyRuntimeError::new_err("Received unsupported message type")),
-                                Err(e) => Err(PyRuntimeError::new_err(format!("Receive failed: {}", e))),
+                                    Err(PyStopAsyncIteration::new_err(
+                                        "Connection closed by server",
+                                    ))
+                                }
+                                Ok(_) => Err(PyRuntimeError::new_err(
+                                    "Received unsupported message type",
+                                )),
+                                Err(e) => {
+                                    Err(PyRuntimeError::new_err(format!("Receive failed: {}", e)))
+                                }
                             };
 
                             match result {
-                                Ok(val) => { let _ = set_future_result(py, loop_obj, future, val); },
-                                Err(e) => { let _ = set_future_exception(py, loop_obj, future, e); }
+                                Ok(val) => {
+                                    let _ = set_future_result(py, loop_obj, future, val);
+                                }
+                                Err(e) => {
+                                    let _ = set_future_exception(py, loop_obj, future, e);
+                                }
                             }
-                        },
+                        }
                         Ok(None) => {
-                            let _ = set_future_exception(py, loop_obj, future, PyStopAsyncIteration::new_err("Connection closed"));
-                        },
+                            let _ = set_future_exception(
+                                py,
+                                loop_obj,
+                                future,
+                                PyStopAsyncIteration::new_err("Connection closed"),
+                            );
+                        }
                         Err(_) => {
-                            let _ = set_future_exception(py, loop_obj, future, PyTimeoutError::new_err(format!("Receive timed out ({} seconds)", receive_timeout)));
+                            let _ = set_future_exception(
+                                py,
+                                loop_obj,
+                                future,
+                                PyTimeoutError::new_err(format!(
+                                    "Receive timed out ({} seconds)",
+                                    receive_timeout
+                                )),
+                            );
                         }
                     }
                 });
@@ -709,21 +807,25 @@ impl AsyncClientConnection {
 /// Connect to a WebSocket server (async)
 #[pyfunction]
 #[pyo3(signature = (uri, **_kwargs))]
-pub fn connect<'py>(py: Python<'py>, uri: String, _kwargs: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, PyAny>> {
+pub fn connect<'py>(
+    py: Python<'py>,
+    uri: String,
+    _kwargs: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
     let ws = AsyncClientConnection::new(uri, None, None);
     let ws_cell = Py::new(py, ws)?;
-    
+
     // Call __aenter__ to connect
     AsyncClientConnection::__aenter__(ws_cell, py)
 }
 
 pub fn register_async_client(py: Python<'_>, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let async_client_module = PyModule::new(py, "async_client")?;
-    
+
     async_client_module.add_class::<AsyncClientConnection>()?;
     async_client_module.add_function(wrap_pyfunction!(connect, &async_client_module)?)?;
-    
+
     parent_module.add_submodule(&async_client_module)?;
-    
+
     Ok(())
 }

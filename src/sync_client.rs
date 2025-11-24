@@ -1,13 +1,15 @@
+use futures_util::{SinkExt, StreamExt};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyConnectionError};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream};
-use futures_util::{SinkExt, StreamExt};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::time::timeout;
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream};
 
-use crate::{get_runtime, AsyncMutex, WebSocketStream, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
+use crate::{
+    get_runtime, AsyncMutex, WebSocketStream, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT,
+};
 
 /// Sync client connection
 #[pyclass(name = "ClientConnection", module = "websocket_rs.sync.client")]
@@ -87,7 +89,7 @@ impl SyncClientConnection {
                         }
                         _ => {}
                     }
-                    
+
                     rt.block_on(async {
                         *stream.lock().await = Some(ws_stream);
                     });
@@ -162,30 +164,34 @@ impl SyncClientConnection {
                             return Python::attach(|py| {
                                 Ok(PyString::new(py, &text).into_any().unbind())
                             });
-                        },
+                        }
                         Message::Binary(data) => {
                             return Python::attach(|py| {
                                 let bytes = PyBytes::new_with(py, data.len(), |b| {
                                     b.copy_from_slice(&data);
                                     Ok(())
-                                }).unwrap();
+                                })
+                                .unwrap();
                                 Ok(bytes.into_any().unbind())
                             });
-                        },
+                        }
                         Message::Ping(_) | Message::Pong(_) => {
                             // Skip Ping/Pong and continue loop
                             continue;
-                        },
+                        }
                         Message::Close(c) => {
                             if let Some(frame) = c {
                                 *self.close_code.write().unwrap() = Some(frame.code.into());
-                                *self.close_reason.write().unwrap() = Some(frame.reason.to_string());
+                                *self.close_reason.write().unwrap() =
+                                    Some(frame.reason.to_string());
                             }
                             return Err(PyRuntimeError::new_err("Connection closed by server"));
-                        },
+                        }
                         _ => {
-                            return Err(PyRuntimeError::new_err("Received unsupported message type"));
-                        },
+                            return Err(PyRuntimeError::new_err(
+                                "Received unsupported message type",
+                            ));
+                        }
                     }
                 }
             })
@@ -270,9 +276,8 @@ impl SyncClientConnection {
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
         self.local_addr.read().unwrap().as_ref().and_then(|s| {
-            s.rsplit_once(':').and_then(|(ip, port)| {
-                port.parse().ok().map(|p| (ip.to_string(), p))
-            })
+            s.rsplit_once(':')
+                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
 
@@ -280,9 +285,8 @@ impl SyncClientConnection {
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
         self.remote_addr.read().unwrap().as_ref().and_then(|s| {
-            s.rsplit_once(':').and_then(|(ip, port)| {
-                port.parse().ok().map(|p| (ip.to_string(), p))
-            })
+            s.rsplit_once(':')
+                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
 
@@ -333,7 +337,9 @@ impl SyncClientConnection {
         match self.recv(py) {
             Ok(msg) => Ok(Some(msg)),
             Err(e) => {
-                if e.is_instance_of::<PyRuntimeError>(py) && e.to_string().contains("Connection closed") {
+                if e.is_instance_of::<PyRuntimeError>(py)
+                    && e.to_string().contains("Connection closed")
+                {
                     Ok(None)
                 } else {
                     Err(e)
@@ -353,12 +359,12 @@ pub fn connect(uri: String, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<Sync
 pub fn register_sync_client(py: Python<'_>, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let sync_module = PyModule::new(py, "sync")?;
     let client_module = PyModule::new(py, "client")?;
-    
+
     client_module.add_class::<SyncClientConnection>()?;
     client_module.add_function(wrap_pyfunction!(connect, &client_module)?)?;
-    
+
     sync_module.add_submodule(&client_module)?;
     parent_module.add_submodule(&sync_module)?;
-    
+
     Ok(())
 }
