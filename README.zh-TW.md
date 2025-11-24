@@ -4,9 +4,9 @@
 [![Release](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml/badge.svg)](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Rust 實作的高效能 WebSocket 客戶端，提供 Python 綁定。支援同步和異步 API，並可選擇與 `websockets` 函式庫兼容。
+[English](README.md) | [繁體中文](README.zh-TW.md)
 
-**[English](README.md)** | **繁體中文**
+Rust 實作的高效能 WebSocket 客戶端，提供 Python 綁定。支援同步和異步 API，並可選擇與 `websockets` 函式庫兼容。
 
 ## 🎯 效能概覽
 

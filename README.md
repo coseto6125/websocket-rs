@@ -4,6 +4,8 @@
 [![Release](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml/badge.svg)](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
 High-performance WebSocket client implementation in Rust with Python bindings. Provides both sync and async APIs with optional compatibility layer for `websockets` library.
 
 ## 🎯 Performance Overview
