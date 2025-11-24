@@ -4,148 +4,264 @@
 [![Release](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml/badge.svg)](https://github.com/coseto6125/websocket-rs/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A high-performance WebSocket client implemented in Rust with Python bindings. Fully compatible with Python `websockets` API while providing significant performance improvements.
+[English](README.md) | [繁體中文](README.zh-TW.md)
+
+High-performance WebSocket client implementation in Rust with Python bindings. Provides both sync and async APIs with optional compatibility layer for `websockets` library.
+
+## 🎯 Performance Overview
+
+### When to Use What
+
+**For Request-Response Patterns** (chat apps, API calls, gaming):
+- 🥇 **picows**: 0.056 ms RTT - Best for extreme low-latency requirements
+- 🥈 **websocket-rs Sync**: 0.244 ms RTT - Best balance of performance and simplicity
+- 🥉 **websocket-client**: 0.427 ms RTT - Good for simple sync applications
+
+**For High-Concurrency Pipelining** (data streaming, batch processing):
+- 🥇 **websocket-rs Async**: 3.656 ms RTT - **7x faster** than picows, **18x faster** than websockets
+- 🥈 **picows**: 25.821 ms RTT - Struggles with pipelined batches
+- 🥉 **websockets Async**: 67.591 ms RTT - Pure Python limitations
+
+### Why Different Patterns Matter
+
+WebSocket applications use two fundamentally different communication patterns:
+
+1. **Request-Response (RR)**: Send one message → wait for reply → send next
+   - Used by: Chat apps, API calls, online games, command-response systems
+   - Characteristics: Sequential, blocking, no concurrency
+   - Winner: **picows** (event-driven C extension)
+
+2. **Pipelined**: Send multiple messages without waiting → receive all responses
+   - Used by: Data streaming, bulk operations, high-throughput systems
+   - Characteristics: Concurrent, non-blocking, batched I/O
+   - Winner: **websocket-rs Async** (Rust async with Tokio)
+
+## 📊 Comprehensive Benchmark Results
+
+**Test Environment**: WSL2 Ubuntu, Python 3.13, localhost echo server, 1000 messages per test
+
+### Request-Response Mode (Real-World Usage)
+
+**Small Messages (512 bytes):**
+
+| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
+|----------------|------------|---------------|-----|---------|
+| **picows (RR)** | 0.005 ms | 0.005 ms | **0.010 ms** | 🏆 1.0x |
+| websocket-client | 0.065 ms | 0.057 ms | 0.123 ms | 12.3x slower |
+| **websocket-rs Sync** | 0.057 ms | 0.075 ms | 0.133 ms | 13.3x slower |
+| websockets (RR) | 0.082 ms | 0.081 ms | 0.165 ms | 16.5x slower |
+| **websocket-rs (RR)** | 0.098 ms | 0.088 ms | 0.187 ms | 18.7x slower |
+| websockets (Sync) | 0.084 ms | 0.109 ms | 0.194 ms | 19.4x slower |
+
+**Large Messages (65536 bytes):**
+
+| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
+|----------------|------------|---------------|-----|---------|
+| **picows (RR)** | 0.032 ms | 0.023 ms | **0.056 ms** | 🏆 1.0x |
+| **websocket-rs Sync** | 0.143 ms | 0.100 ms | 0.244 ms | 4.4x slower |
+| **websocket-rs (RR)** | 0.130 ms | 0.168 ms | 0.298 ms | 5.3x slower |
+| websocket-client | 0.252 ms | 0.174 ms | 0.427 ms | 7.6x slower |
+| websockets (RR) | 0.467 ms | 0.481 ms | 0.949 ms | 17x slower |
+| websockets (Sync) | 0.464 ms | 0.546 ms | 1.011 ms | 18x slower |
+
+**Key Insights:**
+- **picows dominates RR mode**: 4-18x faster than alternatives
+- **websocket-rs Sync**: Best Rust option for RR (4.4x slower than picows, but simpler API)
+- **websocket-rs Async is slower than Python async**: 13% overhead due to PyO3 bridge + dual runtime
+
+### Pipelined Mode (High Concurrency)
+
+**Large Messages (65536 bytes, sliding window):**
+
+| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
+|----------------|------------|---------------|-----|---------|
+| **websocket-rs Async** | 2.846 ms | 0.810 ms | **3.656 ms** | 🏆 1.0x |
+| picows | 25.444 ms | 0.377 ms | 25.821 ms | 7.1x slower |
+| websockets (Async) | 32.609 ms | 34.981 ms | 67.591 ms | 18.5x slower |
+
+**Key Insights:**
+- **websocket-rs Async dominates pipelined mode**: 7x faster than picows, 18x faster than websockets
+- **Rust async shines in concurrency**: No GIL, Tokio scheduler, zero-cost futures
+- **picows struggles with batches**: Event-driven architecture not optimized for pipelined sends
+
+### Performance Scaling by Message Size
+
+**Request-Response Mode:**
+
+| Message Size | picows (RR) | websocket-rs Sync | websocket-rs (RR) | websockets (RR) |
+|--------------|-------------|-------------------|-------------------|-----------------|
+| 512 B | 0.010 ms | 0.133 ms | 0.187 ms | 0.165 ms |
+| 1 KB | 0.010 ms | 0.142 ms | 0.190 ms | 0.161 ms |
+| 2 KB | 0.011 ms | 0.141 ms | 0.195 ms | 0.185 ms |
+| 4 KB | 0.011 ms | 0.144 ms | 0.201 ms | 0.213 ms |
+| 8 KB | 0.012 ms | 0.145 ms | 0.198 ms | 0.258 ms |
+| 16 KB | 0.014 ms | 0.224 ms | 0.281 ms | 0.332 ms |
+| 32 KB | 0.040 ms | 0.212 ms | 0.261 ms | 0.639 ms |
+| 64 KB | 0.056 ms | 0.244 ms | 0.298 ms | 0.949 ms |
+
+**Pipelined Mode:**
+
+| Message Size | websocket-rs Async | picows | websockets (Async) |
+|--------------|-------------------|--------|-------------------|
+| 512 B | 0.803 ms | 5.104 ms | 2.037 ms |
+| 1 KB | 0.929 ms | 4.764 ms | 2.682 ms |
+| 4 KB | 1.139 ms | 5.456 ms | 6.413 ms |
+| 16 KB | 2.691 ms | 10.826 ms | 27.038 ms |
+| 64 KB | 3.656 ms | 25.821 ms | 67.591 ms |
+
+## 🤔 Understanding the Performance Patterns
+
+### Why is websocket-rs Async slower than Python async in RR mode?
+
+**websocket-rs (RR)**: 0.187 ms vs **websockets (RR)**: 0.165 ms (13% slower)
+
+This seems counterintuitive, but it's due to:
+
+1. **PyO3 FFI overhead**: Crossing Python/Rust boundary on every send/recv
+2. **Dual async runtime cost**: Python asyncio + Tokio both running
+3. **No concurrency benefit in RR**: Sequential operations can't utilize Rust's async advantages
+4. **Pure Python async is optimized**: `websockets` is mature, well-tuned pure Python
+
+### Why does websocket-rs Async dominate in Pipelined mode?
+
+**websocket-rs Async**: 3.656 ms vs **picows**: 25.821 ms (7x faster)
+
+Because Rust async excels at concurrency:
+
+1. **True parallelism**: No GIL, can overlap send/receive operations
+2. **Tokio's efficiency**: Work-stealing scheduler, zero-cost futures
+3. **Batched system calls**: Can merge multiple I/O operations
+4. **Memory efficiency**: Compile-time optimizations, no GC pauses
+
+### Why is picows fastest in RR but slower in Pipelined?
+
+**RR**: 0.056 ms (best) vs **Pipelined**: 25.821 ms (7x slower than Rust)
+
+- **RR mode**: Event-driven callback architecture has minimal overhead per message
+- **Pipelined mode**: Queue + async coordination overhead becomes significant with batches
+- **Optimization focus**: picows optimized for event-driven patterns, not batch sends
 
 ## 🚀 Quick Start
 
+### Installation
+
 ```bash
-# Install
+# Using uv (recommended)
 uv pip install git+https://github.com/coseto6125/websocket-rs.git
 
-# Use in your code - Zero changes needed!
+# Using pip
+pip install git+https://github.com/coseto6125/websocket-rs.git
+```
+
+### Basic Usage
+
+```python
+# Direct usage - Sync API
+from websocket_rs.sync_client import connect
+
+with connect("ws://localhost:8765") as ws:
+    ws.send("Hello")
+    response = ws.recv()
+    print(response)
 ```
 
 ```python
-import websocket_rs
-websocket_rs.enable_monkeypatch()  # Enable acceleration
+# Direct usage - Async API
+import asyncio
+from websocket_rs.async_client import connect
 
-# Your existing WebSocket code runs 1.5-5x faster automatically!
+async def main():
+    ws = await connect("ws://localhost:8765")
+    try:
+        await ws.send("Hello")
+        response = await ws.recv()
+        print(response)
+    finally:
+        await ws.close()
+
+asyncio.run(main())
+```
+
+```python
+# Monkeypatch mode (zero code changes)
+import websocket_rs
+websocket_rs.enable_monkeypatch()
+
+# Existing code using websockets now uses Rust implementation
 import websockets.sync.client
 with websockets.sync.client.connect("ws://localhost:8765") as ws:
     ws.send("Hello")
     print(ws.recv())
 ```
 
-## Features
+## 📖 API Documentation
 
-- 🔥 **1.5-5x faster than native Python** (single messages)
-- 🚄 **10-17x performance boost for batch operations**
-- 🔄 **100% API compatible** with Python `websockets` module
-- 🎯 **Zero-code-change acceleration** via monkeypatch
-- 🦀 Efficient async I/O using Rust + Tokio
-- 🔒 Thread-safe with concurrent operation support
-- 💾 Optimized memory usage (zero-copy optimizations)
-- 🔧 Multiple patching strategies (global, context, decorator, environment variable)
+### Standard API (Compatible with Python websockets)
 
-## Performance Comparison
+| Method | Description | Example |
+|--------|-------------|---------|
+| `connect(url)` | Create and connect WebSocket | `ws = connect("ws://localhost:8765")` |
+| `send(message)` | Send message (str or bytes) | `ws.send("Hello")` |
+| `recv()` | Receive message | `msg = ws.recv()` |
+| `close()` | Close connection | `ws.close()` |
 
-Based on actual test results (test scripts in `tests/` directory):
+### Connection Parameters
 
-### Single Message Latency (RTT)
-
-| Message Size | Python websockets | websocket-rs | Performance Gain |
-|---------|------------------|--------------|------------|
-| 1 KB    | 0.258 ms        | 0.155 ms     | **1.66x** |
-| 8 KB    | 0.279 ms        | 0.141 ms     | **1.98x** |
-| 32 KB   | 0.495 ms        | 0.141 ms     | **3.51x** |
-| 64 KB   | 0.801 ms        | 0.161 ms     | **4.98x** |
-
-### Batch Operations Throughput
-
-| Batch Size | 1 KB | 8 KB | 32 KB | 64 KB |
-|---------|------|------|-------|-------|
-| Batch(10) | **8.88x** | **7.57x** | **9.92x** | **10.20x** |
-| Batch(100) | **17.66x** | **11.13x** | **12.44x** | **13.76x** |
-
-*Test environment: WSL2 Ubuntu, Python 3.13, local echo server*
-
-## Installation
-
-### Option 1: Using uv (Fastest & Simplest) 🚀
-
-```bash
-# Install latest version
-uv pip install git+https://github.com/coseto6125/websocket-rs.git
-
-# Or specify a version tag
-uv pip install git+https://github.com/coseto6125/websocket-rs.git@v0.2.0
-
-# Or specify a branch
-uv pip install git+https://github.com/coseto6125/websocket-rs.git@main
-
-# Add to pyproject.toml
-uv add git+https://github.com/coseto6125/websocket-rs.git
+```python
+connect(
+    url: str,                    # WebSocket server URL
+    connect_timeout: float = 30, # Connection timeout (seconds)
+    receive_timeout: float = 30  # Receive timeout (seconds)
+)
 ```
 
-### Option 2: Using Pre-built Wheels (from GitHub Releases)
+## 🎯 Choosing the Right Implementation
+
+### Choose **picows** if you need:
+- ✅ Absolute lowest latency (<0.1 ms)
+- ✅ Request-response pattern (chat, API calls)
+- ✅ Team comfortable with event-driven callbacks
+- ❌ NOT for: Batch/pipelined operations
+
+### Choose **websocket-rs Sync** if you need:
+- ✅ Simple blocking API
+- ✅ Good performance (0.2-0.3 ms)
+- ✅ Drop-in replacement for `websockets.sync`
+- ✅ Request-response pattern
+- ❌ NOT for: Async/await integration
+
+### Choose **websocket-rs Async** if you need:
+- ✅ High-concurrency pipelining
+- ✅ Batch operations (7x faster than picows)
+- ✅ Data streaming applications
+- ✅ Integration with Python asyncio
+- ❌ NOT for: Simple request-response (use Sync instead)
+
+### Choose **websockets (Python)** if you need:
+- ✅ Rapid prototyping
+- ✅ Mature ecosystem
+- ✅ Comprehensive documentation
+- ✅ Low-frequency communication (<10 msg/s)
+- ❌ NOT for: High-performance requirements
+
+## 🔧 Advanced Installation
+
+### From GitHub Releases (Pre-built wheels)
 
 ```bash
-# Install with uv directly from GitHub Release
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.2.0/websocket_rs-0.2.0-cp312-abi3-linux_x86_64.whl
-
-# Or using pip
-pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.2.0/websocket_rs-0.2.0-cp312-abi3-linux_x86_64.whl
-
-# Auto-select appropriate wheel (requires setup)
-pip install websocket-rs --index-url https://github.com/coseto6125/websocket-rs/releases/download/latest/
+# Specify version
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.3.0/websocket_rs-0.3.0-cp312-abi3-linux_x86_64.whl
 ```
 
-### Option 3: From PyPI (if published)
+### From Source
 
-```bash
-# Using uv
-uv pip install websocket-rs
-
-# Using pip
-pip install websocket-rs
-```
-
-### Option 4: Build from Source
-
-#### Prerequisites
+**Requirements**:
 - Python 3.12+
-- Rust 1.70+ (if not installed, visit [rustup.rs](https://rustup.rs/))
-
-#### Auto-compile with pip/uv
+- Rust 1.70+ ([rustup.rs](https://rustup.rs/))
 
 ```bash
-# pip will automatically call maturin to compile
-pip install git+https://github.com/coseto6125/websocket-rs.git
-
-# Or using uv (faster)
-uv pip install git+https://github.com/coseto6125/websocket-rs.git
-```
-
-#### Manual Compilation
-
-```bash
-# 1. Clone repository
 git clone https://github.com/coseto6125/websocket-rs.git
 cd websocket-rs
-
-# 2. Build with maturin
-pip install maturin
-maturin develop --release
-
-# Or build wheel
-maturin build --release
-pip install target/wheels/*.whl
-```
-
-### Option 5: Development Environment Setup
-
-```bash
-# Using uv (recommended)
-git clone https://github.com/coseto6125/websocket-rs.git
-cd websocket-rs
-uv venv
-source .venv/bin/activate  # Linux/macOS
-uv pip install maturin
-maturin develop --release
-
-# Or using traditional pip
-python -m venv .venv
-source .venv/bin/activate
 pip install maturin
 maturin develop --release
 ```
@@ -155,227 +271,24 @@ maturin develop --release
 ```toml
 [project]
 dependencies = [
-    # Install from GitHub
     "websocket-rs @ git+https://github.com/coseto6125/websocket-rs.git@main",
-    # Or from pre-built wheel URL
-    "websocket-rs @ https://github.com/coseto6125/websocket-rs/releases/download/v0.2.0/websocket_rs-0.2.0-cp312-abi3-linux_x86_64.whl",
-]
-
-# Using uv
-[tool.uv]
-dependencies = [
-    "websocket-rs @ git+https://github.com/coseto6125/websocket-rs.git",
 ]
 ```
 
-## Usage
-
-### 🎯 Monkeypatch - Zero Code Changes Required!
-
-The most powerful feature of websocket-rs is the ability to accelerate existing WebSocket code without any modifications. Just import and enable monkeypatch, and all WebSocket operations automatically use our Rust implementation:
-
-```python
-# Add this at the start of your application
-import websocket_rs
-websocket_rs.enable_monkeypatch()
-
-# Now ALL WebSocket code uses websocket-rs automatically!
-import websockets.sync.client
-
-# This uses websocket-rs under the hood - no code changes needed!
-with websockets.sync.client.connect("ws://localhost:8765") as ws:
-    ws.send("Hello")
-    print(ws.recv())
-    # Enjoying 1.5-5x speedup with zero code changes!
-```
-
-#### Why Use Monkeypatch?
-
-- **Zero Migration Cost**: No need to rewrite existing code
-- **Instant Performance**: Get 1.5-5x speedup immediately
-- **Risk-Free Testing**: Easy to enable/disable for A/B testing
-- **Library Compatible**: Works with any code using `websockets` or `websocket-client`
-- **Production Ready**: Can be enabled via environment variable for different deployments
-
-#### Monkeypatch Methods
-
-1. **Global Enable (Recommended)**
-```python
-import websocket_rs
-websocket_rs.enable_monkeypatch()  # Enable for entire application
-```
-
-2. **Environment Variable**
-```bash
-export WEBSOCKET_RS_AUTO_PATCH=1
-python your_app.py  # Automatically uses websocket-rs
-```
-
-3. **Context Manager (Temporary)**
-```python
-from websocket_rs.patch import patch_context
-
-with patch_context():
-    # WebSocket libraries use websocket-rs here
-    import websockets.sync.client
-    ws = websockets.sync.client.connect(url)
-
-# Original implementation restored outside
-```
-
-4. **Decorator (Function-level)**
-```python
-from websocket_rs.auto_patch import use_websocket_rs
-
-@use_websocket_rs
-def my_function():
-    # This function uses websocket-rs for all WebSocket operations
-    import websockets.sync.client
-    with websockets.sync.client.connect(url) as ws:
-        ws.send("Fast!")
-```
-
-5. **Manual Patching**
-```python
-from websocket_rs.patch import patch_all, unpatch_all
-
-patch_all()  # Apply patches
-# ... your code ...
-unpatch_all()  # Restore originals
-```
-
-### Basic Usage (Same as Python websockets)
-
-```python
-from websocket_rs import WebSocket
-
-# Synchronous usage
-ws = WebSocket("ws://localhost:8765")
-ws.connect()
-ws.send("Hello, World!")
-response = ws.recv()
-print(response)
-ws.close()
-
-# Using Context Manager
-with WebSocket("ws://localhost:8765") as ws:
-    ws.send("Hello")
-    print(ws.recv())
-```
-
-### Batch Operations (High-Performance Extension)
-
-```python
-from websocket_rs import WebSocket
-
-ws = WebSocket("ws://localhost:8765")
-ws.connect()
-
-# Batch send - 10-17x faster than sending one by one
-messages = ["msg1", "msg2", "msg3", "msg4", "msg5"]
-ws.send_batch(messages)
-
-# Batch receive
-responses = ws.receive_batch(5)
-print(responses)
-
-ws.close()
-```
-
-### As Drop-in Replacement
-
-```python
-# Original code
-# from websockets.sync.client import connect
-
-# Change to
-from websocket_rs import WebSocket as connect
-
-# Rest of the code remains unchanged
-with connect("ws://localhost:8765") as ws:
-    ws.send("Hello")
-    response = ws.recv()
-```
-
-### Graceful Fallback Strategy
-
-```python
-# Use high-performance version if available, fallback to native
-try:
-    from websocket_rs import WebSocket
-    use_rust = True
-except ImportError:
-    from websockets.sync.client import connect as WebSocket
-    use_rust = False
-    print("Using fallback Python implementation")
-
-# Code remains the same
-ws = WebSocket("ws://localhost:8765")
-if use_rust:
-    ws.connect()  # Rust version requires explicit connect
-# ... rest of the code is identical
-```
-
-## API Documentation
-
-### Standard API (Compatible with Python websockets)
-
-| Method | Description | Example |
-|------|------|------|
-| `WebSocket(url)` | Create WebSocket client | `ws = WebSocket("ws://localhost:8765")` |
-| `connect()` | Establish connection | `ws.connect()` |
-| `send(message)` | Send message (str or bytes) | `ws.send("Hello")` |
-| `recv()` | Receive message | `msg = ws.recv()` |
-| `receive()` | Alias for recv | `msg = ws.receive()` |
-| `close()` | Close connection | `ws.close()` |
-| `is_connected` | Check connection status (property) | `if ws.is_connected:` |
-
-### Extended API (Performance Optimizations)
-
-| Method | Description | Example |
-|------|------|------|
-| `send_batch(messages)` | Send multiple messages in batch | `ws.send_batch(["msg1", "msg2"])` |
-| `receive_batch(count)` | Receive specified number of messages | `msgs = ws.receive_batch(10)` |
-
-### Parameters
-
-```python
-WebSocket(
-    url: str,                    # WebSocket server URL
-    connect_timeout: float = 30, # Connection timeout (seconds)
-    receive_timeout: float = 30  # Receive timeout (seconds)
-)
-```
-
-## Running Tests and Benchmarks
+## 🧪 Running Tests and Benchmarks
 
 ```bash
 # Run API compatibility tests
 python tests/test_compatibility.py
 
-# Run performance benchmarks
+# Run comprehensive benchmarks (RR + Pipelined)
+python tests/benchmark_server_timestamp.py
+
+# Run optimized benchmarks
 python tests/benchmark_optimized.py
-
-# Run latency tests
-python tests/benchmark_latency.py
 ```
 
-## Development
-
-### Project Structure
-
-```
-websocket-rs/
-├── src/
-│   └── lib.rs              # Rust implementation
-├── tests/
-│   ├── benchmark_optimized.py  # Performance tests
-│   ├── benchmark_latency.py    # Latency tests
-│   └── test_compatibility.py   # API compatibility tests
-├── Cargo.toml              # Rust dependencies
-├── pyproject.toml          # Python packaging config
-└── README.md
-```
+## 🛠️ Development
 
 ### Local Development with uv (Recommended)
 
@@ -404,51 +317,40 @@ maturin develop --release
 # Install development dependencies
 pip install maturin pytest websockets
 
-# Development mode compilation (fast iteration)
+# Development mode (fast iteration)
 maturin develop
 
-# Release mode compilation (best performance)
+# Release mode (best performance)
 maturin develop --release
 
-# Watch mode (auto-recompile on file changes)
+# Watch mode (auto-recompile)
 maturin develop --release --watch
 ```
 
-### Building for Different Python Versions
+## 📐 Technical Architecture
 
-```bash
-# Specify Python interpreter
-maturin build --release --interpreter python3.12
-maturin build --release --interpreter python3.13
-maturin build --release --interpreter python3.14
+### Why Rust for WebSockets?
 
-# Build universal wheel (abi3)
-maturin build --release --abi3-py312
-```
+1. **Zero-cost abstractions**: Rust's async/await compiles to efficient state machines
+2. **Tokio runtime**: Work-stealing scheduler optimized for I/O-bound tasks
+3. **No GIL**: True parallelism for concurrent operations
+4. **Memory safety**: No segfaults, data races, or memory leaks
 
-## Performance Optimization Principles
+### Performance Trade-offs
 
-1. **Rust + Tokio**: Zero-cost abstractions + efficient async runtime
-2. **Reduced FFI Overhead**: Batch operations minimize cross-language calls
-3. **Memory Optimization**: Copy-on-Write reduces copying
-4. **RwLock**: Allows multiple concurrent reads
-5. **Dedicated Thread Pool**: Doesn't block Python main thread
+**Request-Response Mode:**
+- ❌ PyO3 FFI overhead on every call
+- ❌ Dual runtime coordination (asyncio + Tokio)
+- ✅ Still competitive with pure Python sync
+- ✅ Better than Python async for large messages
 
-## Use Cases
+**Pipelined Mode:**
+- ✅ FFI overhead amortized across batch
+- ✅ Tokio's concurrency advantages shine
+- ✅ No GIL blocking
+- ✅ Significant speedup over all Python alternatives
 
-### ✅ Recommended Scenarios
-- High-frequency trading systems
-- Real-time data stream processing
-- Large message transmission (>8KB)
-- Batch message processing
-- Low-latency applications
-
-### ⚠️ May Not Be Necessary
-- Simple low-frequency communication
-- Small messages with very low frequency
-- Prototype development phase
-
-## Troubleshooting
+## 🐛 Troubleshooting
 
 ### Compilation Issues
 
@@ -460,31 +362,40 @@ rustc --version  # Requires >= 1.70
 cargo clean
 maturin develop --release
 
-# Use verbose mode for details
+# Verbose mode
 maturin develop --release -v
 ```
 
 ### Runtime Issues
 
 - **TimeoutError**: Increase `connect_timeout` parameter
-- **Module not found**: Ensure `maturin develop` has been executed
+- **Module not found**: Run `maturin develop` first
 - **Connection refused**: Check if server is running
+- **Performance not as expected**: Ensure using `--release` build
 
-## Contributing
+## 🤝 Contributing
 
 Contributions welcome! Please ensure:
 
 1. All tests pass
 2. API compatibility is maintained
-3. Performance is verified with benchmarks
-4. Documentation is updated
+3. Performance benchmarks included
+4. Documentation updated
 
-## License
+## 📄 License
 
 MIT License - See [LICENSE](LICENSE)
 
-## Acknowledgments
+## 🙏 Acknowledgments
 
 - [PyO3](https://github.com/PyO3/pyo3) - Rust Python bindings
 - [Tokio](https://tokio.rs/) - Async runtime
 - [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) - WebSocket implementation
+- [websockets](https://github.com/python-websockets/websockets) - Python WebSocket library
+- [picows](https://github.com/tarasko/picows) - High-performance Python WebSocket client
+
+## 📚 Further Reading
+
+- [Why Rust async is fast](https://tokio.rs/tokio/tutorial)
+- [PyO3 performance guide](https://pyo3.rs/main/doc/pyo3/performance)
+- [WebSocket protocol RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)
