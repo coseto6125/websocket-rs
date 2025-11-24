@@ -12,6 +12,9 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
 
+// Type alias to simplify complex types
+type MessageReceiver = Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>;
+
 // Cache asyncio parts to avoid repeated imports
 static ASYNCIO: OnceLock<Py<PyModule>> = OnceLock::new();
 
@@ -99,7 +102,7 @@ pub struct AsyncClientConnection {
     url: String,
     // Communication with the background task
     tx_cmd: Option<mpsc::Sender<Command>>,
-    rx_msg_internal: Option<Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>>,
+    rx_msg_internal: Option<MessageReceiver>,
     stream_sync: Arc<RwLock<bool>>,
     connect_timeout: f64,
     receive_timeout: f64,
