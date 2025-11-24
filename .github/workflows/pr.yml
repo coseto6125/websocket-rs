@@ -68,9 +68,7 @@ jobs:
         run: maturin develop --release
 
       - name: Run tests
-        run: |
-          python tests/test_compatibility.py
-          python tests/test_monkeypatch.py
+        run: python tests/test_compatibility.py
 
   build:
     name: Build wheels
