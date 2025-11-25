@@ -9,11 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Per-connection event loop cache to reduce Python C API calls
+- Event loop cache write-back for non-context-manager usage (25% improvement)
 - ReadyFuture error path optimization
 - Performance testing suite
 
 ### Changed
 - Updated `get_event_loop()` to `get_running_loop()` for Python 3.10+ compatibility
+- Event loop now cached on first access regardless of usage pattern
 - Error handling performance improved by ~50x
 - Stability improved (standard deviation <1-2%)
 

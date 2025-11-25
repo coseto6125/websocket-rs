@@ -149,9 +149,10 @@ Because Rust async excels at concurrency:
   - Error processing: 10M+ errors/sec (0.1μs per error)
   - Bypasses 4 Python C API calls in asyncio error path
 
-- **Event Loop Cache**: Per-connection event loop caching
-  - Reduces redundant `get_running_loop()` calls
-  - 1-2% improvement in slow path scenarios
+- **Event Loop Cache**: Smart event loop caching with write-back
+  - Caches on first access (works with or without `async with`)
+  - 25% improvement for non-context-manager usage
+  - Reduces redundant `get_running_loop()` calls (~0.014μs per call saved)
 
 - **API Safety**: Updated to `get_running_loop()` (Python 3.10+)
   - Better thread safety

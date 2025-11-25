@@ -149,9 +149,10 @@ WebSocket 應用使用兩種根本不同的通訊模式：
   - 錯誤處理速度：10M+ errors/sec（0.1μs 每次錯誤）
   - 繞過 asyncio 的 4 次 Python C API 調用
 
-- **Event Loop 快取**：Per-connection event loop 快取
-  - 減少重複的 `get_running_loop()` 調用
-  - 慢路徑場景提升 1-2%
+- **Event Loop 快取**：智慧型 event loop 快取與寫回機制
+  - 首次存取時自動快取（無論是否使用 `async with`）
+  - 非 context manager 使用場景提升 25%
+  - 減少重複的 `get_running_loop()` 調用（每次節省 ~0.014μs）
 
 - **API 安全性**：更新為 `get_running_loop()`（Python 3.10+）
   - 更佳的執行緒安全性
