@@ -130,7 +130,12 @@ fn get_cached_event_loop<'py>(
 
     // Slow path: Fallback to dynamic query (use get_running_loop for safety)
     let asyncio = get_asyncio(py)?;
-    asyncio.call_method0("get_running_loop")
+    let event_loop = asyncio.call_method0("get_running_loop")?;
+
+    // Write back to cache for future calls
+    *cache.write() = Some(event_loop.clone().unbind());
+
+    Ok(event_loop)
 }
 
 fn create_future<'py>(
