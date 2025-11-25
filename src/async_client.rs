@@ -33,7 +33,9 @@ static STOP_ITERATION: OnceLock<Py<PyAny>> = OnceLock::new();
 
 fn get_stop_iteration(py: Python<'_>) -> &Py<PyAny> {
     STOP_ITERATION.get_or_init(|| {
-        py.get_type::<pyo3::exceptions::PyStopIteration>().into_any().unbind()
+        py.get_type::<pyo3::exceptions::PyStopIteration>()
+            .into_any()
+            .unbind()
     })
 }
 
@@ -68,7 +70,7 @@ static ASYNCIO: OnceLock<Py<PyModule>> = OnceLock::new();
 
 /// Process a received WebSocket message into a Python object.
 /// This function is marked #[inline] to ensure zero-cost abstraction.
-/// 
+///
 /// - `async_iter`: If true, uses PyStopAsyncIteration for Close messages (for __anext__),
 ///   otherwise uses PyRuntimeError (for recv)
 #[inline]
@@ -168,19 +170,8 @@ fn ready_ok<'py>(py: Python<'py>, result: Py<PyAny>) -> PyResult<Bound<'py, PyAn
     Ok(future)
 }
 
-fn ready_err<'py>(py: Python<'py>, exc: PyErr) -> PyResult<Bound<'py, PyAny>> {
-    let asyncio = get_asyncio(py)?;
-    let event_loop = asyncio.call_method0("get_running_loop")?;
-    let future = event_loop.call_method0("create_future")?;
-    future.call_method1("set_exception", (exc,))?;
-    Ok(future)
-}
-
 // Fast path: Create completed future with minimal overhead (success)
-fn ready_fast<'py>(
-    py: Python<'py>,
-    result: impl IntoPyObject<'py>,
-) -> PyResult<Bound<'py, PyAny>> {
+fn ready_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<Bound<'py, PyAny>> {
     // Use custom ReadyFuture to bypass asyncio overhead
     let obj = result
         .into_pyobject(py)
@@ -196,10 +187,7 @@ fn ready_fast<'py>(
 }
 
 // Fast path: Create completed future with error (error path optimization)
-fn ready_fast_err<'py>(
-    py: Python<'py>,
-    err: PyErr,
-) -> PyResult<Bound<'py, PyAny>> {
+fn ready_fast_err<'py>(py: Python<'py>, err: PyErr) -> PyResult<Bound<'py, PyAny>> {
     // Use custom ReadyFuture to bypass asyncio overhead for errors
     let future = Bound::new(
         py,
@@ -307,15 +295,13 @@ impl AsyncClientConnection {
                                 if let Err(e) = complete_future(py, event_loop, future, py.None()) {
                                     eprintln!("CRITICAL: Failed to complete future: {:?}", e);
                                 }
-                            } else {
-                                if let Err(e) = fail_future(
-                                    py,
-                                    event_loop,
-                                    future,
-                                    PyRuntimeError::new_err("Failed to send message (actor died)"),
-                                ) {
-                                    eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                                }
+                            } else if let Err(e) = fail_future(
+                                py,
+                                event_loop,
+                                future,
+                                PyRuntimeError::new_err("Failed to send message (actor died)"),
+                            ) {
+                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
                             }
                         });
                     });
@@ -346,7 +332,7 @@ impl AsyncClientConnection {
                 Ok(msg) => {
                     // Message available! Process immediately
                     let result = process_message(py, msg, &close_code, &close_reason, false);
-                    
+
                     match result {
                         Ok(val) => {
                             // Fast path: Use optimized future creation
@@ -387,7 +373,8 @@ impl AsyncClientConnection {
 
                     match msg_result {
                         Ok(Some(msg)) => {
-                            let result = process_message(py, msg, &close_code, &close_reason, false);
+                            let result =
+                                process_message(py, msg, &close_code, &close_reason, false);
 
                             match result {
                                 Ok(val) => {
@@ -397,7 +384,10 @@ impl AsyncClientConnection {
                                 }
                                 Err(e) => {
                                     if let Err(err) = fail_future(py, event_loop, future, e) {
-                                        eprintln!("CRITICAL: Failed to set future exception: {:?}", err);
+                                        eprintln!(
+                                            "CRITICAL: Failed to set future exception: {:?}",
+                                            err
+                                        );
                                     }
                                 }
                             }
@@ -477,7 +467,8 @@ impl AsyncClientConnection {
                                 Err(_) => break,
                             }
                         }
-                    }).await;
+                    })
+                    .await;
                 }
 
                 Python::attach(|py| {
@@ -526,15 +517,13 @@ impl AsyncClientConnection {
                                 if let Err(e) = complete_future(py, event_loop, future, py.None()) {
                                     eprintln!("CRITICAL: Failed to complete future: {:?}", e);
                                 }
-                            } else {
-                                if let Err(e) = fail_future(
-                                    py,
-                                    event_loop,
-                                    future,
-                                    PyRuntimeError::new_err("Failed to send ping"),
-                                ) {
-                                    eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                                }
+                            } else if let Err(e) = fail_future(
+                                py,
+                                event_loop,
+                                future,
+                                PyRuntimeError::new_err("Failed to send ping"),
+                            ) {
+                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
                             }
                         });
                     });
@@ -581,15 +570,13 @@ impl AsyncClientConnection {
                                 if let Err(e) = complete_future(py, event_loop, future, py.None()) {
                                     eprintln!("CRITICAL: Failed to complete future: {:?}", e);
                                 }
-                            } else {
-                                if let Err(e) = fail_future(
-                                    py,
-                                    event_loop,
-                                    future,
-                                    PyRuntimeError::new_err("Failed to send pong"),
-                                ) {
-                                    eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                                }
+                            } else if let Err(e) = fail_future(
+                                py,
+                                event_loop,
+                                future,
+                                PyRuntimeError::new_err("Failed to send pong"),
+                            ) {
+                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
                             }
                         });
                     });
@@ -837,14 +824,13 @@ impl AsyncClientConnection {
         let close_code = self.close_code.clone();
         let close_reason = self.close_reason.clone();
 
-
         // Optimistic Recv: Try to receive synchronously first
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
                     // Message available! Process immediately
                     let result = process_message(py, msg, &close_code, &close_reason, true);
-                    
+
                     match result {
                         Ok(val) => {
                             // Fast path: Use optimized future creation
@@ -861,10 +847,7 @@ impl AsyncClientConnection {
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     // Fast error path: Connection closed
-                    return ready_fast_err(
-                        py,
-                        PyStopAsyncIteration::new_err("Connection closed"),
-                    );
+                    return ready_fast_err(py, PyStopAsyncIteration::new_err("Connection closed"));
                 }
             }
         }
@@ -898,7 +881,10 @@ impl AsyncClientConnection {
                                 }
                                 Err(e) => {
                                     if let Err(err) = fail_future(py, event_loop, future, e) {
-                                        eprintln!("CRITICAL: Failed to set future exception: {:?}", err);
+                                        eprintln!(
+                                            "CRITICAL: Failed to set future exception: {:?}",
+                                            err
+                                        );
                                     }
                                 }
                             }
