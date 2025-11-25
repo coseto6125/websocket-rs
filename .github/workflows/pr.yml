@@ -4,6 +4,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [main, develop]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.github/workflows/**'
 
 jobs:
   lint:
