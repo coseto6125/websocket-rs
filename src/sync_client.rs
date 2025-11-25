@@ -1,9 +1,10 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use parking_lot::RwLock;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
@@ -75,18 +76,18 @@ impl SyncClientConnection {
                     match ws_stream.get_ref() {
                         MaybeTlsStream::Plain(s) => {
                             if let Ok(addr) = s.local_addr() {
-                                *local_addr.write().unwrap() = Some(addr.to_string());
+                                *local_addr.write() = Some(addr.to_string());
                             }
                             if let Ok(addr) = s.peer_addr() {
-                                *remote_addr.write().unwrap() = Some(addr.to_string());
+                                *remote_addr.write() = Some(addr.to_string());
                             }
                         }
                         MaybeTlsStream::NativeTls(s) => {
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
-                                *local_addr.write().unwrap() = Some(addr.to_string());
+                                *local_addr.write() = Some(addr.to_string());
                             }
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
-                                *remote_addr.write().unwrap() = Some(addr.to_string());
+                                *remote_addr.write() = Some(addr.to_string());
                             }
                         }
                         _ => {}
@@ -95,7 +96,7 @@ impl SyncClientConnection {
                     rt.block_on(async {
                         *stream.lock().await = Some(ws_stream);
                     });
-                    *stream_sync.write().unwrap() = true;
+                    *stream_sync.write() = true;
                     Ok(())
                 }
                 Ok(Err(e)) => Err(PyConnectionError::new_err(e.to_string())),
@@ -183,9 +184,8 @@ impl SyncClientConnection {
                         }
                         Message::Close(c) => {
                             if let Some(frame) = c {
-                                *self.close_code.write().unwrap() = Some(frame.code.into());
-                                *self.close_reason.write().unwrap() =
-                                    Some(frame.reason.to_string());
+                                *self.close_code.write() = Some(frame.code.into());
+                                *self.close_reason.write() = Some(frame.reason.to_string());
                             }
                             return Err(PyRuntimeError::new_err("Connection closed by server"));
                         }
@@ -217,7 +217,7 @@ impl SyncClientConnection {
                 }
                 *guard = None;
             });
-            *stream_sync.write().unwrap() = false;
+            *stream_sync.write() = false;
             Ok(())
         })
     }
@@ -265,19 +265,19 @@ impl SyncClientConnection {
     /// Check if connection is open
     #[getter]
     fn open(&self) -> bool {
-        *self.stream_sync.read().unwrap()
+        *self.stream_sync.read()
     }
 
     /// Check if connection is closed
     #[getter]
     fn closed(&self) -> bool {
-        !*self.stream_sync.read().unwrap()
+        !*self.stream_sync.read()
     }
 
     /// Local address
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
-        self.local_addr.read().unwrap().as_ref().and_then(|s| {
+        self.local_addr.read().as_ref().and_then(|s| {
             s.rsplit_once(':')
                 .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
@@ -286,7 +286,7 @@ impl SyncClientConnection {
     /// Remote address
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
-        self.remote_addr.read().unwrap().as_ref().and_then(|s| {
+        self.remote_addr.read().as_ref().and_then(|s| {
             s.rsplit_once(':')
                 .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
@@ -295,19 +295,19 @@ impl SyncClientConnection {
     /// Close code
     #[getter]
     fn close_code(&self) -> Option<u16> {
-        *self.close_code.read().unwrap()
+        *self.close_code.read()
     }
 
     /// Close reason
     #[getter]
     fn close_reason(&self) -> Option<String> {
-        self.close_reason.read().unwrap().clone()
+        self.close_reason.read().clone()
     }
 
     /// Subprotocol
     #[getter]
     fn subprotocol(&self) -> Option<String> {
-        self.subprotocol.read().unwrap().clone()
+        self.subprotocol.read().clone()
     }
 
     /// Context manager - enter

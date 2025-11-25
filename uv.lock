@@ -424,7 +424,7 @@ dev = [
     { name = "maturin" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "uvloop" },
+    { name = "uvloop", marker = "sys_platform != 'win32'" },
     { name = "websocket" },
     { name = "websockets" },
 ]
@@ -449,7 +449,7 @@ dev = [
     { name = "maturin", specifier = ">=1.0" },
     { name = "pytest", specifier = ">=7.0" },
     { name = "ruff", specifier = ">=0.1.0" },
-    { name = "uvloop", specifier = ">=0.22.1" },
+    { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.22.1" },
     { name = "websocket" },
     { name = "websockets", specifier = ">=12.0" },
 ]

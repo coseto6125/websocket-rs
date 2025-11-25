@@ -1,6 +1,6 @@
 [package]
 name = "websocket_rs"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 authors = ["coseto6125 <enorenor@gmail.com>"]
 description = "High-performance WebSocket client library for Python using Rust"
@@ -23,7 +23,6 @@ futures = "0.3"
 futures-util = "0.3"
 parking_lot = "0.12"
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
-flume = "0.11"
 bytes = "1.11.0"
 
 [lints.rust]

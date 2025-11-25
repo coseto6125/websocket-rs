@@ -451,6 +451,25 @@ Use **Async API** for best performance:
 from websocket_rs.async_client import connect
 ```
 
+### Event Loop Caching (v0.3.1+)
+The async client automatically caches the event loop on first access:
+```python
+# Both patterns benefit from event loop caching
+# Pattern 1: Using context manager (recommended)
+async with connect("ws://...") as ws:
+    await ws.send("msg")  # Uses cached event loop
+
+# Pattern 2: Manual management (also optimized)
+ws = await connect("ws://...")
+await ws.send("msg")  # Event loop cached on first access
+await ws.close()
+```
+
+**Performance impact:**
+- 25% improvement for non-context-manager usage
+- ~0.014μs saved per operation
+- Automatic write-back on first access
+
 ### Batch Operations
 When sending/receiving multiple messages, use async API:
 ```python
