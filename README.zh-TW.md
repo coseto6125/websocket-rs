@@ -179,8 +179,14 @@ WebSocket 應用使用兩種根本不同的通訊模式：
 ### 安裝
 
 ```bash
-# 使用 uv（推薦）
-uv pip install git+https://github.com/coseto6125/websocket-rs.git
+# 從 PyPI 安裝（推薦）
+pip install websocket-rs
+
+# 使用 uv
+uv pip install websocket-rs
+
+# 從原始碼安裝
+pip install git+https://github.com/coseto6125/websocket-rs.git
 
 # 使用 pip
 pip install git+https://github.com/coseto6125/websocket-rs.git

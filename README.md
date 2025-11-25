@@ -179,10 +179,13 @@ Based on 1000 messages (1KB each):
 ### Installation
 
 ```bash
-# Using uv (recommended)
-uv pip install git+https://github.com/coseto6125/websocket-rs.git
+# From PyPI (recommended)
+pip install websocket-rs
 
-# Using pip
+# Using uv
+uv pip install websocket-rs
+
+# From source
 pip install git+https://github.com/coseto6125/websocket-rs.git
 ```
 
