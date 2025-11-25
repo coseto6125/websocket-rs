@@ -13,14 +13,14 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 ### When to Use What
 
 **For Request-Response Patterns** (chat apps, API calls, gaming):
-- 🥇 **picows**: 0.056 ms RTT - Best for extreme low-latency requirements
-- 🥈 **websocket-rs Sync**: 0.244 ms RTT - Best balance of performance and simplicity
-- 🥉 **websocket-client**: 0.427 ms RTT - Good for simple sync applications
+- 🥇 **picows**: 0.034 ms RTT - Best for extreme low-latency requirements
+- 🥈 **websocket-rs Sync**: 0.128 ms RTT - Best balance of performance and simplicity
+- 🥉 **websocket-client**: 0.237 ms RTT - Good for simple sync applications
 
 **For High-Concurrency Pipelining** (data streaming, batch processing):
-- 🥇 **websocket-rs Async**: 3.656 ms RTT - **7x faster** than picows, **18x faster** than websockets
-- 🥈 **picows**: 25.821 ms RTT - Struggles with pipelined batches
-- 🥉 **websockets Async**: 67.591 ms RTT - Pure Python limitations
+- 🥇 **websocket-rs Async**: 2.964 ms RTT - **12x faster** than picows, **21x faster** than websockets
+- 🥈 **picows**: 36.129 ms RTT - Struggles with pipelined batches
+- 🥉 **websockets Async**: 61.217 ms RTT - Pure Python limitations
 
 ### Why Different Patterns Matter
 
@@ -47,27 +47,27 @@ WebSocket applications use two fundamentally different communication patterns:
 | Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
 |----------------|------------|---------------|-----|---------|
 | **picows (RR)** | 0.005 ms | 0.005 ms | **0.010 ms** | 🏆 1.0x |
-| websocket-client | 0.065 ms | 0.057 ms | 0.123 ms | 12.3x slower |
-| **websocket-rs Sync** | 0.057 ms | 0.075 ms | 0.133 ms | 13.3x slower |
-| websockets (RR) | 0.082 ms | 0.081 ms | 0.165 ms | 16.5x slower |
-| **websocket-rs (RR)** | 0.098 ms | 0.088 ms | 0.187 ms | 18.7x slower |
+| **websocket-rs Sync** | 0.053 ms | 0.047 ms | 0.101 ms | 10.1x slower |
+| websocket-client | 0.069 ms | 0.060 ms | 0.129 ms | 12.9x slower |
+| websockets (RR) | 0.084 ms | 0.083 ms | 0.167 ms | 16.7x slower |
 | websockets (Sync) | 0.084 ms | 0.109 ms | 0.194 ms | 19.4x slower |
+| **websocket-rs (RR)** | 0.103 ms | 0.092 ms | 0.196 ms | 19.6x slower |
 
 **Large Messages (65536 bytes):**
 
 | Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
 |----------------|------------|---------------|-----|---------|
-| **picows (RR)** | 0.032 ms | 0.023 ms | **0.056 ms** | 🏆 1.0x |
-| **websocket-rs Sync** | 0.143 ms | 0.100 ms | 0.244 ms | 4.4x slower |
-| **websocket-rs (RR)** | 0.130 ms | 0.168 ms | 0.298 ms | 5.3x slower |
-| websocket-client | 0.252 ms | 0.174 ms | 0.427 ms | 7.6x slower |
-| websockets (RR) | 0.467 ms | 0.481 ms | 0.949 ms | 17x slower |
-| websockets (Sync) | 0.464 ms | 0.546 ms | 1.011 ms | 18x slower |
+| **picows (RR)** | 0.021 ms | 0.013 ms | **0.034 ms** | 🏆 1.0x |
+| **websocket-rs Sync** | 0.070 ms | 0.057 ms | 0.128 ms | 3.8x slower |
+| **websocket-rs (RR)** | 0.129 ms | 0.108 ms | 0.238 ms | 7.0x slower |
+| websocket-client | 0.162 ms | 0.074 ms | 0.237 ms | 7.0x slower |
+| websockets (RR) | 0.392 ms | 0.397 ms | 0.790 ms | 23.2x slower |
+| websockets (Sync) | 0.391 ms | 0.421 ms | 0.814 ms | 23.9x slower |
 
 **Key Insights:**
-- **picows dominates RR mode**: 4-18x faster than alternatives
-- **websocket-rs Sync**: Best Rust option for RR (4.4x slower than picows, but simpler API)
-- **websocket-rs Async is slower than Python async**: 13% overhead due to PyO3 bridge + dual runtime
+- **picows dominates RR mode**: 3-23x faster than alternatives
+- **websocket-rs Sync**: Best Rust option for RR (3.8x slower than picows, 1.85x faster than websocket-client)
+- **websocket-rs Async is slower than Python async**: 19% overhead due to PyO3 bridge + dual runtime
 
 ### Pipelined Mode (High Concurrency)
 
@@ -75,12 +75,12 @@ WebSocket applications use two fundamentally different communication patterns:
 
 | Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
 |----------------|------------|---------------|-----|---------|
-| **websocket-rs Async** | 2.846 ms | 0.810 ms | **3.656 ms** | 🏆 1.0x |
-| picows | 25.444 ms | 0.377 ms | 25.821 ms | 7.1x slower |
-| websockets (Async) | 32.609 ms | 34.981 ms | 67.591 ms | 18.5x slower |
+| **websocket-rs Async** | 2.329 ms | 0.635 ms | **2.964 ms** | 🏆 1.0x |
+| picows | 35.719 ms | 0.409 ms | 36.129 ms | 12.2x slower |
+| websockets (Async) | 31.197 ms | 30.019 ms | 61.217 ms | 20.7x slower |
 
 **Key Insights:**
-- **websocket-rs Async dominates pipelined mode**: 7x faster than picows, 18x faster than websockets
+- **websocket-rs Async dominates pipelined mode**: 12x faster than picows, 21x faster than websockets
 - **Rust async shines in concurrency**: No GIL, Tokio scheduler, zero-cost futures
 - **picows struggles with batches**: Event-driven architecture not optimized for pipelined sends
 
@@ -90,30 +90,30 @@ WebSocket applications use two fundamentally different communication patterns:
 
 | Message Size | picows (RR) | websocket-rs Sync | websocket-rs (RR) | websockets (RR) |
 |--------------|-------------|-------------------|-------------------|-----------------|
-| 512 B | 0.010 ms | 0.133 ms | 0.187 ms | 0.165 ms |
-| 1 KB | 0.010 ms | 0.142 ms | 0.190 ms | 0.161 ms |
-| 2 KB | 0.011 ms | 0.141 ms | 0.195 ms | 0.185 ms |
-| 4 KB | 0.011 ms | 0.144 ms | 0.201 ms | 0.213 ms |
-| 8 KB | 0.012 ms | 0.145 ms | 0.198 ms | 0.258 ms |
-| 16 KB | 0.014 ms | 0.224 ms | 0.281 ms | 0.332 ms |
-| 32 KB | 0.040 ms | 0.212 ms | 0.261 ms | 0.639 ms |
-| 64 KB | 0.056 ms | 0.244 ms | 0.298 ms | 0.949 ms |
+| 512 B | 0.010 ms | 0.101 ms | 0.196 ms | 0.167 ms |
+| 1 KB | 0.010 ms | 0.102 ms | 0.199 ms | 0.175 ms |
+| 2 KB | 0.012 ms | 0.106 ms | 0.198 ms | 0.183 ms |
+| 4 KB | 0.011 ms | 0.103 ms | 0.201 ms | 0.212 ms |
+| 8 KB | 0.012 ms | 0.109 ms | 0.201 ms | 0.255 ms |
+| 16 KB | 0.015 ms | 0.109 ms | 0.204 ms | 0.339 ms |
+| 32 KB | 0.020 ms | 0.115 ms | 0.210 ms | 0.489 ms |
+| 64 KB | 0.034 ms | 0.128 ms | 0.238 ms | 0.790 ms |
 
 **Pipelined Mode:**
 
 | Message Size | websocket-rs Async | picows | websockets (Async) |
 |--------------|-------------------|--------|-------------------|
-| 512 B | 0.803 ms | 5.104 ms | 2.037 ms |
-| 1 KB | 0.929 ms | 4.764 ms | 2.682 ms |
-| 4 KB | 1.139 ms | 5.456 ms | 6.413 ms |
-| 16 KB | 2.691 ms | 10.826 ms | 27.038 ms |
-| 64 KB | 3.656 ms | 25.821 ms | 67.591 ms |
+| 512 B | 0.873 ms | 4.904 ms | 2.206 ms |
+| 1 KB | 0.889 ms | 4.749 ms | 2.626 ms |
+| 4 KB | 1.094 ms | 5.926 ms | 6.309 ms |
+| 16 KB | 2.034 ms | 14.398 ms | 17.562 ms |
+| 64 KB | 2.964 ms | 36.129 ms | 61.217 ms |
 
 ## 🤔 Understanding the Performance Patterns
 
 ### Why is websocket-rs Async slower than Python async in RR mode?
 
-**websocket-rs (RR)**: 0.187 ms vs **websockets (RR)**: 0.165 ms (13% slower)
+**websocket-rs (RR)**: 0.196 ms vs **websockets (RR)**: 0.167 ms (17% slower)
 
 This seems counterintuitive, but it's due to:
 
@@ -124,7 +124,7 @@ This seems counterintuitive, but it's due to:
 
 ### Why does websocket-rs Async dominate in Pipelined mode?
 
-**websocket-rs Async**: 3.656 ms vs **picows**: 25.821 ms (7x faster)
+**websocket-rs Async**: 2.964 ms vs **picows**: 36.129 ms (12x faster)
 
 Because Rust async excels at concurrency:
 
@@ -135,45 +135,36 @@ Because Rust async excels at concurrency:
 
 ### Why is picows fastest in RR but slower in Pipelined?
 
-**RR**: 0.056 ms (best) vs **Pipelined**: 25.821 ms (7x slower than Rust)
+**RR**: 0.034 ms (best) vs **Pipelined**: 36.129 ms (12x slower than Rust)
 
 - **RR mode**: Event-driven callback architecture has minimal overhead per message
 - **Pipelined mode**: Queue + async coordination overhead becomes significant with batches
 - **Optimization focus**: picows optimized for event-driven patterns, not batch sends
 
-## ✨ What's New in v0.3.1
+## ✨ What's New in v0.4.0
 
-### Performance Improvements
+### Pure Sync Client - Remove Async Overhead
 
-- **Error Handling Optimization**: 50x faster error path with ReadyFuture error support
-  - Error processing: 10M+ errors/sec (0.1μs per error)
-  - Bypasses 4 Python C API calls in asyncio error path
+v0.4.0 reimplements Sync Client using `tungstenite` (non-async) instead of Tokio runtime wrapper:
 
-- **Event Loop Cache**: Smart event loop caching with write-back
-  - Caches on first access (works with or without `async with`)
-  - 25% improvement for non-context-manager usage
-  - Reduces redundant `get_running_loop()` calls (~0.014μs per call saved)
+**Implementation Changes**:
+- Use `tungstenite` (blocking I/O) instead of `tokio-tungstenite`
+- Remove Tokio runtime overhead
+- Direct `std::net::TcpStream` usage
 
-- **API Safety**: Updated to `get_running_loop()` (Python 3.10+)
-  - Better thread safety
-  - Prevents event loop confusion across threads
+**Performance Gains**:
+- Request-Response RTT: **0.128 ms** (was 0.244 ms, 1.9x faster)
+- **1.85x faster** than websocket-client
+- **6.2x faster** than websockets
 
-### Test Results (v0.3.1)
+**Architecture Design**:
+- Sync client: Pure blocking I/O (simple scripts, CLI tools)
+- Async client: Tokio runtime (high concurrency, event-driven)
+- Specialized implementation for each use case
 
-Based on 1000 messages (1KB each):
-
-| Scenario | Latency | Throughput |
-|----------|---------|------------|
-| Request-Response | 232.64ms | 4,300 ops/s |
-| Pipelined | 105.39ms | 9,500 ops/s |
-| Error Path (10k) | 1.00ms | 10M errors/s |
-| Mixed (90/10) | 200.03ms | 5,000 ops/s |
-
-### Stability
-
-- Standard deviation: <1-2%
-- Consistent performance across multiple test runs
-- Optimizations complete for Actor Pattern + PyO3 architecture
+**Backward Compatibility**:
+- 100% API compatible
+- No code changes required
 
 ## 🚀 Quick Start
 
@@ -262,14 +253,15 @@ connect(
 
 ### Choose **websocket-rs Sync** if you need:
 - ✅ Simple blocking API
-- ✅ Good performance (0.2-0.3 ms)
+- ✅ Good performance (0.1-0.13 ms RTT)
 - ✅ Drop-in replacement for `websockets.sync`
 - ✅ Request-response pattern
+- ✅ 1.85x faster than websocket-client
 - ❌ NOT for: Async/await integration
 
 ### Choose **websocket-rs Async** if you need:
 - ✅ High-concurrency pipelining
-- ✅ Batch operations (7x faster than picows)
+- ✅ Batch operations (12x faster than picows)
 - ✅ Data streaming applications
 - ✅ Integration with Python asyncio
 - ❌ NOT for: Simple request-response (use Sync instead)
