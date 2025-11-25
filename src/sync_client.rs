@@ -13,6 +13,7 @@ use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
 pub struct SyncClientConnection {
     url: String,
     ws: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    #[allow(dead_code)] // Used in __connect closure, compiler can't track it
     connect_timeout: f64,
     receive_timeout: f64,
     local_addr: Option<String>,
@@ -43,7 +44,7 @@ impl SyncClientConnection {
         let url = self.url.clone();
         let receive_timeout = self.receive_timeout;
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let (mut ws, _) = tungstenite_connect(&url)
                 .map_err(|e| PyConnectionError::new_err(format!("Connection failed: {}", e)))?;
 
@@ -94,7 +95,7 @@ impl SyncClientConnection {
             return Err(PyRuntimeError::new_err("Message must be string or bytes"));
         };
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
@@ -107,7 +108,7 @@ impl SyncClientConnection {
 
     /// Receive a message
     fn recv(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let result = py.allow_threads(|| {
+        let result = py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
@@ -162,7 +163,7 @@ impl SyncClientConnection {
 
     /// Close the connection
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| {
+        py.detach(|| {
             if let Some(mut ws) = self.ws.take() {
                 if let Err(e) = ws.close(None) {
                     eprintln!("Error closing WebSocket: {}", e);
@@ -176,7 +177,7 @@ impl SyncClientConnection {
     fn ping(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
@@ -191,7 +192,7 @@ impl SyncClientConnection {
     fn pong(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
 
-        py.allow_threads(|| {
+        py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
