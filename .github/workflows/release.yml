@@ -4,7 +4,6 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,7 +15,6 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.12', '3.13', '3.14']
 
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +22,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: '3.12'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -39,8 +37,8 @@ jobs:
 
       - name: Set up Python with uv
         run: |
-          uv python install ${{ matrix.python-version }}
-          uv venv --python ${{ matrix.python-version }}
+          uv python install 3.12
+          uv venv --python 3.12
 
       - name: Build wheels
         run: |
@@ -50,7 +48,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-py${{ matrix.python-version }}
+          name: wheels-${{ matrix.os }}
           path: dist/*.whl
 
   build-sdist:
