@@ -1,27 +1,11 @@
 use pyo3::prelude::*;
-use std::sync::OnceLock;
-use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::WebSocketStream as TokioWebSocketStream;
 
 mod async_client;
 mod sync_client;
 
-// Type aliases
-type WebSocketStream = TokioWebSocketStream<MaybeTlsStream<TcpStream>>;
-
 // Constants
 const DEFAULT_CONNECT_TIMEOUT: f64 = 10.0;
 const DEFAULT_RECEIVE_TIMEOUT: f64 = 10.0;
-
-// Global runtime
-static RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn get_runtime() -> &'static Runtime {
-    RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
-}
 
 #[pymodule]
 fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {

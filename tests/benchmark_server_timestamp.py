@@ -12,7 +12,9 @@ WebSocket 效能測試 - 使用 Server 時間戳驗證
 - 接收延遲: Server發送 → Client接收
 - RTT: 完整往返時間
 """
+
 import uvloop
+
 uvloop.install()
 import asyncio
 import statistics
@@ -26,7 +28,8 @@ import websockets.sync.client
 from websocket import create_connection
 
 try:
-    from picows import WSFrame, WSMsgType, WSListener, ws_connect
+    from picows import WSFrame, WSListener, WSMsgType, ws_connect
+
     PICOWS_AVAILABLE = True
 except ImportError:
     PICOWS_AVAILABLE = False
@@ -42,7 +45,7 @@ def parse_and_verify_response(response, expected_payload_len, expected_msg_id=No
         raise ValueError(f"回應長度不足: 需要至少 24 bytes, 收到 {len(response)} bytes")
 
     # 解析: [msg_id 4B][recv 8B][send 8B][len 4B][message]
-    msg_id, server_recv_time, server_send_time, message_len = struct.unpack('=IddI', response[:24])
+    msg_id, server_recv_time, server_send_time, message_len = struct.unpack("=IddI", response[:24])
     actual_message = response[24:]
 
     # 驗證訊息 ID（如果提供）
@@ -62,6 +65,7 @@ def parse_and_verify_response(response, expected_payload_len, expected_msg_id=No
 
 async def start_timestamp_server(host: str = "localhost", port: int = 8765):
     """啟動帶時間戳和訊息 ID 的 echo server"""
+
     async def echo_with_timestamps(websocket):
         try:
             async for message in websocket:
@@ -75,14 +79,14 @@ async def start_timestamp_server(host: str = "localhost", port: int = 8765):
 
                 # 解析訊息 ID（前 4 bytes）
                 if len(message_bytes) >= 4:
-                    msg_id = struct.unpack('=I', message_bytes[:4])[0]
+                    msg_id = struct.unpack("=I", message_bytes[:4])[0]
                 else:
                     msg_id = 0  # warmup 訊息
 
                 server_send_time = time.perf_counter()
 
                 # 打包: [msg_id 4B][recv 8B][send 8B][message_len 4B][原始訊息]
-                response_header = struct.pack('=IddI', msg_id, server_recv_time, server_send_time, len(message_bytes))
+                response_header = struct.pack("=IddI", msg_id, server_recv_time, server_send_time, len(message_bytes))
                 response = response_header + message_bytes
 
                 await websocket.send(response)
@@ -106,7 +110,7 @@ async def benchmark_websockets_async(uri: str, message_size: int, num_messages: 
     async with websockets.connect(uri) as ws:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             await ws.send(warmup_msg)
             await ws.recv()
 
@@ -117,7 +121,7 @@ async def benchmark_websockets_async(uri: str, message_size: int, num_messages: 
         while recv_count < num_messages:
             # 發送訊息直到達到窗口上限或全部發送完成
             while sent_count < num_messages and (sent_count - recv_count) < max_in_flight:
-                message = struct.pack('=I', sent_count) + base_message
+                message = struct.pack("=I", sent_count) + base_message
                 client_send_times[sent_count] = time.perf_counter()
                 await ws.send(message)
                 sent_count += 1
@@ -165,13 +169,13 @@ async def benchmark_websockets_request_response(uri: str, message_size: int, num
     async with websockets.connect(uri) as ws:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             await ws.send(warmup_msg)
             await ws.recv()
 
         # Request-Response 模式：發送一筆 → 等待回應 → 發下一筆
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             await ws.send(message)
 
@@ -211,13 +215,13 @@ def benchmark_websockets_sync(uri: str, message_size: int, num_messages: int) ->
     with websockets.sync.client.connect(uri) as ws:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             ws.send(warmup_msg)
             ws.recv()  # 丟棄 warmup 回應
 
         # 測試（同步模式按順序收發）
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             ws.send(message)
             response = ws.recv()
@@ -260,13 +264,13 @@ def benchmark_websocket_client(uri: str, message_size: int, num_messages: int) -
     try:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             ws.send_binary(warmup_msg)
             ws.recv()
 
         # 測試
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             ws.send_binary(message)
             response = ws.recv()
@@ -306,13 +310,13 @@ def benchmark_websocket_rs_sync(uri: str, message_size: int, num_messages: int) 
     with websocket_rs.sync.client.connect(uri) as ws:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             ws.send(warmup_msg)
             ws.recv()
 
         # 測試
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             ws.send(message)
             response = ws.recv()
@@ -353,7 +357,7 @@ async def benchmark_websocket_rs_async(uri: str, message_size: int, num_messages
     try:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             await ws.send(warmup_msg)
             await ws.recv()
 
@@ -362,7 +366,7 @@ async def benchmark_websocket_rs_async(uri: str, message_size: int, num_messages
 
         while recv_count < num_messages:
             while sent_count < num_messages and (sent_count - recv_count) < max_in_flight:
-                message = struct.pack('=I', sent_count) + base_message
+                message = struct.pack("=I", sent_count) + base_message
                 client_send_times[sent_count] = time.perf_counter()
                 await ws.send(message)
                 sent_count += 1
@@ -409,13 +413,13 @@ async def benchmark_websocket_rs_request_response(uri: str, message_size: int, n
     try:
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             await ws.send(warmup_msg)
             await ws.recv()
 
         # Request-Response 模式：發送一筆 → 等待回應 → 發下一筆
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             await ws.send(message)
 
@@ -475,13 +479,13 @@ async def benchmark_picows(uri: str, message_size: int, num_messages: int) -> di
 
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             ws_transport.send(WSMsgType.BINARY, warmup_msg)
             await response_queue.get()
 
         # 發送所有訊息
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             client_send_times[msg_id] = time.perf_counter()
             ws_transport.send(WSMsgType.BINARY, message)
 
@@ -544,13 +548,13 @@ async def benchmark_picows_request_response(uri: str, message_size: int, num_mes
 
         # 預熱
         for warmup_id in range(10):
-            warmup_msg = struct.pack('=I', 9999 + warmup_id) + b"warmup"
+            warmup_msg = struct.pack("=I", 9999 + warmup_id) + b"warmup"
             ws_transport.send(WSMsgType.BINARY, warmup_msg)
             await response_queue.get()
 
         # Request-Response 模式：發送一筆 → 等待回應 → 發下一筆
         for msg_id in range(num_messages):
-            message = struct.pack('=I', msg_id) + base_message
+            message = struct.pack("=I", msg_id) + base_message
             t_send = time.perf_counter()
             ws_transport.send(WSMsgType.BINARY, message)
 
@@ -614,9 +618,7 @@ async def main():
             print("-" * 100)
 
             # websockets Request-Response
-            result = await asyncio.to_thread(
-                lambda s=size: asyncio.run(benchmark_websockets_request_response(uri, s, num_messages))
-            )
+            result = await asyncio.to_thread(lambda s=size: asyncio.run(benchmark_websockets_request_response(uri, s, num_messages)))
             print(f"{result['impl']:22} | {result['send']:9.3f} ms | {result['recv']:9.3f} ms | {result['rtt']:7.3f} ms")
 
             # websockets sync
@@ -630,10 +632,7 @@ async def main():
             # picows Request-Response
             if PICOWS_AVAILABLE:
                 try:
-                    result = await asyncio.wait_for(
-                        benchmark_picows_request_response(uri, size, num_messages),
-                        timeout=60.0
-                    )
+                    result = await asyncio.wait_for(benchmark_picows_request_response(uri, size, num_messages), timeout=60.0)
                     print(f"{result['impl']:22} | {result['send']:9.3f} ms | {result['recv']:9.3f} ms | {result['rtt']:7.3f} ms")
                 except TimeoutError:
                     print(f"{'picows (RR)':22} | ERROR: 測試超時 (60秒)")
@@ -651,18 +650,13 @@ async def main():
             print("\n  --- Pipelined 模式（併發測試） ---")
 
             # websockets Pipelined
-            result = await asyncio.to_thread(
-                lambda s=size: asyncio.run(benchmark_websockets_async(uri, s, num_messages))
-            )
+            result = await asyncio.to_thread(lambda s=size: asyncio.run(benchmark_websockets_async(uri, s, num_messages)))
             print(f"{result['impl']:22} | {result['send']:9.3f} ms | {result['recv']:9.3f} ms | {result['rtt']:7.3f} ms")
 
             # picows Pipelined
             if PICOWS_AVAILABLE:
                 try:
-                    result = await asyncio.wait_for(
-                        benchmark_picows(uri, size, num_messages),
-                        timeout=60.0
-                    )
+                    result = await asyncio.wait_for(benchmark_picows(uri, size, num_messages), timeout=60.0)
                     print(f"{result['impl']:22} | {result['send']:9.3f} ms | {result['recv']:9.3f} ms | {result['rtt']:7.3f} ms")
                 except TimeoutError:
                     print(f"{'picows':22} | ERROR: 測試超時 (60秒)")

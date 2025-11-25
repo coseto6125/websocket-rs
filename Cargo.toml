@@ -1,6 +1,6 @@
 [package]
 name = "websocket_rs"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 authors = ["coseto6125 <enorenor@gmail.com>"]
 description = "High-performance WebSocket client library for Python using Rust"
@@ -18,12 +18,14 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py312"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+tungstenite = { version = "0.24", features = ["native-tls"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 futures-util = "0.3"
 parking_lot = "0.12"
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 bytes = "1.11.0"
+url = "2.5"
 
 [lints.rust]
 non_local_definitions = "allow"

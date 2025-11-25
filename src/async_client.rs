@@ -83,13 +83,7 @@ fn process_message(
 ) -> PyResult<Py<PyAny>> {
     match msg {
         Ok(Message::Text(text)) => Ok(text.into_pyobject(py)?.into_any().unbind()),
-        Ok(Message::Binary(data)) => {
-            let bytes = PyBytes::new_with(py, data.len(), |b| {
-                b.copy_from_slice(&data);
-                Ok(())
-            })?;
-            Ok(bytes.into_any().unbind())
-        }
+        Ok(Message::Binary(data)) => Ok(PyBytes::new(py, &data).into_any().unbind()),
         Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()),
         Ok(Message::Close(c)) => {
             if let Some(frame) = c {
