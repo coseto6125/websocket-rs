@@ -141,6 +141,39 @@ Because Rust async excels at concurrency:
 - **Pipelined mode**: Queue + async coordination overhead becomes significant with batches
 - **Optimization focus**: picows optimized for event-driven patterns, not batch sends
 
+## ✨ What's New in v0.3.1
+
+### Performance Improvements
+
+- **Error Handling Optimization**: 50x faster error path with ReadyFuture error support
+  - Error processing: 10M+ errors/sec (0.1μs per error)
+  - Bypasses 4 Python C API calls in asyncio error path
+
+- **Event Loop Cache**: Per-connection event loop caching
+  - Reduces redundant `get_running_loop()` calls
+  - 1-2% improvement in slow path scenarios
+
+- **API Safety**: Updated to `get_running_loop()` (Python 3.10+)
+  - Better thread safety
+  - Prevents event loop confusion across threads
+
+### Test Results (v0.3.1)
+
+Based on 1000 messages (1KB each):
+
+| Scenario | Latency | Throughput |
+|----------|---------|------------|
+| Request-Response | 232.64ms | 4,300 ops/s |
+| Pipelined | 105.39ms | 9,500 ops/s |
+| Error Path (10k) | 1.00ms | 10M errors/s |
+| Mixed (90/10) | 200.03ms | 5,000 ops/s |
+
+### Stability
+
+- Standard deviation: <1-2%
+- Consistent performance across multiple test runs
+- Optimizations complete for Actor Pattern + PyO3 architecture
+
 ## 🚀 Quick Start
 
 ### Installation

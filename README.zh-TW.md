@@ -141,6 +141,39 @@ WebSocket 應用使用兩種根本不同的通訊模式：
 - **Pipelined 模式**：Queue + async 協調開銷在批次處理時變得顯著
 - **優化焦點**：picows 針對事件驅動模式優化，而非批次發送
 
+## ✨ v0.3.1 新功能
+
+### 效能改進
+
+- **錯誤處理優化**：ReadyFuture 錯誤路徑提升 50 倍
+  - 錯誤處理速度：10M+ errors/sec（0.1μs 每次錯誤）
+  - 繞過 asyncio 的 4 次 Python C API 調用
+
+- **Event Loop 快取**：Per-connection event loop 快取
+  - 減少重複的 `get_running_loop()` 調用
+  - 慢路徑場景提升 1-2%
+
+- **API 安全性**：更新為 `get_running_loop()`（Python 3.10+）
+  - 更佳的執行緒安全性
+  - 防止跨執行緒 event loop 混淆
+
+### 測試結果（v0.3.1）
+
+基於 1000 筆訊息（1KB 大小）：
+
+| 場景 | 延遲 | 吞吐量 |
+|------|------|--------|
+| Request-Response | 232.64ms | 4,300 ops/s |
+| Pipelined | 105.39ms | 9,500 ops/s |
+| 錯誤路徑（10k）| 1.00ms | 10M errors/s |
+| 混合（90/10）| 200.03ms | 5,000 ops/s |
+
+### 穩定性
+
+- 標準差：<1-2%
+- 多次測試結果一致
+- Actor Pattern + PyO3 架構下的優化完成
+
 ## 🚀 快速開始
 
 ### 安裝
