@@ -36,7 +36,7 @@ WebSocket 應用使用兩種根本不同的通訊模式：
    - 特性：併發、非阻塞、批次 I/O
    - 最佳選擇：**websocket-rs Async**（Rust async + Tokio）
 
-📊 **[查看詳細效能測試](docs/BENCHMARKS.md)** - 完整效能比較與測試方法
+📊 **[查看詳細效能測試](https://github.com/coseto6125/websocket-rs/blob/main/docs/BENCHMARKS.md)** - 完整效能比較與測試方法
 
 ## ✨ v0.4.1 新功能
 
