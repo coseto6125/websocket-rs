@@ -41,8 +41,14 @@ ENV/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Test and cache
+.pytest_cache/
+.ruff_cache/
+
+# Benchmark outputs
 *.log
-*.json
+benchmark_results.json
 
 # Scripts (local automation)
 auto_merge_and_release.sh
