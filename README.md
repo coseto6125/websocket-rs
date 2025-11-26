@@ -36,7 +36,7 @@ WebSocket applications use two fundamentally different communication patterns:
    - Characteristics: Concurrent, non-blocking, batched I/O
    - Winner: **websocket-rs Async** (Rust async with Tokio)
 
-📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** - Comprehensive performance comparison with test methodology
+📊 **[View Detailed Benchmarks](https://github.com/coseto6125/websocket-rs/blob/main/docs/BENCHMARKS.md)** - Comprehensive performance comparison with test methodology
 
 ## ✨ What's New in v0.4.1
 
