@@ -43,3 +43,7 @@ ENV/
 Thumbs.db
 *.log
 *.json
+
+# Scripts (local automation)
+auto_merge_and_release.sh
+monitor_and_merge.sh
