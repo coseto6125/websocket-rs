@@ -176,8 +176,8 @@ connect(
 ### 從 GitHub Releases 安裝（預編譯 wheels）
 
 ```bash
-# 指定版本
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.3.0/websocket_rs-0.3.0-cp312-abi3-linux_x86_64.whl
+# 指定版本（範例為 Linux x86_64, Python 3.12+）
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.4.1/websocket_rs-0.4.1-cp312-abi3-linux_x86_64.whl
 ```
 
 ### 從原始碼編譯

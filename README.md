@@ -174,8 +174,8 @@ connect(
 ### From GitHub Releases (Pre-built wheels)
 
 ```bash
-# Specify version
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.3.0/websocket_rs-0.3.0-cp312-abi3-linux_x86_64.whl
+# Specify version (example for Linux x86_64, Python 3.12+)
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.4.1/websocket_rs-0.4.1-cp312-abi3-linux_x86_64.whl
 ```
 
 ### From Source

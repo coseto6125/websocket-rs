@@ -71,7 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Silent error ignoring
 - Missing timeout on connection close
 
-## [0.2.0] - 2024-XX-XX
+## [0.2.0] - 2025-11-21
 
 ### Added
 - Initial async and sync client implementations
