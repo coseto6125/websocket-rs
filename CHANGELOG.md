@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2025-11-26
+
+### Fixed
+- Version number sync across all package files (__init__.py, pyproject.toml, Cargo.toml)
+- Cleaned up obsolete python/ directory structure
+- Improved .gitignore rules for better precision
+
+## [0.4.0] - 2025-11-26
+
+### Added
+- Pure synchronous client implementation (websocket_rs.sync.client)
+- High-performance sync API with blocking I/O
+- Comprehensive benchmark suite with server timestamp validation
+
+### Performance
+- Sync client: ~50% faster than websockets.sync.client
+- Request-Response: 194.32ms for 1000 messages (vs 287.71ms)
+- Pipelined: 115.13ms for 1000 messages (vs 152.24ms)
+- Throughput: 8,685 msgs/sec (vs 5,806 msgs/sec)
+
+### Changed
+- Project structure reorganization
+- Enhanced documentation with performance benchmarks
+
 ## [0.3.1] - 2025-11-25
 
 ### Added
