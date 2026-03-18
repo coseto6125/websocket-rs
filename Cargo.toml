@@ -27,6 +27,9 @@ parking_lot = "0.12"
 pyo3-async-runtimes = { version = "0.27", features = ["tokio-runtime"] }
 bytes = "1.11.0"
 url = "2.5"
+tokio-socks = "0.5.2"
+native-tls = "0.2.18"
+tokio-native-tls = "0.3.1"
 
 [lints.rust]
 non_local_definitions = "allow"

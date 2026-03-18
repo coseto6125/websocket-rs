@@ -5,30 +5,27 @@ use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopAsyncIteration, 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3::BoundObject;
+use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
 use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
 
-// Type alias to simplify complex types
 type MessageReceiver = Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>;
 
-/// A custom Future that completes immediately.
-/// This avoids the overhead of asyncio.get_event_loop().create_future()
-/// when the result is already available (Optimistic Send/Recv).
-///
-/// Supports both success and error paths for maximum fast-path coverage.
 #[pyclass]
 struct ReadyFuture {
     result: Option<Result<Py<PyAny>, PyErr>>,
 }
 
-// Cache StopIteration type to avoid repeated lookups
 static STOP_ITERATION: OnceLock<Py<PyAny>> = OnceLock::new();
 
 fn get_stop_iteration(py: Python<'_>) -> &Py<PyAny> {
@@ -49,15 +46,11 @@ impl ReadyFuture {
         if let Some(res) = self.result.take() {
             match res {
                 Ok(val) => {
-                    // Success path: Use cached StopIteration type
                     let stop_iter = get_stop_iteration(py).bind(py);
                     let err = stop_iter.call1((val,))?;
                     Err(PyErr::from_value(err))
                 }
-                Err(e) => {
-                    // Error path: Directly raise the exception
-                    Err(e)
-                }
+                Err(e) => Err(e),
             }
         } else {
             Err(pyo3::exceptions::PyStopIteration::new_err(()))
@@ -65,14 +58,8 @@ impl ReadyFuture {
     }
 }
 
-// Cache asyncio parts to avoid repeated imports
 static ASYNCIO: OnceLock<Py<PyModule>> = OnceLock::new();
 
-/// Process a received WebSocket message into a Python object.
-/// This function is marked #[inline] to ensure zero-cost abstraction.
-///
-/// - `async_iter`: If true, uses PyStopAsyncIteration for Close messages (for __anext__),
-///   otherwise uses PyRuntimeError (for recv)
 #[inline]
 fn process_message(
     py: Python,
@@ -111,24 +98,17 @@ fn get_asyncio(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     Ok(module)
 }
 
-/// Get event loop from cache, with fallback to dynamic query
 #[inline]
 fn get_cached_event_loop<'py>(
     py: Python<'py>,
     cache: &Arc<RwLock<Option<Py<PyAny>>>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    // Fast path: Use cache
     if let Some(loop_obj) = cache.read().as_ref() {
         return Ok(loop_obj.bind(py).clone());
     }
-
-    // Slow path: Fallback to dynamic query (use get_running_loop for safety)
     let asyncio = get_asyncio(py)?;
     let event_loop = asyncio.call_method0("get_running_loop")?;
-
-    // Write back to cache for future calls
     *cache.write() = Some(event_loop.clone().unbind());
-
     Ok(event_loop)
 }
 
@@ -169,9 +149,7 @@ fn ready_ok<'py>(py: Python<'py>, result: Py<PyAny>) -> PyResult<Bound<'py, PyAn
     Ok(future)
 }
 
-// Fast path: Create completed future with minimal overhead (success)
 fn ready_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<Bound<'py, PyAny>> {
-    // Use custom ReadyFuture to bypass asyncio overhead
     let obj = result
         .into_pyobject(py)
         .map_err(|_| PyRuntimeError::new_err("Conversion failed"))?;
@@ -185,9 +163,7 @@ fn ready_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<
     Ok(future.into_any())
 }
 
-// Fast path: Create completed future with error (error path optimization)
 fn ready_fast_err<'py>(py: Python<'py>, err: PyErr) -> PyResult<Bound<'py, PyAny>> {
-    // Use custom ReadyFuture to bypass asyncio overhead for errors
     let future = Bound::new(
         py,
         ReadyFuture {
@@ -197,7 +173,6 @@ fn ready_fast_err<'py>(py: Python<'py>, err: PyErr) -> PyResult<Bound<'py, PyAny
     Ok(future.into_any())
 }
 
-/// Commands sent to the background actor
 #[derive(Debug)]
 enum Command {
     Text(String),
@@ -207,23 +182,97 @@ enum Command {
     Close,
 }
 
-/// Async client connection
+// Background Task Handler (Supports both Direct and Proxy Streams)
+async fn start_ws_task<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
+    slf_ptr: Py<AsyncClientConnection>,
+    future_ptr: Py<PyAny>,
+    event_loop_ptr: Py<PyAny>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx_cmd_val, mut rx_cmd) = mpsc::channel::<Command>(64);
+    let (tx_msg, rx_msg_val) = mpsc::channel::<Result<Message, String>>(64);
+
+    Python::attach(|py| {
+        let mut ws_mut = slf_ptr.bind(py).borrow_mut();
+        ws_mut.tx_cmd = Some(tx_cmd_val);
+        ws_mut.rx_msg_internal = Some(Arc::new(AsyncMutex::new(rx_msg_val)));
+        *ws_mut.stream_sync.write() = true;
+    });
+
+    tokio::spawn(async move {
+        let (mut sink, mut stream) = ws_stream.split();
+        loop {
+            tokio::select! {
+                cmd = rx_cmd.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            let mut close_requested = false;
+                            match cmd {
+                                Command::Text(t) => { let _ = sink.send(Message::Text(Utf8Bytes::from(t))).await; }
+                                Command::Binary(b) => { let _ = sink.send(Message::Binary(Bytes::from(b))).await; }
+                                Command::Ping(d) => { let _ = sink.send(Message::Ping(Bytes::from(d))).await; }
+                                Command::Pong(d) => { let _ = sink.send(Message::Pong(Bytes::from(d))).await; }
+                                Command::Close => {
+                                    let _ = sink.close().await;
+                                    close_requested = true;
+                                }
+                            }
+                            if close_requested {
+                                while let Some(msg) = stream.next().await {
+                                    match msg {
+                                        Ok(Message::Close(_)) => break,
+                                        Ok(_) => continue,
+                                        Err(_) => break,
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                msg = stream.next() => {
+                    match msg {
+                        Some(Ok(msg)) => {
+                            if tx_msg.send(Ok(msg)).await.is_err() { break; }
+                        }
+                        Some(Err(e)) => {
+                            let _ = tx_msg.send(Err(e.to_string())).await;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        let _ = sink.close().await;
+    });
+
+    Python::attach(|py| {
+        let future = future_ptr.bind(py);
+        let event_loop = event_loop_ptr.bind(py);
+        if let Err(e) = complete_future(py, event_loop, future, slf_ptr.into_any()) {
+            eprintln!("CRITICAL: Failed to complete future: {:?}", e);
+        }
+    });
+}
+
 #[pyclass(name = "ClientConnection", module = "websocket_rs.async_client")]
 pub struct AsyncClientConnection {
     url: String,
-    // Communication with the background task
+    headers: Arc<RwLock<Option<HashMap<String, String>>>>,
+    proxy: Arc<RwLock<Option<String>>>,
     tx_cmd: Option<mpsc::Sender<Command>>,
     rx_msg_internal: Option<MessageReceiver>,
     stream_sync: Arc<RwLock<bool>>,
     connect_timeout: f64,
     receive_timeout: f64,
-    // Event loop cache (per-connection optimization)
     event_loop: Arc<RwLock<Option<Py<PyAny>>>>,
-    // Connection info
     local_addr: Arc<RwLock<Option<String>>>,
     remote_addr: Arc<RwLock<Option<String>>>,
     subprotocol: Arc<RwLock<Option<String>>>,
-    // Close info
     close_code: Arc<RwLock<Option<u16>>>,
     close_reason: Arc<RwLock<Option<String>>>,
 }
@@ -231,10 +280,18 @@ pub struct AsyncClientConnection {
 #[pymethods]
 impl AsyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None))]
-    fn new(url: String, connect_timeout: Option<f64>, receive_timeout: Option<f64>) -> Self {
+    #[pyo3(signature = (url, headers=None, proxy=None, connect_timeout=None, receive_timeout=None))]
+    fn new(
+        url: String,
+        headers: Option<HashMap<String, String>>,
+        proxy: Option<String>,
+        connect_timeout: Option<f64>,
+        receive_timeout: Option<f64>,
+    ) -> Self {
         AsyncClientConnection {
             url,
+            headers: Arc::new(RwLock::new(headers)),
+            proxy: Arc::new(RwLock::new(proxy)),
             tx_cmd: None,
             rx_msg_internal: None,
             stream_sync: Arc::new(RwLock::new(false)),
@@ -249,7 +306,6 @@ impl AsyncClientConnection {
         }
     }
 
-    /// Send a message (async)
     fn send<'py>(
         &self,
         py: Python<'py>,
@@ -268,44 +324,34 @@ impl AsyncClientConnection {
         } else {
             return Err(PyRuntimeError::new_err("Message must be str or bytes"));
         };
-        // Optimistic Send: Try to send synchronously first
+
         match tx_cloned.try_send(command) {
-            Ok(_) => {
-                // Fast path: Use optimized future creation
-                ready_fast(py, py.None())
-            }
+            Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
-                // Channel full, fallback to async wait (Backpressure)
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
-
                 let future_ptr = future.clone().unbind();
                 let event_loop_ptr = event_loop.unbind();
 
                 py.detach(|| {
                     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                         let res = tx_cloned.send(cmd).await;
-
                         Python::attach(|py| {
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-
                             if res.is_ok() {
-                                if let Err(e) = complete_future(py, event_loop, future, py.None()) {
-                                    eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                                }
-                            } else if let Err(e) = fail_future(
-                                py,
-                                event_loop,
-                                future,
-                                PyRuntimeError::new_err("Failed to send message (actor died)"),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
+                                let _ = complete_future(py, event_loop, future, py.None());
+                            } else {
+                                let _ = fail_future(
+                                    py,
+                                    event_loop,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send message"),
+                                );
                             }
                         });
                     });
                 });
-
                 Ok(future)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -314,7 +360,6 @@ impl AsyncClientConnection {
         }
     }
 
-    /// Receive a message (async)
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = self
             .rx_msg_internal
@@ -325,94 +370,62 @@ impl AsyncClientConnection {
         let close_code = self.close_code.clone();
         let close_reason = self.close_reason.clone();
 
-        // Optimistic Recv: Try to receive synchronously first
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    // Message available! Process immediately
                     let result = process_message(py, msg, &close_code, &close_reason, false);
-
                     match result {
-                        Ok(val) => {
-                            // Fast path: Use optimized future creation
-                            return ready_fast(py, val);
-                        }
-                        Err(e) => {
-                            // Fast error path: Use optimized error future
-                            return ready_fast_err(py, e);
-                        }
+                        Ok(val) => return ready_fast(py, val),
+                        Err(e) => return ready_fast_err(py, e),
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Channel empty, proceed to async wait
-                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Fast error path: Connection closed
                     return ready_fast_err(py, PyRuntimeError::new_err("Connection closed"));
                 }
             }
         }
 
-        // Slow Path: Async Wait
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
-
         let future_ptr = future.clone().unbind();
         let event_loop_ptr = event_loop.unbind();
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let mut rx = rx.lock().await;
-
                 let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv()).await;
-
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
                     let event_loop = event_loop_ptr.bind(py);
-
                     match msg_result {
                         Ok(Some(msg)) => {
                             let result =
                                 process_message(py, msg, &close_code, &close_reason, false);
-
                             match result {
                                 Ok(val) => {
-                                    if let Err(e) = complete_future(py, event_loop, future, val) {
-                                        eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                                    }
+                                    let _ = complete_future(py, event_loop, future, val);
                                 }
                                 Err(e) => {
-                                    if let Err(err) = fail_future(py, event_loop, future, e) {
-                                        eprintln!(
-                                            "CRITICAL: Failed to set future exception: {:?}",
-                                            err
-                                        );
-                                    }
+                                    let _ = fail_future(py, event_loop, future, e);
                                 }
                             }
                         }
                         Ok(None) => {
-                            if let Err(e) = fail_future(
+                            let _ = fail_future(
                                 py,
                                 event_loop,
                                 future,
                                 PyRuntimeError::new_err("Connection closed"),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                            }
+                            );
                         }
                         Err(_) => {
-                            if let Err(e) = fail_future(
+                            let _ = fail_future(
                                 py,
                                 event_loop,
                                 future,
-                                PyTimeoutError::new_err(format!(
-                                    "Receive timed out ({} seconds)",
-                                    receive_timeout
-                                )),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                            }
+                                PyTimeoutError::new_err("Receive timed out"),
+                            );
                         }
                     }
                 });
@@ -422,12 +435,10 @@ impl AsyncClientConnection {
         Ok(future)
     }
 
-    /// Close the connection (async)
     fn close<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let event_loop_cache = slf.bind(py).borrow().event_loop.clone();
         let event_loop = get_cached_event_loop(py, &event_loop_cache)?;
         let future = create_future(py, &event_loop)?;
-
         let future_ptr = future.clone().unbind();
         let event_loop_ptr = event_loop.unbind();
 
@@ -437,33 +448,27 @@ impl AsyncClientConnection {
                 let mut rx_arc_option = None;
                 let mut stream_sync_arc = None;
 
-                // Acquire GIL to take ownership of fields and set stream_sync
                 Python::attach(|py| {
                     let mut ws_mut = slf.bind(py).borrow_mut();
-                    tx_option = ws_mut.tx_cmd.take(); // Take ownership
-                    rx_arc_option = ws_mut.rx_msg_internal.take(); // Take ownership
-                    stream_sync_arc = Some(ws_mut.stream_sync.clone()); // Clone Arc for later mutation
+                    tx_option = ws_mut.tx_cmd.take();
+                    rx_arc_option = ws_mut.rx_msg_internal.take();
+                    stream_sync_arc = Some(ws_mut.stream_sync.clone());
                 });
 
-                // Set stream_sync to false
                 if let Some(arc) = stream_sync_arc {
                     *arc.write() = false;
                 }
-
-                // 1. Send Close command (if tx exists)
                 if let Some(tx) = tx_option {
                     let _ = tx.send(Command::Close).await;
                 }
 
-                // 2. Wait for actor to close with 10s timeout (if rx exists)
                 if let Some(rx_arc) = rx_arc_option {
                     let _ = tokio::time::timeout(Duration::from_secs(10), async {
                         let mut rx = rx_arc.lock().await;
                         while let Some(msg) = rx.recv().await {
                             match msg {
-                                Ok(Message::Close(_)) => break,
+                                Ok(Message::Close(_)) | Err(_) => break,
                                 Ok(_) => continue,
-                                Err(_) => break,
                             }
                         }
                     })
@@ -473,9 +478,7 @@ impl AsyncClientConnection {
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
                     let event_loop = event_loop_ptr.bind(py);
-                    if let Err(e) = complete_future(py, event_loop, future, py.None()) {
-                        eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                    }
+                    let _ = complete_future(py, event_loop, future, py.None());
                 });
             });
         });
@@ -483,7 +486,6 @@ impl AsyncClientConnection {
         Ok(future)
     }
 
-    /// Ping (async)
     fn ping<'py>(&self, py: Python<'py>, data: Option<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
         let tx_cloned = self
             .tx_cmd
@@ -491,43 +493,32 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let data = data.unwrap_or_default();
-
-        // Optimistic Send
         match tx_cloned.try_send(Command::Ping(data)) {
-            Ok(_) => {
-                let future = ready_ok(py, py.None())?;
-                Ok(future)
-            }
+            Ok(_) => ready_ok(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
-
                 let future_ptr = future.clone().unbind();
                 let event_loop_ptr = event_loop.unbind();
-
                 py.detach(|| {
                     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                         let res = tx_cloned.send(cmd).await;
-
                         Python::attach(|py| {
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
                             if res.is_ok() {
-                                if let Err(e) = complete_future(py, event_loop, future, py.None()) {
-                                    eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                                }
-                            } else if let Err(e) = fail_future(
-                                py,
-                                event_loop,
-                                future,
-                                PyRuntimeError::new_err("Failed to send ping"),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
+                                let _ = complete_future(py, event_loop, future, py.None());
+                            } else {
+                                let _ = fail_future(
+                                    py,
+                                    event_loop,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send ping"),
+                                );
                             }
                         });
                     });
                 });
-
                 Ok(future)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -536,7 +527,6 @@ impl AsyncClientConnection {
         }
     }
 
-    /// Pong (async)
     fn pong<'py>(&self, py: Python<'py>, data: Option<Vec<u8>>) -> PyResult<Bound<'py, PyAny>> {
         let tx_cloned = self
             .tx_cmd
@@ -544,43 +534,32 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let data = data.unwrap_or_default();
-
-        // Optimistic Send
         match tx_cloned.try_send(Command::Pong(data)) {
-            Ok(_) => {
-                let future = ready_ok(py, py.None())?;
-                Ok(future)
-            }
+            Ok(_) => ready_ok(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
-
                 let future_ptr = future.clone().unbind();
                 let event_loop_ptr = event_loop.unbind();
-
                 py.detach(|| {
                     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                         let res = tx_cloned.send(cmd).await;
-
                         Python::attach(|py| {
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
                             if res.is_ok() {
-                                if let Err(e) = complete_future(py, event_loop, future, py.None()) {
-                                    eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                                }
-                            } else if let Err(e) = fail_future(
-                                py,
-                                event_loop,
-                                future,
-                                PyRuntimeError::new_err("Failed to send pong"),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
+                                let _ = complete_future(py, event_loop, future, py.None());
+                            } else {
+                                let _ = fail_future(
+                                    py,
+                                    event_loop,
+                                    future,
+                                    PyRuntimeError::new_err("Failed to send pong"),
+                                );
                             }
                         });
                     });
                 });
-
                 Ok(future)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -589,17 +568,14 @@ impl AsyncClientConnection {
         }
     }
 
-    // ... getters ...
     #[getter]
     fn open(&self) -> bool {
         *self.stream_sync.read()
     }
-
     #[getter]
     fn closed(&self) -> bool {
         !*self.stream_sync.read()
     }
-
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
         self.local_addr.read().as_ref().and_then(|s| {
@@ -607,7 +583,6 @@ impl AsyncClientConnection {
                 .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
-
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
         self.remote_addr.read().as_ref().and_then(|s| {
@@ -615,30 +590,35 @@ impl AsyncClientConnection {
                 .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
         })
     }
-
     #[getter]
     fn close_code(&self) -> Option<u16> {
         *self.close_code.read()
     }
-
     #[getter]
     fn close_reason(&self) -> Option<String> {
         self.close_reason.read().clone()
     }
-
     #[getter]
     fn subprotocol(&self) -> Option<String> {
         self.subprotocol.read().clone()
     }
 
-    /// Async context manager - enter
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (url, connect_timeout, _stream_sync, local_addr, remote_addr, event_loop_cache) = {
+        let (
+            url,
+            headers_cache,
+            proxy_cache,
+            connect_timeout,
+            local_addr,
+            remote_addr,
+            event_loop_cache,
+        ) = {
             let ws = slf.bind(py).borrow();
             (
                 ws.url.clone(),
+                ws.headers.clone(),
+                ws.proxy.clone(),
                 ws.connect_timeout,
-                ws.stream_sync.clone(),
                 ws.local_addr.clone(),
                 ws.remote_addr.clone(),
                 ws.event_loop.clone(),
@@ -647,26 +627,103 @@ impl AsyncClientConnection {
 
         let asyncio = get_asyncio(py)?;
         let event_loop = asyncio.call_method0("get_running_loop")?;
-
-        // Cache event loop for this connection
         *event_loop_cache.write() = Some(event_loop.clone().unbind());
 
         let future = create_future(py, &event_loop)?;
-
         let future_ptr = future.clone().unbind();
         let event_loop_ptr = event_loop.unbind();
         let slf_ptr = slf.clone_ref(py);
 
+        // Extract values without holding locks across await points
+        let proxy_opt = proxy_cache.read().clone();
+
+        // 🚀 FIX: Clone the pointers WHILE WE STILL HAVE THE GIL
+        let slf_ptr_task = slf_ptr.clone_ref(py);
+        let future_ptr_task = future_ptr.clone_ref(py);
+        let event_loop_ptr_task = event_loop_ptr.clone_ref(py);
+
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                let result = timeout(
-                    Duration::from_secs_f64(connect_timeout),
-                    connect_async(&url),
-                )
-                .await;
+                let connect_task = async move {
+                    let mut request = match url.clone().into_client_request() {
+                        Ok(req) => req,
+                        Err(e) => return Err(e.to_string()),
+                    };
 
-                match result {
-                    Ok(Ok((ws_stream, _))) => {
+                    if let Some(headers) = headers_cache.read().as_ref() {
+                        for (k, v) in headers {
+                            if let (Ok(k_hdr), Ok(v_hdr)) =
+                                (HeaderName::from_str(k), HeaderValue::from_str(v))
+                            {
+                                request.headers_mut().insert(k_hdr, v_hdr);
+                            }
+                        }
+                    }
+
+                    if let Some(proxy_str) = proxy_opt {
+                        let target_url = url::Url::parse(&url).map_err(|e| e.to_string())?;
+                        let host = target_url
+                            .host_str()
+                            .ok_or("Invalid target host")?
+                            .to_string();
+                        let port = target_url
+                            .port_or_known_default()
+                            .ok_or("Invalid target port")?;
+
+                        let proxy_url = url::Url::parse(&proxy_str).map_err(|e| e.to_string())?;
+                        let proxy_host = proxy_url
+                            .host_str()
+                            .ok_or("Invalid proxy host")?
+                            .to_string();
+                        let proxy_port = proxy_url
+                            .port_or_known_default()
+                            .ok_or("Invalid proxy port")?;
+
+                        let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
+                            (proxy_host.as_str(), proxy_port),
+                            (host.as_str(), port),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+
+                        if target_url.scheme() == "wss" {
+                            let cx = native_tls::TlsConnector::builder()
+                                .build()
+                                .map_err(|e| e.to_string())?;
+                            let cx = tokio_native_tls::TlsConnector::from(cx);
+                            let tls_stream = cx
+                                .connect(&host, socks_stream)
+                                .await
+                                .map_err(|e| e.to_string())?;
+
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, tls_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            start_ws_task(
+                                ws_stream,
+                                slf_ptr_task,
+                                future_ptr_task,
+                                event_loop_ptr_task,
+                            )
+                            .await;
+                        } else {
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, socks_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            start_ws_task(
+                                ws_stream,
+                                slf_ptr_task,
+                                future_ptr_task,
+                                event_loop_ptr_task,
+                            )
+                            .await;
+                        }
+                    } else {
+                        let (ws_stream, _) =
+                            connect_async(request).await.map_err(|e| e.to_string())?;
+
                         match ws_stream.get_ref() {
                             MaybeTlsStream::Plain(s) => {
                                 if let Ok(addr) = s.local_addr() {
@@ -686,105 +743,39 @@ impl AsyncClientConnection {
                             }
                             _ => {}
                         }
-
-                        // Create channels with optimal buffer size
-                        let (tx_cmd_val, mut rx_cmd) = mpsc::channel::<Command>(64);
-                        let (tx_msg, rx_msg_val) = mpsc::channel::<Result<Message, String>>(64);
-
-                        // Update the fields on the AsyncClientConnection instance
-                        Python::attach(|py| {
-                            let mut ws_mut = slf_ptr.bind(py).borrow_mut();
-                            ws_mut.tx_cmd = Some(tx_cmd_val);
-                            ws_mut.rx_msg_internal = Some(Arc::new(AsyncMutex::new(rx_msg_val)));
-                            *ws_mut.stream_sync.write() = true;
-                        });
-
-                        // Spawn background actor
-                        tokio::spawn(async move {
-                            let (sink, stream) = ws_stream.split();
-
-                            let mut sink = sink;
-                            let mut stream = stream;
-
-                            loop {
-                                tokio::select! {
-                                    cmd = rx_cmd.recv() => {
-                                        match cmd {
-                                            Some(cmd) => {
-                                                // 處理第一個命令
-                                                let mut close_requested = false;
-                                                match cmd {
-                                                    Command::Text(t) => { let _ = sink.send(Message::Text(Utf8Bytes::from(t))).await; }
-                                                    Command::Binary(b) => { let _ = sink.send(Message::Binary(Bytes::from(b))).await; }
-                                                    Command::Ping(d) => { let _ = sink.send(Message::Ping(Bytes::from(d))).await; }
-                                                    Command::Pong(d) => { let _ = sink.send(Message::Pong(Bytes::from(d))).await; }
-                                                    Command::Close => {
-                                                        let _ = sink.close().await;
-                                                        close_requested = true;
-                                                    }
-                                                }
-
-                                                if close_requested {
-                                                    // 如果是關閉命令,繼續讀取直到對方關閉或出錯
-                                                    while let Some(msg) = stream.next().await {
-                                                        match msg {
-                                                            Ok(Message::Close(_)) => break,
-                                                            Ok(_) => continue,
-                                                            Err(_) => break,
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                            None => break, // Channel closed
-                                        }
-                                    }
-                                    msg = stream.next() => {
-                                        match msg {
-                                            Some(Ok(msg)) => {
-                                                if tx_msg.send(Ok(msg)).await.is_err() {
-                                                    break; // Receiver dropped
-                                                }
-                                            }
-                                            Some(Err(e)) => {
-                                                let _ = tx_msg.send(Err(e.to_string())).await;
-                                                break;
-                                            }
-                                            None => break, // Stream ended
-                                        }
-                                    }
-                                }
-                            }
-                            // Ensure sink is closed if we exit loop
-                            let _ = sink.close().await;
-                        });
-
-                        Python::attach(|py| {
-                            let future = future_ptr.bind(py);
-                            let event_loop = event_loop_ptr.bind(py);
-                            if let Err(e) = complete_future(py, event_loop, future, slf_ptr.into_any()) {
-                                eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                            }
-                        });
+                        start_ws_task(
+                            ws_stream,
+                            slf_ptr_task,
+                            future_ptr_task,
+                            event_loop_ptr_task,
+                        )
+                        .await;
                     }
+                    Ok::<(), String>(())
+                };
+
+                match timeout(Duration::from_secs_f64(connect_timeout), connect_task).await {
                     Ok(Err(e)) => {
                         Python::attach(|py| {
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            if let Err(err) = fail_future(py, event_loop, future, PyConnectionError::new_err(e.to_string())) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", err);
-                            }
+                            let _ =
+                                fail_future(py, event_loop, future, PyConnectionError::new_err(e));
                         });
-                    },
+                    }
                     Err(_) => {
                         Python::attach(|py| {
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            if let Err(e) = fail_future(py, event_loop, future, PyTimeoutError::new_err(format!("Connection timed out ({} seconds)", connect_timeout))) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                            }
+                            let _ = fail_future(
+                                py,
+                                event_loop,
+                                future,
+                                PyTimeoutError::new_err("Connection timed out"),
+                            );
                         });
-                    },
+                    }
+                    Ok(Ok(())) => {} // Success handled inside start_ws_task
                 }
             });
         });
@@ -792,27 +783,22 @@ impl AsyncClientConnection {
         Ok(future)
     }
 
-    /// Async context manager - exit
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __aexit__<'py>(
-        slf: Py<Self>, // Capture slf for passing to close
+        slf: Py<Self>,
         py: Python<'py>,
         _exc_type: Option<&Bound<'py, PyAny>>,
         _exc_value: Option<&Bound<'py, PyAny>>,
         _traceback: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        // Clear event loop cache
         *slf.bind(py).borrow().event_loop.write() = None;
-
-        AsyncClientConnection::close(slf, py) // Call close with slf
+        AsyncClientConnection::close(slf, py)
     }
 
-    /// Async Iterator support - return self
     fn __aiter__(slf: Py<Self>) -> Py<Self> {
         slf
     }
 
-    /// Async Iterator support - return next message
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let rx = self
             .rx_msg_internal
@@ -823,93 +809,61 @@ impl AsyncClientConnection {
         let close_code = self.close_code.clone();
         let close_reason = self.close_reason.clone();
 
-        // Optimistic Recv: Try to receive synchronously first
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    // Message available! Process immediately
                     let result = process_message(py, msg, &close_code, &close_reason, true);
-
                     match result {
-                        Ok(val) => {
-                            // Fast path: Use optimized future creation
-                            return ready_fast(py, val);
-                        }
-                        Err(e) => {
-                            // Fast error path: Use optimized error future
-                            return ready_fast_err(py, e);
-                        }
+                        Ok(val) => return ready_fast(py, val),
+                        Err(e) => return ready_fast_err(py, e),
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    // Channel empty, proceed to async wait
-                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // Fast error path: Connection closed
-                    return ready_fast_err(py, PyStopAsyncIteration::new_err("Connection closed"));
+                    return ready_fast_err(py, PyStopAsyncIteration::new_err("Connection closed"))
                 }
             }
         }
 
-        // Slow Path: Async Wait
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
-
         let future_ptr = future.clone().unbind();
         let event_loop_ptr = event_loop.unbind();
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let mut rx = rx.lock().await;
-
                 let msg_result = timeout(Duration::from_secs_f64(receive_timeout), rx.recv()).await;
-
                 Python::attach(|py| {
                     let future = future_ptr.bind(py);
                     let event_loop = event_loop_ptr.bind(py);
-
                     match msg_result {
                         Ok(Some(msg)) => {
                             let result = process_message(py, msg, &close_code, &close_reason, true);
-
                             match result {
                                 Ok(val) => {
-                                    if let Err(e) = complete_future(py, event_loop, future, val) {
-                                        eprintln!("CRITICAL: Failed to complete future: {:?}", e);
-                                    }
+                                    let _ = complete_future(py, event_loop, future, val);
                                 }
                                 Err(e) => {
-                                    if let Err(err) = fail_future(py, event_loop, future, e) {
-                                        eprintln!(
-                                            "CRITICAL: Failed to set future exception: {:?}",
-                                            err
-                                        );
-                                    }
+                                    let _ = fail_future(py, event_loop, future, e);
                                 }
                             }
                         }
                         Ok(None) => {
-                            if let Err(e) = fail_future(
+                            let _ = fail_future(
                                 py,
                                 event_loop,
                                 future,
                                 PyStopAsyncIteration::new_err("Connection closed"),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                            }
+                            );
                         }
                         Err(_) => {
-                            if let Err(e) = fail_future(
+                            let _ = fail_future(
                                 py,
                                 event_loop,
                                 future,
-                                PyTimeoutError::new_err(format!(
-                                    "Receive timed out ({} seconds)",
-                                    receive_timeout
-                                )),
-                            ) {
-                                eprintln!("CRITICAL: Failed to set future exception: {:?}", e);
-                            }
+                                PyTimeoutError::new_err("Receive timed out"),
+                            );
                         }
                     }
                 });
@@ -920,28 +874,24 @@ impl AsyncClientConnection {
     }
 }
 
-/// Connect to a WebSocket server (async)
 #[pyfunction]
-#[pyo3(signature = (uri, **_kwargs))]
+#[pyo3(signature = (uri, headers=None, proxy=None, **_kwargs))]
 pub fn connect<'py>(
     py: Python<'py>,
     uri: String,
+    headers: Option<HashMap<String, String>>,
+    proxy: Option<String>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let ws = AsyncClientConnection::new(uri, None, None);
+    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None);
     let ws_cell = Py::new(py, ws)?;
-
-    // Call __aenter__ to connect
     AsyncClientConnection::__aenter__(ws_cell, py)
 }
 
 pub fn register_async_client(py: Python<'_>, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {
     let async_client_module = PyModule::new(py, "async_client")?;
-
     async_client_module.add_class::<AsyncClientConnection>()?;
     async_client_module.add_function(wrap_pyfunction!(connect, &async_client_module)?)?;
-
     parent_module.add_submodule(&async_client_module)?;
-
     Ok(())
 }
