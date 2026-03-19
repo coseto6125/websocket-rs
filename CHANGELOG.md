@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-03-19
+
+### Added
+- SOCKS5 proxy support via `proxy="socks5://host:port"` keyword argument
+- Custom HTTP headers support via `headers={"key": "value"}` keyword argument
+- Proxy scheme validation (only socks5:// accepted, clear error for others)
+- Header name/value validation at construction time
+
+### Changed
+- `headers`, `proxy`, `connect_timeout`, `receive_timeout` are now keyword-only parameters
+- Refactored background WebSocket task into generic `start_ws_task()` supporting both direct and proxy streams
+- Simplified `Arc<RwLock>` usage for one-time-use fields (headers, proxy)
+
+### Fixed
+- GIL safety: ensure all `Py<T>` objects are dropped under GIL in error/timeout paths
+- Restore error logging for future completion failures (previously silently swallowed)
+
 ## [0.4.1] - 2025-11-26
 
 ### Fixed

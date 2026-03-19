@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "websocket-rs"
-version = "0.4.1"
+version = "0.5.0"
 description = "High-performance WebSocket client library for Python using Rust"
 readme = "README.pypi.md"
 authors = [
