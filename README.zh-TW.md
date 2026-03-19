@@ -38,29 +38,22 @@ WebSocket 應用使用兩種根本不同的通訊模式：
 
 📊 **[查看詳細效能測試](docs/BENCHMARKS.md)** - 完整效能比較與測試方法
 
-## ✨ v0.4.1 新功能
+## ✨ v0.5.0 新功能
 
-### 變更
-- 修正所有套件檔案的版號同步
-- 清理專案結構（移除過時的 python/ 目錄）
-- 改進 .gitignore 規則提高精確度
-- 將 Cargo.lock 加入版本控制
-- 建立獨立的 BENCHMARKS.md 存放詳細效能資料
+### SOCKS5 Proxy 支援
+```python
+ws = await connect("wss://example.com/ws", proxy="socks5://127.0.0.1:1080")
+```
 
-### v0.4.0 重點
+### 自訂 HTTP Headers
+```python
+ws = await connect("wss://example.com/ws", headers={"Authorization": "Bearer token"})
+```
 
-**純同步客戶端** - 使用 `tungstenite`（非 async）重新實作：
-- Request-Response RTT：**0.128 ms**（原為 0.244 ms，**快 1.9 倍**）
-- 比 websocket-client **快 1.85 倍**
-- 比 websockets **快 6.2 倍**
-
-**架構設計**：
-- 同步客戶端：純阻塞 I/O（簡單腳本、CLI 工具）
-- 異步客戶端：Tokio runtime（高併發、事件驅動）
-
-**向後相容**：
-- 100% API 相容
-- 無需修改程式碼
+### 安全性與品質
+- 修正非同步 error/timeout 路徑的 GIL 安全問題
+- 建構時驗證 proxy scheme 與 header 值
+- 向後相容 — `headers`/`proxy` 為 keyword-only 參數
 
 ## 🚀 快速開始
 
@@ -177,7 +170,7 @@ connect(
 
 ```bash
 # 指定版本（範例為 Linux x86_64, Python 3.12+）
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.4.1/websocket_rs-0.4.1-cp312-abi3-linux_x86_64.whl
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.5.0/websocket_rs-0.5.0-cp312-abi3-manylinux_2_34_x86_64.whl
 ```
 
 ### 從原始碼編譯

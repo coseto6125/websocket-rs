@@ -38,29 +38,22 @@ WebSocket applications use two fundamentally different communication patterns:
 
 📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** - Comprehensive performance comparison with test methodology
 
-## ✨ What's New in v0.4.1
+## ✨ What's New in v0.5.0
 
-### Changes
-- Fixed version number sync across all package files
-- Cleaned up project structure (removed obsolete python/ directory)
-- Improved .gitignore rules for better precision
-- Added Cargo.lock to version control
-- Created separate BENCHMARKS.md for detailed performance data
+### SOCKS5 Proxy Support
+```python
+ws = await connect("wss://example.com/ws", proxy="socks5://127.0.0.1:1080")
+```
 
-### v0.4.0 Highlights
+### Custom HTTP Headers
+```python
+ws = await connect("wss://example.com/ws", headers={"Authorization": "Bearer token"})
+```
 
-**Pure Sync Client** - Reimplemented using `tungstenite` (non-async):
-- Request-Response RTT: **0.128 ms** (was 0.244 ms, **1.9x faster**)
-- **1.85x faster** than websocket-client
-- **6.2x faster** than websockets
-
-**Architecture Design**:
-- Sync client: Pure blocking I/O (simple scripts, CLI tools)
-- Async client: Tokio runtime (high concurrency, event-driven)
-
-**Backward Compatibility**:
-- 100% API compatible
-- No code changes required
+### Safety & Quality
+- GIL safety fixes for async error/timeout paths
+- Input validation for proxy scheme and header values
+- Backward compatible — `headers`/`proxy` are keyword-only
 
 ## 🚀 Quick Start
 
@@ -175,7 +168,7 @@ connect(
 
 ```bash
 # Specify version (example for Linux x86_64, Python 3.12+)
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.4.1/websocket_rs-0.4.1-cp312-abi3-linux_x86_64.whl
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.5.0/websocket_rs-0.5.0-cp312-abi3-manylinux_2_34_x86_64.whl
 ```
 
 ### From Source
