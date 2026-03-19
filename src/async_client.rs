@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError};
+use pyo3::exceptions::{
+    PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use pyo3::BoundObject;
@@ -182,6 +184,13 @@ enum Command {
     Close,
 }
 
+/// Result of WebSocket connect — carries the stream type without Py<T> ownership issues
+enum WsConnectResult {
+    Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>),
+    Proxy(Box<tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>>),
+    ProxyPlain(Box<tokio_tungstenite::WebSocketStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>),
+}
+
 // Background Task Handler (Supports both Direct and Proxy Streams)
 async fn start_ws_task<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
@@ -262,8 +271,8 @@ async fn start_ws_task<S>(
 #[pyclass(name = "ClientConnection", module = "websocket_rs.async_client")]
 pub struct AsyncClientConnection {
     url: String,
-    headers: Arc<RwLock<Option<HashMap<String, String>>>>,
-    proxy: Arc<RwLock<Option<String>>>,
+    headers: Option<HashMap<String, String>>,
+    proxy: Option<String>,
     tx_cmd: Option<mpsc::Sender<Command>>,
     rx_msg_internal: Option<MessageReceiver>,
     stream_sync: Arc<RwLock<bool>>,
@@ -280,18 +289,39 @@ pub struct AsyncClientConnection {
 #[pymethods]
 impl AsyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, headers=None, proxy=None, connect_timeout=None, receive_timeout=None))]
+    #[pyo3(signature = (url, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None))]
     fn new(
         url: String,
         headers: Option<HashMap<String, String>>,
         proxy: Option<String>,
         connect_timeout: Option<f64>,
         receive_timeout: Option<f64>,
-    ) -> Self {
-        AsyncClientConnection {
+    ) -> PyResult<Self> {
+        // Validate proxy scheme (only socks5:// supported)
+        if let Some(ref p) = proxy {
+            let scheme = p.split("://").next().unwrap_or("");
+            if scheme != "socks5" {
+                return Err(PyValueError::new_err(format!(
+                    "Only socks5:// proxy is supported, got: {}://",
+                    scheme
+                )));
+            }
+        }
+
+        // Validate headers
+        if let Some(ref h) = headers {
+            for (k, v) in h {
+                HeaderName::from_str(k)
+                    .map_err(|_| PyValueError::new_err(format!("Invalid header name: {}", k)))?;
+                HeaderValue::from_str(v)
+                    .map_err(|_| PyValueError::new_err(format!("Invalid header value for {}", k)))?;
+            }
+        }
+
+        Ok(AsyncClientConnection {
             url,
-            headers: Arc::new(RwLock::new(headers)),
-            proxy: Arc::new(RwLock::new(proxy)),
+            headers,
+            proxy,
             tx_cmd: None,
             rx_msg_internal: None,
             stream_sync: Arc::new(RwLock::new(false)),
@@ -303,7 +333,7 @@ impl AsyncClientConnection {
             subprotocol: Arc::new(RwLock::new(None)),
             close_code: Arc::new(RwLock::new(None)),
             close_reason: Arc::new(RwLock::new(None)),
-        }
+        })
     }
 
     fn send<'py>(
@@ -604,15 +634,8 @@ impl AsyncClientConnection {
     }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let (
-            url,
-            headers_cache,
-            proxy_cache,
-            connect_timeout,
-            local_addr,
-            remote_addr,
-            event_loop_cache,
-        ) = {
+        // Extract all values while holding the GIL — nothing crosses the await boundary
+        let (url, headers_opt, proxy_opt, connect_timeout, local_addr, remote_addr, event_loop_cache) = {
             let ws = slf.bind(py).borrow();
             (
                 ws.url.clone(),
@@ -634,23 +657,13 @@ impl AsyncClientConnection {
         let event_loop_ptr = event_loop.unbind();
         let slf_ptr = slf.clone_ref(py);
 
-        // Extract values without holding locks across await points
-        let proxy_opt = proxy_cache.read().clone();
-
-        // 🚀 FIX: Clone the pointers WHILE WE STILL HAVE THE GIL
-        let slf_ptr_task = slf_ptr.clone_ref(py);
-        let future_ptr_task = future_ptr.clone_ref(py);
-        let event_loop_ptr_task = event_loop_ptr.clone_ref(py);
-
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-                let connect_task = async move {
-                    let mut request = match url.clone().into_client_request() {
-                        Ok(req) => req,
-                        Err(e) => return Err(e.to_string()),
-                    };
+                let connect_fut = async {
+                    let mut request = url.clone().into_client_request().map_err(|e| e.to_string())?;
 
-                    if let Some(headers) = headers_cache.read().as_ref() {
+                    // Inject custom headers (already validated in new())
+                    if let Some(ref headers) = headers_opt {
                         for (k, v) in headers {
                             if let (Ok(k_hdr), Ok(v_hdr)) =
                                 (HeaderName::from_str(k), HeaderValue::from_str(v))
@@ -660,122 +673,114 @@ impl AsyncClientConnection {
                         }
                     }
 
-                    if let Some(proxy_str) = proxy_opt {
+                    if let Some(ref proxy_str) = proxy_opt {
+                        // ── SOCKS5 proxy path ──
                         let target_url = url::Url::parse(&url).map_err(|e| e.to_string())?;
-                        let host = target_url
-                            .host_str()
-                            .ok_or("Invalid target host")?
-                            .to_string();
-                        let port = target_url
-                            .port_or_known_default()
-                            .ok_or("Invalid target port")?;
+                        let host = target_url.host_str().ok_or("Invalid target host")?.to_string();
+                        let port = target_url.port_or_known_default().ok_or("Invalid target port")?;
 
-                        let proxy_url = url::Url::parse(&proxy_str).map_err(|e| e.to_string())?;
-                        let proxy_host = proxy_url
-                            .host_str()
-                            .ok_or("Invalid proxy host")?
-                            .to_string();
-                        let proxy_port = proxy_url
-                            .port_or_known_default()
-                            .ok_or("Invalid proxy port")?;
+                        let proxy_url = url::Url::parse(proxy_str).map_err(|e| e.to_string())?;
+                        let proxy_host = proxy_url.host_str().ok_or("Invalid proxy host")?.to_string();
+                        let proxy_port = proxy_url.port_or_known_default().ok_or("Invalid proxy port")?;
 
                         let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
                             (proxy_host.as_str(), proxy_port),
                             (host.as_str(), port),
                         )
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| format!("SOCKS5 proxy connection failed: {}", e))?;
 
                         if target_url.scheme() == "wss" {
                             let cx = native_tls::TlsConnector::builder()
                                 .build()
-                                .map_err(|e| e.to_string())?;
+                                .map_err(|e| format!("TLS connector build failed: {}", e))?;
                             let cx = tokio_native_tls::TlsConnector::from(cx);
                             let tls_stream = cx
                                 .connect(&host, socks_stream)
                                 .await
+                                .map_err(|e| format!("TLS handshake through proxy failed: {}", e))?;
+
+                            let (ws_stream, _) = tokio_tungstenite::client_async(request, tls_stream)
+                                .await
                                 .map_err(|e| e.to_string())?;
-
-                            let (ws_stream, _) =
-                                tokio_tungstenite::client_async(request, tls_stream)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                            start_ws_task(
-                                ws_stream,
-                                slf_ptr_task,
-                                future_ptr_task,
-                                event_loop_ptr_task,
-                            )
-                            .await;
+                            return Ok(WsConnectResult::Proxy(Box::new(ws_stream)));
                         } else {
-                            let (ws_stream, _) =
-                                tokio_tungstenite::client_async(request, socks_stream)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                            start_ws_task(
-                                ws_stream,
-                                slf_ptr_task,
-                                future_ptr_task,
-                                event_loop_ptr_task,
-                            )
-                            .await;
+                            let (ws_stream, _) = tokio_tungstenite::client_async(request, socks_stream)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            return Ok(WsConnectResult::ProxyPlain(Box::new(ws_stream)));
                         }
-                    } else {
-                        let (ws_stream, _) =
-                            connect_async(request).await.map_err(|e| e.to_string())?;
-
-                        match ws_stream.get_ref() {
-                            MaybeTlsStream::Plain(s) => {
-                                if let Ok(addr) = s.local_addr() {
-                                    *local_addr.write() = Some(addr.to_string());
-                                }
-                                if let Ok(addr) = s.peer_addr() {
-                                    *remote_addr.write() = Some(addr.to_string());
-                                }
-                            }
-                            MaybeTlsStream::NativeTls(s) => {
-                                if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
-                                    *local_addr.write() = Some(addr.to_string());
-                                }
-                                if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
-                                    *remote_addr.write() = Some(addr.to_string());
-                                }
-                            }
-                            _ => {}
-                        }
-                        start_ws_task(
-                            ws_stream,
-                            slf_ptr_task,
-                            future_ptr_task,
-                            event_loop_ptr_task,
-                        )
-                        .await;
                     }
-                    Ok::<(), String>(())
+
+                    // ── Direct connection path ──
+                    let (ws_stream, _) = connect_async(request).await.map_err(|e| e.to_string())?;
+
+                    // Extract addr info from direct connection
+                    match ws_stream.get_ref() {
+                        MaybeTlsStream::Plain(s) => {
+                            if let Ok(addr) = s.local_addr() {
+                                *local_addr.write() = Some(addr.to_string());
+                            }
+                            if let Ok(addr) = s.peer_addr() {
+                                *remote_addr.write() = Some(addr.to_string());
+                            }
+                        }
+                        MaybeTlsStream::NativeTls(s) => {
+                            if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
+                                *local_addr.write() = Some(addr.to_string());
+                            }
+                            if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
+                                *remote_addr.write() = Some(addr.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok::<WsConnectResult, String>(WsConnectResult::Direct(ws_stream))
                 };
 
-                match timeout(Duration::from_secs_f64(connect_timeout), connect_task).await {
+                // Timeout wraps the entire connect future
+                match timeout(Duration::from_secs_f64(connect_timeout), connect_fut).await {
+                    Ok(Ok(ws_result)) => {
+                        // Success: start background task with the stream
+                        match ws_result {
+                            WsConnectResult::Direct(ws_stream) => {
+                                start_ws_task(ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                            }
+                            WsConnectResult::Proxy(ws_stream) => {
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                            }
+                            WsConnectResult::ProxyPlain(ws_stream) => {
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                            }
+                        }
+                    }
                     Ok(Err(e)) => {
+                        // Connection error — drop Py<T> safely under GIL
                         Python::attach(|py| {
+                            drop(slf_ptr);
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            let _ =
-                                fail_future(py, event_loop, future, PyConnectionError::new_err(e));
+                            if let Err(e) = fail_future(py, event_loop, future, PyConnectionError::new_err(e)) {
+                                eprintln!("Failed to set connection error on future: {:?}", e);
+                            }
                         });
                     }
                     Err(_) => {
+                        // Timeout — drop Py<T> safely under GIL
                         Python::attach(|py| {
+                            drop(slf_ptr);
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            let _ = fail_future(
+                            if let Err(e) = fail_future(
                                 py,
                                 event_loop,
                                 future,
-                                PyTimeoutError::new_err("Connection timed out"),
-                            );
+                                PyTimeoutError::new_err(format!("Connection timed out ({:.1}s)", connect_timeout)),
+                            ) {
+                                eprintln!("Failed to set timeout error on future: {:?}", e);
+                            }
                         });
                     }
-                    Ok(Ok(())) => {} // Success handled inside start_ws_task
                 }
             });
         });
@@ -875,7 +880,7 @@ impl AsyncClientConnection {
 }
 
 #[pyfunction]
-#[pyo3(signature = (uri, headers=None, proxy=None, **_kwargs))]
+#[pyo3(signature = (uri, *, headers=None, proxy=None, **_kwargs))]
 pub fn connect<'py>(
     py: Python<'py>,
     uri: String,
@@ -883,7 +888,7 @@ pub fn connect<'py>(
     proxy: Option<String>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None);
+    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None)?;
     let ws_cell = Py::new(py, ws)?;
     AsyncClientConnection::__aenter__(ws_cell, py)
 }
