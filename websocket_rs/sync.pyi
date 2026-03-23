@@ -19,10 +19,10 @@ class Response:
 
 def connect(
     url: str,
-    proxy: str,
-    headers: dict[str, Any],
     connect_timeout: int | float = 30,
     receive_timeout: int | float = 30,
+    proxy: str | None = None,
+    headers: dict[str, Any] | None = None
 ) -> Response:
     """
     Establishes an asynchronous WebSocket connection.
