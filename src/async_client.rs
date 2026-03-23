@@ -187,8 +187,20 @@ enum Command {
 /// Result of WebSocket connect — carries the stream type without Py<T> ownership issues
 enum WsConnectResult {
     Direct(Box<tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
-    Proxy(Box<tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>>),
-    ProxyPlain(Box<tokio_tungstenite::WebSocketStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>),
+    Proxy(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>,
+            >,
+        >,
+    ),
+    ProxyPlain(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>,
+            >,
+        >,
+    ),
 }
 
 // Background Task Handler (Supports both Direct and Proxy Streams)
@@ -313,8 +325,9 @@ impl AsyncClientConnection {
             for (k, v) in h {
                 HeaderName::from_str(k)
                     .map_err(|_| PyValueError::new_err(format!("Invalid header name: {}", k)))?;
-                HeaderValue::from_str(v)
-                    .map_err(|_| PyValueError::new_err(format!("Invalid header value for {}", k)))?;
+                HeaderValue::from_str(v).map_err(|_| {
+                    PyValueError::new_err(format!("Invalid header value for {}", k))
+                })?;
             }
         }
 
@@ -635,7 +648,15 @@ impl AsyncClientConnection {
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Extract all values while holding the GIL — nothing crosses the await boundary
-        let (url, headers_opt, proxy_opt, connect_timeout, local_addr, remote_addr, event_loop_cache) = {
+        let (
+            url,
+            headers_opt,
+            proxy_opt,
+            connect_timeout,
+            local_addr,
+            remote_addr,
+            event_loop_cache,
+        ) = {
             let ws = slf.bind(py).borrow();
             (
                 ws.url.clone(),
@@ -660,7 +681,10 @@ impl AsyncClientConnection {
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let connect_fut = async {
-                    let mut request = url.clone().into_client_request().map_err(|e| e.to_string())?;
+                    let mut request = url
+                        .clone()
+                        .into_client_request()
+                        .map_err(|e| e.to_string())?;
 
                     // Inject custom headers (already validated in new())
                     if let Some(ref headers) = headers_opt {
@@ -676,12 +700,22 @@ impl AsyncClientConnection {
                     if let Some(ref proxy_str) = proxy_opt {
                         // ── SOCKS5 proxy path ──
                         let target_url = url::Url::parse(&url).map_err(|e| e.to_string())?;
-                        let host = target_url.host_str().ok_or("Invalid target host")?.to_string();
-                        let port = target_url.port_or_known_default().ok_or("Invalid target port")?;
+                        let host = target_url
+                            .host_str()
+                            .ok_or("Invalid target host")?
+                            .to_string();
+                        let port = target_url
+                            .port_or_known_default()
+                            .ok_or("Invalid target port")?;
 
                         let proxy_url = url::Url::parse(proxy_str).map_err(|e| e.to_string())?;
-                        let proxy_host = proxy_url.host_str().ok_or("Invalid proxy host")?.to_string();
-                        let proxy_port = proxy_url.port_or_known_default().ok_or("Invalid proxy port")?;
+                        let proxy_host = proxy_url
+                            .host_str()
+                            .ok_or("Invalid proxy host")?
+                            .to_string();
+                        let proxy_port = proxy_url
+                            .port_or_known_default()
+                            .ok_or("Invalid proxy port")?;
 
                         let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
                             (proxy_host.as_str(), proxy_port),
@@ -695,19 +729,21 @@ impl AsyncClientConnection {
                                 .build()
                                 .map_err(|e| format!("TLS connector build failed: {}", e))?;
                             let cx = tokio_native_tls::TlsConnector::from(cx);
-                            let tls_stream = cx
-                                .connect(&host, socks_stream)
-                                .await
-                                .map_err(|e| format!("TLS handshake through proxy failed: {}", e))?;
+                            let tls_stream =
+                                cx.connect(&host, socks_stream).await.map_err(|e| {
+                                    format!("TLS handshake through proxy failed: {}", e)
+                                })?;
 
-                            let (ws_stream, _) = tokio_tungstenite::client_async(request, tls_stream)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, tls_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             return Ok(WsConnectResult::Proxy(Box::new(ws_stream)));
                         } else {
-                            let (ws_stream, _) = tokio_tungstenite::client_async(request, socks_stream)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, socks_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             return Ok(WsConnectResult::ProxyPlain(Box::new(ws_stream)));
                         }
                     }
@@ -744,13 +780,16 @@ impl AsyncClientConnection {
                         // Success: start background task with the stream
                         match ws_result {
                             WsConnectResult::Direct(ws_stream) => {
-                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                             WsConnectResult::Proxy(ws_stream) => {
-                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                             WsConnectResult::ProxyPlain(ws_stream) => {
-                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                         }
                     }
@@ -760,7 +799,9 @@ impl AsyncClientConnection {
                             drop(slf_ptr);
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            if let Err(e) = fail_future(py, event_loop, future, PyConnectionError::new_err(e)) {
+                            if let Err(e) =
+                                fail_future(py, event_loop, future, PyConnectionError::new_err(e))
+                            {
                                 eprintln!("Failed to set connection error on future: {:?}", e);
                             }
                         });
@@ -775,7 +816,10 @@ impl AsyncClientConnection {
                                 py,
                                 event_loop,
                                 future,
-                                PyTimeoutError::new_err(format!("Connection timed out ({:.1}s)", connect_timeout)),
+                                PyTimeoutError::new_err(format!(
+                                    "Connection timed out ({:.1}s)",
+                                    connect_timeout
+                                )),
                             ) {
                                 eprintln!("Failed to set timeout error on future: {:?}", e);
                             }
