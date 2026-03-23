@@ -2,8 +2,9 @@ from . import async_client, sync
 
 def enable_monkeypatch() -> None:
     """
-    Enables monkey-patching globally. This substitutes `websocket-rs`
-    in place of native websocket implementations where applicable.
+    Enables monkey-patching globally. This substitutes `websocket_rs`
+    (backed by the `websocket-rs` crate) in place of native websocket
+    implementations where applicable.
     """
     ...
 
