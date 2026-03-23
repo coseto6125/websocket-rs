@@ -186,7 +186,7 @@ enum Command {
 
 /// Result of WebSocket connect — carries the stream type without Py<T> ownership issues
 enum WsConnectResult {
-    Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>),
+    Direct(Box<tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
     Proxy(Box<tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>>),
     ProxyPlain(Box<tokio_tungstenite::WebSocketStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>),
 }
@@ -735,7 +735,7 @@ impl AsyncClientConnection {
                         }
                         _ => {}
                     }
-                    Ok::<WsConnectResult, String>(WsConnectResult::Direct(ws_stream))
+                    Ok::<WsConnectResult, String>(WsConnectResult::Direct(Box::new(ws_stream)))
                 };
 
                 // Timeout wraps the entire connect future
@@ -744,7 +744,7 @@ impl AsyncClientConnection {
                         // Success: start background task with the stream
                         match ws_result {
                             WsConnectResult::Direct(ws_stream) => {
-                                start_ws_task(ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
                             }
                             WsConnectResult::Proxy(ws_stream) => {
                                 start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;

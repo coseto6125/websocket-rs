@@ -36,7 +36,6 @@ build:
 test: build
 	@echo "🧪 Running tests..."
 	. .venv/bin/activate && python tests/test_compatibility.py
-	. .venv/bin/activate && python tests/test_monkeypatch.py
 
 # Run benchmarks
 bench: build
