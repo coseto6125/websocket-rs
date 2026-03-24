@@ -40,9 +40,7 @@ test: build
 # Run benchmarks
 bench: build
 	@echo "📊 Running benchmarks..."
-	. .venv/bin/activate && python tests/benchmark_optimized.py
-	@echo ""
-	. .venv/bin/activate && python tests/benchmark_latency.py
+	. .venv/bin/activate && python tests/benchmark_server_timestamp.py
 
 # Clean build artifacts
 clean:
@@ -64,4 +62,4 @@ release:
 # Quick test (no server needed)
 quick-test: build
 	@echo "🧪 Running quick tests (no server required)..."
-	. .venv/bin/activate && python tests/test_monkeypatch.py
+	. .venv/bin/activate && python tests/test_compatibility.py

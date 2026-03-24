@@ -8,6 +8,11 @@ use tungstenite::{connect as tungstenite_connect, Message, WebSocket};
 
 use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
 
+enum RecvResult {
+    Text(String),
+    Binary(Vec<u8>),
+}
+
 /// Sync client connection (pure sync, no async runtime overhead)
 #[pyclass(name = "ClientConnection", module = "websocket_rs.sync.client")]
 pub struct SyncClientConnection {
@@ -16,8 +21,8 @@ pub struct SyncClientConnection {
     #[allow(dead_code)] // Used in __connect closure, compiler can't track it
     connect_timeout: f64,
     receive_timeout: f64,
-    local_addr: Option<String>,
-    remote_addr: Option<String>,
+    local_addr: Option<(String, u16)>,
+    remote_addr: Option<(String, u16)>,
     close_code: Option<u16>,
     close_reason: Option<String>,
 }
@@ -57,10 +62,10 @@ impl SyncClientConnection {
                     })?;
 
                     if let Ok(addr) = stream.local_addr() {
-                        self.local_addr = Some(addr.to_string());
+                        self.local_addr = Some((addr.ip().to_string(), addr.port()));
                     }
                     if let Ok(addr) = stream.peer_addr() {
-                        self.remote_addr = Some(addr.to_string());
+                        self.remote_addr = Some((addr.ip().to_string(), addr.port()));
                     }
                 }
                 MaybeTlsStream::NativeTls(stream) => {
@@ -71,10 +76,10 @@ impl SyncClientConnection {
                     })?;
 
                     if let Ok(addr) = tcp_stream.local_addr() {
-                        self.local_addr = Some(addr.to_string());
+                        self.local_addr = Some((addr.ip().to_string(), addr.port()));
                     }
                     if let Ok(addr) = tcp_stream.peer_addr() {
-                        self.remote_addr = Some(addr.to_string());
+                        self.remote_addr = Some((addr.ip().to_string(), addr.port()));
                     }
                 }
                 _ => {}
@@ -88,7 +93,7 @@ impl SyncClientConnection {
     /// Send a message
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
-            Message::Text(s.to_string_lossy().to_string())
+            Message::Text(s.to_str()?.to_owned())
         } else if let Ok(b) = message.cast::<PyBytes>() {
             Message::Binary(b.as_bytes().to_vec())
         } else {
@@ -115,23 +120,27 @@ impl SyncClientConnection {
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
             loop {
-                let msg = ws.read().map_err(|e| {
-                    if e.to_string().contains("timed out") {
+                let msg = ws.read().map_err(|e| match &e {
+                    tungstenite::Error::Io(io_err)
+                        if matches!(
+                            io_err.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
                         PyTimeoutError::new_err(format!(
                             "Receive timed out ({} seconds)",
                             self.receive_timeout
                         ))
-                    } else {
-                        PyRuntimeError::new_err(format!("Receive failed: {}", e))
                     }
+                    _ => PyRuntimeError::new_err(format!("Receive failed: {}", e)),
                 })?;
 
                 match msg {
                     Message::Text(text) => {
-                        return Ok((true, text.into_bytes()));
+                        return Ok(RecvResult::Text(text));
                     }
                     Message::Binary(data) => {
-                        return Ok((false, data));
+                        return Ok(RecvResult::Binary(data));
                     }
                     Message::Ping(_) | Message::Pong(_) => {
                         continue;
@@ -150,14 +159,9 @@ impl SyncClientConnection {
             }
         })?;
 
-        // Create Python object with GIL
-        let (is_text, data) = result;
-        if is_text {
-            Ok(PyString::new(py, std::str::from_utf8(&data).unwrap())
-                .into_any()
-                .unbind())
-        } else {
-            Ok(PyBytes::new(py, &data).into_any().unbind())
+        match result {
+            RecvResult::Text(s) => Ok(PyString::new(py, &s).into_any().unbind()),
+            RecvResult::Binary(b) => Ok(PyBytes::new(py, &b).into_any().unbind()),
         }
     }
 
@@ -218,19 +222,13 @@ impl SyncClientConnection {
     /// Local address
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
-        self.local_addr.as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.local_addr.clone()
     }
 
     /// Remote address
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
-        self.remote_addr.as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.remote_addr.clone()
     }
 
     /// Close code

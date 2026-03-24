@@ -94,7 +94,7 @@ fn get_asyncio(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     if let Some(module) = ASYNCIO.get() {
         return Ok(module.bind(py).clone());
     }
-    let module = py.import("asyncio")?;
+    let module = py.import(pyo3::intern!(py, "asyncio"))?;
     let module_perm = module.clone().unbind();
     ASYNCIO.set(module_perm).ok();
     Ok(module)
@@ -109,46 +109,41 @@ fn get_cached_event_loop<'py>(
         return Ok(loop_obj.bind(py).clone());
     }
     let asyncio = get_asyncio(py)?;
-    let event_loop = asyncio.call_method0("get_running_loop")?;
+    let event_loop = asyncio.call_method0(pyo3::intern!(py, "get_running_loop"))?;
     *cache.write() = Some(event_loop.clone().unbind());
     Ok(event_loop)
 }
 
 fn create_future<'py>(
-    _py: Python<'py>,
+    py: Python<'py>,
     event_loop: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    event_loop.call_method0("create_future")
+    event_loop.call_method0(pyo3::intern!(py, "create_future"))
 }
 
 fn complete_future<'py>(
-    _py: Python<'py>,
+    py: Python<'py>,
     event_loop: &Bound<'py, PyAny>,
     future: &Bound<'py, PyAny>,
     result: Py<PyAny>,
 ) -> PyResult<()> {
-    let set_result = future.getattr("set_result")?;
-    event_loop.call_method1("call_soon_threadsafe", (set_result, result))?;
+    let set_result = future.getattr(pyo3::intern!(py, "set_result"))?;
+    event_loop.call_method1(
+        pyo3::intern!(py, "call_soon_threadsafe"),
+        (set_result, result),
+    )?;
     Ok(())
 }
 
-fn fail_future(
-    _py: Python<'_>,
-    event_loop: &Bound<'_, PyAny>,
-    future: &Bound<'_, PyAny>,
+fn fail_future<'py>(
+    py: Python<'py>,
+    event_loop: &Bound<'py, PyAny>,
+    future: &Bound<'py, PyAny>,
     exc: PyErr,
 ) -> PyResult<()> {
-    let set_exc = future.getattr("set_exception")?;
-    event_loop.call_method1("call_soon_threadsafe", (set_exc, exc))?;
+    let set_exc = future.getattr(pyo3::intern!(py, "set_exception"))?;
+    event_loop.call_method1(pyo3::intern!(py, "call_soon_threadsafe"), (set_exc, exc))?;
     Ok(())
-}
-
-fn ready_ok<'py>(py: Python<'py>, result: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    let asyncio = get_asyncio(py)?;
-    let event_loop = asyncio.call_method0("get_running_loop")?;
-    let future = event_loop.call_method0("create_future")?;
-    future.call_method1("set_result", (result,))?;
-    Ok(future)
 }
 
 fn ready_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -256,6 +251,10 @@ async fn start_ws_task<S>(
                 }
                 msg = stream.next() => {
                     match msg {
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                            // Filtered: don't wake recv/anext for control frames
+                            continue;
+                        }
                         Some(Ok(msg)) => {
                             if tx_msg.send(Ok(msg)).await.is_err() { break; }
                         }
@@ -291,8 +290,8 @@ pub struct AsyncClientConnection {
     connect_timeout: f64,
     receive_timeout: f64,
     event_loop: Arc<RwLock<Option<Py<PyAny>>>>,
-    local_addr: Arc<RwLock<Option<String>>>,
-    remote_addr: Arc<RwLock<Option<String>>>,
+    local_addr: Arc<RwLock<Option<(String, u16)>>>,
+    remote_addr: Arc<RwLock<Option<(String, u16)>>>,
     subprotocol: Arc<RwLock<Option<String>>>,
     close_code: Arc<RwLock<Option<u16>>>,
     close_reason: Arc<RwLock<Option<String>>>,
@@ -360,10 +359,10 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
 
-        let command = if let Ok(text) = message.extract::<String>() {
-            Command::Text(text)
-        } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
-            Command::Binary(bytes)
+        let command = if let Ok(s) = message.cast::<pyo3::types::PyString>() {
+            Command::Text(s.to_str()?.to_owned())
+        } else if let Ok(b) = message.cast::<PyBytes>() {
+            Command::Binary(b.as_bytes().to_vec())
         } else {
             return Err(PyRuntimeError::new_err("Message must be str or bytes"));
         };
@@ -410,13 +409,13 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let receive_timeout = self.receive_timeout;
-        let close_code = self.close_code.clone();
-        let close_reason = self.close_reason.clone();
 
+        // Fast path: try_lock + try_recv avoids spawning a tokio task
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    let result = process_message(py, msg, &close_code, &close_reason, false);
+                    let result =
+                        process_message(py, msg, &self.close_code, &self.close_reason, false);
                     match result {
                         Ok(val) => return ready_fast(py, val),
                         Err(e) => return ready_fast_err(py, e),
@@ -429,6 +428,9 @@ impl AsyncClientConnection {
             }
         }
 
+        // Slow path: clone Arcs only when we need to move them into the spawned task
+        let close_code = self.close_code.clone();
+        let close_reason = self.close_reason.clone();
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
         let future_ptr = future.clone().unbind();
@@ -537,7 +539,7 @@ impl AsyncClientConnection {
             .clone();
         let data = data.unwrap_or_default();
         match tx_cloned.try_send(Command::Ping(data)) {
-            Ok(_) => ready_ok(py, py.None()),
+            Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
@@ -578,7 +580,7 @@ impl AsyncClientConnection {
             .clone();
         let data = data.unwrap_or_default();
         match tx_cloned.try_send(Command::Pong(data)) {
-            Ok(_) => ready_ok(py, py.None()),
+            Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
@@ -621,17 +623,11 @@ impl AsyncClientConnection {
     }
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
-        self.local_addr.read().as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.local_addr.read().clone()
     }
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
-        self.remote_addr.read().as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.remote_addr.read().clone()
     }
     #[getter]
     fn close_code(&self) -> Option<u16> {
@@ -670,7 +666,7 @@ impl AsyncClientConnection {
         };
 
         let asyncio = get_asyncio(py)?;
-        let event_loop = asyncio.call_method0("get_running_loop")?;
+        let event_loop = asyncio.call_method0(pyo3::intern!(py, "get_running_loop"))?;
         *event_loop_cache.write() = Some(event_loop.clone().unbind());
 
         let future = create_future(py, &event_loop)?;
@@ -755,18 +751,18 @@ impl AsyncClientConnection {
                     match ws_stream.get_ref() {
                         MaybeTlsStream::Plain(s) => {
                             if let Ok(addr) = s.local_addr() {
-                                *local_addr.write() = Some(addr.to_string());
+                                *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                             if let Ok(addr) = s.peer_addr() {
-                                *remote_addr.write() = Some(addr.to_string());
+                                *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }
                         MaybeTlsStream::NativeTls(s) => {
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
-                                *local_addr.write() = Some(addr.to_string());
+                                *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
-                                *remote_addr.write() = Some(addr.to_string());
+                                *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }
                         _ => {}
@@ -855,13 +851,13 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let receive_timeout = self.receive_timeout;
-        let close_code = self.close_code.clone();
-        let close_reason = self.close_reason.clone();
 
+        // Fast path: borrow from self, no Arc clone
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    let result = process_message(py, msg, &close_code, &close_reason, true);
+                    let result =
+                        process_message(py, msg, &self.close_code, &self.close_reason, true);
                     match result {
                         Ok(val) => return ready_fast(py, val),
                         Err(e) => return ready_fast_err(py, e),
@@ -874,6 +870,9 @@ impl AsyncClientConnection {
             }
         }
 
+        // Slow path: clone only when moving into spawned task
+        let close_code = self.close_code.clone();
+        let close_reason = self.close_reason.clone();
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
         let future_ptr = future.clone().unbind();
