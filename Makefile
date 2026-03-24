@@ -51,8 +51,8 @@ clean:
 	rm -rf .pytest_cache/
 	rm -rf __pycache__/
 	rm -rf **/__pycache__/
-	find . -name "*.so" -delete
-	find . -name "*.pyd" -delete
+	find ./websocket_rs -name "*.so" -delete 2>/dev/null || true
+	find ./websocket_rs -name "*.pyd" -delete 2>/dev/null || true
 
 # Build distribution wheels
 release:

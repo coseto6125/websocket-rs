@@ -1,29 +1,72 @@
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use std::net::TcpStream;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
-use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{connect as tungstenite_connect, Message, WebSocket};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::Message;
+use tungstenite::WebSocket;
 
-use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY};
+use crate::{
+    DEFAULT_CLOSE_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY,
+};
 
 enum RecvResult {
     Text(String),
     Binary(Vec<u8>),
 }
 
+/// Type-erased stream for WebSocket (avoids generic type in pyclass)
+enum WsStream {
+    Plain(TcpStream),
+    Tls(native_tls::TlsStream<TcpStream>),
+}
+
+impl Read for WsStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            WsStream::Plain(s) => s.read(buf),
+            WsStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for WsStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WsStream::Plain(s) => s.write(buf),
+            WsStream::Tls(s) => s.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WsStream::Plain(s) => s.flush(),
+            WsStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+impl WsStream {
+    fn tcp_ref(&self) -> &TcpStream {
+        match self {
+            WsStream::Plain(s) => s,
+            WsStream::Tls(s) => s.get_ref(),
+        }
+    }
+}
+
 /// Sync client connection (pure sync, no async runtime overhead)
 #[pyclass(name = "ClientConnection", module = "websocket_rs.sync.client")]
 pub struct SyncClientConnection {
     url: String,
-    ws: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
-    #[allow(dead_code)] // Used in __connect closure, compiler can't track it
+    ws: Option<WebSocket<WsStream>>,
     connect_timeout: f64,
     receive_timeout: f64,
+    close_timeout: f64,
+    tcp_nodelay: bool,
     local_addr: Option<(String, u16)>,
     remote_addr: Option<(String, u16)>,
-    tcp_nodelay: bool,
     close_code: Option<u16>,
     close_reason: Option<String>,
 }
@@ -31,11 +74,12 @@ pub struct SyncClientConnection {
 #[pymethods]
 impl SyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None, tcp_nodelay=None))]
+    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None))]
     fn new(
         url: String,
         connect_timeout: Option<f64>,
         receive_timeout: Option<f64>,
+        close_timeout: Option<f64>,
         tcp_nodelay: Option<bool>,
     ) -> Self {
         SyncClientConnection {
@@ -43,6 +87,7 @@ impl SyncClientConnection {
             ws: None,
             connect_timeout: connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            close_timeout: close_timeout.unwrap_or(DEFAULT_CLOSE_TIMEOUT),
             tcp_nodelay: tcp_nodelay.unwrap_or(DEFAULT_TCP_NODELAY),
             local_addr: None,
             remote_addr: None,
@@ -52,47 +97,81 @@ impl SyncClientConnection {
     }
 
     /// Internal connect implementation
+    // SAFETY: py.detach() releases the GIL while this closure runs with &mut self.
+    // This is safe because PyO3's PyRefMut guarantees exclusive borrow — no other
+    // Python thread can access this object while we hold the mutable reference.
     fn __connect(&mut self, py: Python<'_>) -> PyResult<()> {
         let url = self.url.clone();
+        let connect_timeout = self.connect_timeout;
         let receive_timeout = self.receive_timeout;
         let tcp_nodelay = self.tcp_nodelay;
 
         py.detach(|| {
-            let (mut ws, _) = tungstenite_connect(&url)
-                .map_err(|e| PyConnectionError::new_err(format!("Connection failed: {}", e)))?;
+            // Parse URL and resolve address
+            let request = url
+                .clone()
+                .into_client_request()
+                .map_err(|e| PyConnectionError::new_err(format!("Invalid URL: {}", e)))?;
+            let uri = request.uri().clone();
+            let host = uri
+                .host()
+                .ok_or_else(|| PyConnectionError::new_err("Missing host in URL"))?
+                .to_string();
+            let is_tls = uri.scheme_str() == Some("wss");
+            let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });
+            let addr = (host.as_str(), port)
+                .to_socket_addrs()
+                .map_err(|e| PyConnectionError::new_err(format!("DNS resolution failed: {}", e)))?
+                .next()
+                .ok_or_else(|| PyConnectionError::new_err("No address resolved"))?;
 
-            // Set TCP_NODELAY, read timeout and get addresses
-            match ws.get_mut() {
-                MaybeTlsStream::Plain(stream) => {
-                    let _ = stream.set_nodelay(tcp_nodelay);
-                    let timeout = Duration::from_secs_f64(receive_timeout);
-                    stream.set_read_timeout(Some(timeout)).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Set timeout failed: {}", e))
-                    })?;
-
-                    if let Ok(addr) = stream.local_addr() {
-                        self.local_addr = Some((addr.ip().to_string(), addr.port()));
-                    }
-                    if let Ok(addr) = stream.peer_addr() {
-                        self.remote_addr = Some((addr.ip().to_string(), addr.port()));
-                    }
+            // TCP connect with timeout
+            let connect_dur = Duration::from_secs_f64(connect_timeout);
+            let tcp = TcpStream::connect_timeout(&addr, connect_dur).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    PyTimeoutError::new_err(format!(
+                        "Connection timed out ({:.1}s)",
+                        connect_timeout
+                    ))
+                } else {
+                    PyConnectionError::new_err(format!("Connection failed: {}", e))
                 }
-                MaybeTlsStream::NativeTls(stream) => {
-                    let tcp_stream = stream.get_ref();
-                    let _ = tcp_stream.set_nodelay(tcp_nodelay);
-                    let timeout = Duration::from_secs_f64(receive_timeout);
-                    tcp_stream.set_read_timeout(Some(timeout)).map_err(|e| {
-                        PyRuntimeError::new_err(format!("Set timeout failed: {}", e))
-                    })?;
+            })?;
+            let _ = tcp.set_nodelay(tcp_nodelay);
 
-                    if let Ok(addr) = tcp_stream.local_addr() {
-                        self.local_addr = Some((addr.ip().to_string(), addr.port()));
-                    }
-                    if let Ok(addr) = tcp_stream.peer_addr() {
-                        self.remote_addr = Some((addr.ip().to_string(), addr.port()));
-                    }
-                }
-                _ => {}
+            // Set temp timeout to bound TLS + WS handshake
+            let _ = tcp.set_read_timeout(Some(connect_dur));
+            let _ = tcp.set_write_timeout(Some(connect_dur));
+
+            // Build stream (plain or TLS) and do WS handshake
+            let ws_stream = if is_tls {
+                let connector = native_tls::TlsConnector::builder()
+                    .build()
+                    .map_err(|e| PyConnectionError::new_err(format!("TLS build failed: {}", e)))?;
+                let tls = connector.connect(&host, tcp).map_err(|e| {
+                    PyConnectionError::new_err(format!("TLS handshake failed: {}", e))
+                })?;
+                WsStream::Tls(tls)
+            } else {
+                WsStream::Plain(tcp)
+            };
+
+            let (ws, _) = tungstenite::client(request, ws_stream).map_err(|e| {
+                PyConnectionError::new_err(format!("WebSocket handshake failed: {}", e))
+            })?;
+
+            // Reset timeouts: read = receive_timeout, write = unlimited
+            let tcp_ref = ws.get_ref().tcp_ref();
+            tcp_ref
+                .set_read_timeout(Some(Duration::from_secs_f64(receive_timeout)))
+                .map_err(|e| PyRuntimeError::new_err(format!("Set timeout failed: {}", e)))?;
+            let _ = tcp_ref.set_write_timeout(None);
+
+            if let Ok(a) = tcp_ref.local_addr() {
+                self.local_addr = Some((a.ip().to_string(), a.port()));
+            }
+            if let Ok(a) = tcp_ref.peer_addr() {
+                self.remote_addr = Some((a.ip().to_string(), a.port()));
             }
 
             self.ws = Some(ws);
@@ -100,7 +179,6 @@ impl SyncClientConnection {
         })
     }
 
-    /// Send a message
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
             Message::Text(s.to_str()?.to_owned())
@@ -121,7 +199,6 @@ impl SyncClientConnection {
         })
     }
 
-    /// Receive a message
     fn recv(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let result = py.detach(|| {
             let ws = self
@@ -146,15 +223,9 @@ impl SyncClientConnection {
                 })?;
 
                 match msg {
-                    Message::Text(text) => {
-                        return Ok(RecvResult::Text(text));
-                    }
-                    Message::Binary(data) => {
-                        return Ok(RecvResult::Binary(data));
-                    }
-                    Message::Ping(_) | Message::Pong(_) => {
-                        continue;
-                    }
+                    Message::Text(text) => return Ok(RecvResult::Text(text)),
+                    Message::Binary(data) => return Ok(RecvResult::Binary(data)),
+                    Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(frame) => {
                         if let Some(f) = frame {
                             self.close_code = Some(f.code.into());
@@ -162,9 +233,7 @@ impl SyncClientConnection {
                         }
                         return Err(PyRuntimeError::new_err("Connection closed by server"));
                     }
-                    _ => {
-                        return Err(PyRuntimeError::new_err("Received unsupported message type"));
-                    }
+                    _ => return Err(PyRuntimeError::new_err("Received unsupported message type")),
                 }
             }
         })?;
@@ -175,85 +244,78 @@ impl SyncClientConnection {
         }
     }
 
-    /// Close the connection
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        let close_timeout = self.close_timeout;
         py.detach(|| {
             if let Some(mut ws) = self.ws.take() {
+                // Set a timeout for the close handshake
+                let tcp_ref = ws.get_ref().tcp_ref();
+                let _ = tcp_ref.set_read_timeout(Some(Duration::from_secs_f64(close_timeout)));
                 if let Err(e) = ws.close(None) {
-                    eprintln!("Error closing WebSocket: {}", e);
+                    // Read remaining frames until close confirmation or timeout
+                    if !matches!(e, tungstenite::Error::ConnectionClosed) {
+                        loop {
+                            match ws.read() {
+                                Ok(Message::Close(_)) | Err(_) => break,
+                                _ => continue,
+                            }
+                        }
+                    }
                 }
             }
             Ok(())
         })
     }
 
-    /// Ping
     fn ping(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
-
         py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
-
             ws.send(Message::Ping(data))
                 .map_err(|e| PyRuntimeError::new_err(format!("Ping failed: {}", e)))
         })
     }
 
-    /// Pong
     fn pong(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
-
         py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
-
             ws.send(Message::Pong(data))
                 .map_err(|e| PyRuntimeError::new_err(format!("Pong failed: {}", e)))
         })
     }
 
-    /// Check if connection is open
     #[getter]
     fn open(&self) -> bool {
         self.ws.is_some()
     }
-
-    /// Check if connection is closed
     #[getter]
     fn closed(&self) -> bool {
         self.ws.is_none()
     }
-
-    /// Local address
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
         self.local_addr.clone()
     }
-
-    /// Remote address
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
         self.remote_addr.clone()
     }
-
-    /// Close code
     #[getter]
     fn close_code(&self) -> Option<u16> {
         self.close_code
     }
-
-    /// Close reason
     #[getter]
     fn close_reason(&self) -> Option<String> {
         self.close_reason.clone()
     }
 
-    /// Context manager - enter
     fn __enter__<'py>(
         mut slf: PyRefMut<'py, Self>,
         py: Python<'py>,
@@ -262,7 +324,6 @@ impl SyncClientConnection {
         Ok(slf)
     }
 
-    /// Context manager - exit
     #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
     fn __exit__(
         &mut self,
@@ -275,12 +336,10 @@ impl SyncClientConnection {
         Ok(false)
     }
 
-    /// Iterator support - return self
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }
 
-    /// Iterator support - return next message
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         match self.recv(py) {
             Ok(msg) => Ok(Some(msg)),
@@ -297,11 +356,23 @@ impl SyncClientConnection {
     }
 }
 
-/// Connect to a WebSocket server (sync)
 #[pyfunction]
-#[pyo3(signature = (uri, **_kwargs))]
-pub fn connect(uri: String, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<SyncClientConnection> {
-    Ok(SyncClientConnection::new(uri, None, None, None))
+#[pyo3(signature = (uri, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None, **_kwargs))]
+pub fn connect(
+    uri: String,
+    connect_timeout: Option<f64>,
+    receive_timeout: Option<f64>,
+    close_timeout: Option<f64>,
+    tcp_nodelay: Option<bool>,
+    _kwargs: Option<&Bound<'_, PyAny>>,
+) -> PyResult<SyncClientConnection> {
+    Ok(SyncClientConnection::new(
+        uri,
+        connect_timeout,
+        receive_timeout,
+        close_timeout,
+        tcp_nodelay,
+    ))
 }
 
 pub fn register_sync_client(py: Python<'_>, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {

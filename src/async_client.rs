@@ -73,7 +73,8 @@ fn process_message(
     match msg {
         Ok(Message::Text(text)) => Ok(text.into_pyobject(py)?.into_any().unbind()),
         Ok(Message::Binary(data)) => Ok(PyBytes::new(py, &data).into_any().unbind()),
-        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()),
+        // Ping/Pong are filtered in background task and should never reach here
+        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => unreachable!("filtered in background task"),
         Ok(Message::Close(c)) => {
             if let Some(frame) = c {
                 *close_code.write() = Some(frame.code.into());
@@ -226,10 +227,10 @@ async fn start_ws_task<S>(
                         Some(cmd) => {
                             let mut close_requested = false;
                             match cmd {
-                                Command::Text(t) => { let _ = sink.send(Message::Text(Utf8Bytes::from(t))).await; }
-                                Command::Binary(b) => { let _ = sink.send(Message::Binary(Bytes::from(b))).await; }
-                                Command::Ping(d) => { let _ = sink.send(Message::Ping(Bytes::from(d))).await; }
-                                Command::Pong(d) => { let _ = sink.send(Message::Pong(Bytes::from(d))).await; }
+                                Command::Text(t) => { if sink.send(Message::Text(Utf8Bytes::from(t))).await.is_err() { break; } }
+                                Command::Binary(b) => { if sink.send(Message::Binary(Bytes::from(b))).await.is_err() { break; } }
+                                Command::Ping(d) => { if sink.send(Message::Ping(Bytes::from(d))).await.is_err() { break; } }
+                                Command::Pong(d) => { if sink.send(Message::Pong(Bytes::from(d))).await.is_err() { break; } }
                                 Command::Close => {
                                     let _ = sink.close().await;
                                     close_requested = true;
@@ -725,8 +726,15 @@ impl AsyncClientConnection {
                         .await
                         .map_err(|e| format!("SOCKS5 proxy connection failed: {}", e))?;
 
-                        // Set TCP_NODELAY on the underlying proxy TCP stream
-                        let _ = std::ops::Deref::deref(&socks_stream).set_nodelay(tcp_nodelay);
+                        // Set TCP_NODELAY and extract addresses from proxy TCP stream
+                        let tcp_ref = std::ops::Deref::deref(&socks_stream);
+                        let _ = tcp_ref.set_nodelay(tcp_nodelay);
+                        if let Ok(addr) = tcp_ref.local_addr() {
+                            *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
+                        }
+                        if let Ok(addr) = tcp_ref.peer_addr() {
+                            *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
+                        }
 
                         if target_url.scheme() == "wss" {
                             let cx = native_tls::TlsConnector::builder()
@@ -846,7 +854,8 @@ impl AsyncClientConnection {
         _exc_value: Option<&Bound<'py, PyAny>>,
         _traceback: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        *slf.bind(py).borrow().event_loop.write() = None;
+        // Note: event_loop cache is NOT cleared here — close() needs it.
+        // The cache will be dropped with the object when GC'd.
         AsyncClientConnection::close(slf, py)
     }
 

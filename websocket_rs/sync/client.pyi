@@ -8,6 +8,7 @@ class ClientConnection:
         url: str,
         connect_timeout: float | None = None,
         receive_timeout: float | None = None,
+        close_timeout: float | None = None,
         tcp_nodelay: bool | None = None,
     ) -> None: ...
     def send(self, message: str | bytes) -> None: ...
@@ -39,11 +40,22 @@ class ClientConnection:
     def __iter__(self) -> ClientConnection: ...
     def __next__(self) -> str | bytes: ...
 
-def connect(uri: str, **kwargs: object) -> ClientConnection:
+def connect(
+    uri: str,
+    connect_timeout: float | None = None,
+    receive_timeout: float | None = None,
+    close_timeout: float | None = None,
+    tcp_nodelay: bool | None = None,
+    **kwargs: object,
+) -> ClientConnection:
     """Create a sync WebSocket client connection.
 
     Args:
         uri: WebSocket server URL (e.g., ``"ws://localhost:8765"``).
-        **kwargs: Accepted for compatibility, currently ignored.
+        connect_timeout: Connection timeout in seconds. Default: 10.0.
+        receive_timeout: Receive timeout in seconds. Default: 10.0.
+        close_timeout: Close handshake timeout in seconds. Default: 10.0.
+        tcp_nodelay: Disable Nagle's algorithm. Default: True.
+        **kwargs: Accepted for compatibility.
     """
     ...
