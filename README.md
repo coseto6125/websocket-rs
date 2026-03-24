@@ -21,9 +21,9 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 | 256 KB  | **7.7x** faster | **7.7x** faster |
 | 1 MB    | **13.3x** faster | **18.1x** faster |
 
-> Payload 越大，Rust 的零拷貝 parsing 優勢越明顯。Async 在 8KB+ 開始反超 Python websockets。
+> Larger payloads amplify Rust's zero-copy parsing advantage. Async overtakes Python websockets starting at 8KB+.
 >
-> 跨網路場景下（實測 Postman Echo wss://），兩者延遲差異 < 1% — 網路延遲主導一切。
+> Over real networks (tested against Postman Echo wss://), latency difference is < 1% — network latency dominates.
 
 📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
