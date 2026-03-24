@@ -94,8 +94,8 @@ impl SyncClientConnection {
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
             Message::Text(s.to_str()?.to_owned())
-        } else if let Ok(b) = message.cast::<PyBytes>() {
-            Message::Binary(b.as_bytes().to_vec())
+        } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
+            Message::Binary(bytes)
         } else {
             return Err(PyRuntimeError::new_err("Message must be string or bytes"));
         };

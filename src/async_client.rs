@@ -361,8 +361,8 @@ impl AsyncClientConnection {
 
         let command = if let Ok(s) = message.cast::<pyo3::types::PyString>() {
             Command::Text(s.to_str()?.to_owned())
-        } else if let Ok(b) = message.cast::<PyBytes>() {
-            Command::Binary(b.as_bytes().to_vec())
+        } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
+            Command::Binary(bytes)
         } else {
             return Err(PyRuntimeError::new_err("Message must be str or bytes"));
         };
