@@ -20,7 +20,7 @@ enum RecvResult {
 /// Type-erased stream for WebSocket (avoids generic type in pyclass)
 enum WsStream {
     Plain(TcpStream),
-    Tls(native_tls::TlsStream<TcpStream>),
+    Tls(Box<native_tls::TlsStream<TcpStream>>),
 }
 
 impl Read for WsStream {
@@ -151,7 +151,7 @@ impl SyncClientConnection {
                 let tls = connector.connect(&host, tcp).map_err(|e| {
                     PyConnectionError::new_err(format!("TLS handshake failed: {}", e))
                 })?;
-                WsStream::Tls(tls)
+                WsStream::Tls(Box::new(tls))
             } else {
                 WsStream::Plain(tcp)
             };
