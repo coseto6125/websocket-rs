@@ -20,7 +20,7 @@ sync = _websocket_rs.sync
 async_client = _websocket_rs.async_client
 
 # Version
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # Public API
 __all__ = [

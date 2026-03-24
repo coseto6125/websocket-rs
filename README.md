@@ -36,7 +36,7 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 - TCP_NODELAY enabled by default
 - Address stored as pre-parsed tuple
 
-### SOCKS5 Proxy & Custom Headers (v0.5.0)
+### SOCKS5 Proxy & Custom Headers (v0.6.0)
 ```python
 ws = await connect("wss://example.com/ws",
                    proxy="socks5://127.0.0.1:1080",
@@ -128,7 +128,7 @@ ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
 
 ```bash
 # Specify version (example for Linux x86_64, Python 3.12+)
-uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.5.0/websocket_rs-0.5.0-cp312-abi3-manylinux_2_34_x86_64.whl
+uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.6.0/websocket_rs-0.6.0-cp312-abi3-manylinux_2_34_x86_64.whl
 ```
 
 ### From Source
