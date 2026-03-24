@@ -6,7 +6,7 @@ use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect as tungstenite_connect, Message, WebSocket};
 
-use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
+use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY};
 
 enum RecvResult {
     Text(String),
@@ -23,6 +23,7 @@ pub struct SyncClientConnection {
     receive_timeout: f64,
     local_addr: Option<(String, u16)>,
     remote_addr: Option<(String, u16)>,
+    tcp_nodelay: bool,
     close_code: Option<u16>,
     close_reason: Option<String>,
 }
@@ -30,13 +31,19 @@ pub struct SyncClientConnection {
 #[pymethods]
 impl SyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None))]
-    fn new(url: String, connect_timeout: Option<f64>, receive_timeout: Option<f64>) -> Self {
+    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None, tcp_nodelay=None))]
+    fn new(
+        url: String,
+        connect_timeout: Option<f64>,
+        receive_timeout: Option<f64>,
+        tcp_nodelay: Option<bool>,
+    ) -> Self {
         SyncClientConnection {
             url,
             ws: None,
             connect_timeout: connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            tcp_nodelay: tcp_nodelay.unwrap_or(DEFAULT_TCP_NODELAY),
             local_addr: None,
             remote_addr: None,
             close_code: None,
@@ -48,14 +55,16 @@ impl SyncClientConnection {
     fn __connect(&mut self, py: Python<'_>) -> PyResult<()> {
         let url = self.url.clone();
         let receive_timeout = self.receive_timeout;
+        let tcp_nodelay = self.tcp_nodelay;
 
         py.detach(|| {
             let (mut ws, _) = tungstenite_connect(&url)
                 .map_err(|e| PyConnectionError::new_err(format!("Connection failed: {}", e)))?;
 
-            // Set read timeout and get addresses
+            // Set TCP_NODELAY, read timeout and get addresses
             match ws.get_mut() {
                 MaybeTlsStream::Plain(stream) => {
+                    let _ = stream.set_nodelay(tcp_nodelay);
                     let timeout = Duration::from_secs_f64(receive_timeout);
                     stream.set_read_timeout(Some(timeout)).map_err(|e| {
                         PyRuntimeError::new_err(format!("Set timeout failed: {}", e))
@@ -70,6 +79,7 @@ impl SyncClientConnection {
                 }
                 MaybeTlsStream::NativeTls(stream) => {
                     let tcp_stream = stream.get_ref();
+                    let _ = tcp_stream.set_nodelay(tcp_nodelay);
                     let timeout = Duration::from_secs_f64(receive_timeout);
                     tcp_stream.set_read_timeout(Some(timeout)).map_err(|e| {
                         PyRuntimeError::new_err(format!("Set timeout failed: {}", e))
@@ -291,7 +301,7 @@ impl SyncClientConnection {
 #[pyfunction]
 #[pyo3(signature = (uri, **_kwargs))]
 pub fn connect(uri: String, _kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<SyncClientConnection> {
-    Ok(SyncClientConnection::new(uri, None, None))
+    Ok(SyncClientConnection::new(uri, None, None, None))
 }
 
 pub fn register_sync_client(py: Python<'_>, parent_module: &Bound<'_, PyModule>) -> PyResult<()> {

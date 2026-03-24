@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
-use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
+use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY};
 
 type MessageReceiver = Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>;
 
@@ -289,6 +289,7 @@ pub struct AsyncClientConnection {
     stream_sync: Arc<RwLock<bool>>,
     connect_timeout: f64,
     receive_timeout: f64,
+    tcp_nodelay: bool,
     event_loop: Arc<RwLock<Option<Py<PyAny>>>>,
     local_addr: Arc<RwLock<Option<(String, u16)>>>,
     remote_addr: Arc<RwLock<Option<(String, u16)>>>,
@@ -300,13 +301,14 @@ pub struct AsyncClientConnection {
 #[pymethods]
 impl AsyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None))]
+    #[pyo3(signature = (url, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None, tcp_nodelay=None))]
     fn new(
         url: String,
         headers: Option<HashMap<String, String>>,
         proxy: Option<String>,
         connect_timeout: Option<f64>,
         receive_timeout: Option<f64>,
+        tcp_nodelay: Option<bool>,
     ) -> PyResult<Self> {
         // Validate proxy scheme (only socks5:// supported)
         if let Some(ref p) = proxy {
@@ -339,6 +341,7 @@ impl AsyncClientConnection {
             stream_sync: Arc::new(RwLock::new(false)),
             connect_timeout: connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            tcp_nodelay: tcp_nodelay.unwrap_or(DEFAULT_TCP_NODELAY),
             event_loop: Arc::new(RwLock::new(None)),
             local_addr: Arc::new(RwLock::new(None)),
             remote_addr: Arc::new(RwLock::new(None)),
@@ -649,6 +652,7 @@ impl AsyncClientConnection {
             headers_opt,
             proxy_opt,
             connect_timeout,
+            tcp_nodelay,
             local_addr,
             remote_addr,
             event_loop_cache,
@@ -659,6 +663,7 @@ impl AsyncClientConnection {
                 ws.headers.clone(),
                 ws.proxy.clone(),
                 ws.connect_timeout,
+                ws.tcp_nodelay,
                 ws.local_addr.clone(),
                 ws.remote_addr.clone(),
                 ws.event_loop.clone(),
@@ -720,6 +725,9 @@ impl AsyncClientConnection {
                         .await
                         .map_err(|e| format!("SOCKS5 proxy connection failed: {}", e))?;
 
+                        // Set TCP_NODELAY on the underlying proxy TCP stream
+                        let _ = std::ops::Deref::deref(&socks_stream).set_nodelay(tcp_nodelay);
+
                         if target_url.scheme() == "wss" {
                             let cx = native_tls::TlsConnector::builder()
                                 .build()
@@ -747,9 +755,10 @@ impl AsyncClientConnection {
                     // ── Direct connection path ──
                     let (ws_stream, _) = connect_async(request).await.map_err(|e| e.to_string())?;
 
-                    // Extract addr info from direct connection
+                    // Set TCP_NODELAY and extract addr info from direct connection
                     match ws_stream.get_ref() {
                         MaybeTlsStream::Plain(s) => {
+                            let _ = s.set_nodelay(tcp_nodelay);
                             if let Ok(addr) = s.local_addr() {
                                 *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
@@ -758,6 +767,7 @@ impl AsyncClientConnection {
                             }
                         }
                         MaybeTlsStream::NativeTls(s) => {
+                            let _ = s.get_ref().get_ref().get_ref().set_nodelay(tcp_nodelay);
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
                                 *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
@@ -931,7 +941,7 @@ pub fn connect<'py>(
     proxy: Option<String>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None)?;
+    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None, None)?;
     let ws_cell = Py::new(py, ws)?;
     AsyncClientConnection::__aenter__(ws_cell, py)
 }

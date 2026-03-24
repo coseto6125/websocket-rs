@@ -6,6 +6,7 @@ mod sync_client;
 // Constants
 const DEFAULT_CONNECT_TIMEOUT: f64 = 10.0;
 const DEFAULT_RECEIVE_TIMEOUT: f64 = 10.0;
+const DEFAULT_TCP_NODELAY: bool = true;
 
 #[pymodule]
 fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
