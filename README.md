@@ -6,54 +6,46 @@
 
 [English](README.md) | [繁體中文](README.zh-TW.md)
 
-High-performance WebSocket client implementation in Rust with Python bindings. Provides both sync and async APIs with optional compatibility layer for `websockets` library.
+High-performance WebSocket client implementation in Rust with Python bindings. Provides both sync and async APIs compatible with `websockets` library.
 
-## 🎯 Performance Overview
+## 🎯 Performance
 
-### When to Use What
+### vs websockets 15.0 (localhost, 200 roundtrips)
 
-**For Request-Response Patterns** (chat apps, API calls, gaming):
-- 🥇 **picows**: 0.034 ms RTT - Best for extreme low-latency requirements
-- 🥈 **websocket-rs Sync**: 0.128 ms RTT - Best balance of performance and simplicity
-- 🥉 **websocket-client**: 0.237 ms RTT - Good for simple sync applications
+| Payload | Sync | Async |
+|---------|------|-------|
+| 32 B    | **1.8x** faster | 0.87x |
+| 1 KB    | **1.9x** faster | 0.88x |
+| 16 KB   | **3.2x** faster | **1.5x** faster |
+| 64 KB   | **6.0x** faster | **3.1x** faster |
+| 256 KB  | **7.7x** faster | **7.7x** faster |
+| 1 MB    | **13.3x** faster | **18.1x** faster |
 
-**For High-Concurrency Pipelining** (data streaming, batch processing):
-- 🥇 **websocket-rs Async**: 2.964 ms RTT - **12x faster** than picows, **21x faster** than websockets
-- 🥈 **picows**: 36.129 ms RTT - Struggles with pipelined batches
-- 🥉 **websockets Async**: 61.217 ms RTT - Pure Python limitations
+> Payload 越大，Rust 的零拷貝 parsing 優勢越明顯。Async 在 8KB+ 開始反超 Python websockets。
+>
+> 跨網路場景下（實測 Postman Echo wss://），兩者延遲差異 < 1% — 網路延遲主導一切。
 
-### Why Different Patterns Matter
+📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
-WebSocket applications use two fundamentally different communication patterns:
+## ✨ What's New in v0.6.0
 
-1. **Request-Response (RR)**: Send one message → wait for reply → send next
-   - Used by: Chat apps, API calls, online games, command-response systems
-   - Characteristics: Sequential, blocking, no concurrency
-   - Winner: **picows** (event-driven C extension)
+### Performance Optimizations
+- `pyo3::intern!` for all Python string lookups in hot paths
+- Zero-copy recv path (sync client)
+- Ping/Pong filtered in background task (async client)
+- TCP_NODELAY enabled by default
+- Address stored as pre-parsed tuple
 
-2. **Pipelined**: Send multiple messages without waiting → receive all responses
-   - Used by: Data streaming, bulk operations, high-throughput systems
-   - Characteristics: Concurrent, non-blocking, batched I/O
-   - Winner: **websocket-rs Async** (Rust async with Tokio)
-
-📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** - Comprehensive performance comparison with test methodology
-
-## ✨ What's New in v0.5.0
-
-### SOCKS5 Proxy Support
+### SOCKS5 Proxy & Custom Headers (v0.5.0)
 ```python
-ws = await connect("wss://example.com/ws", proxy="socks5://127.0.0.1:1080")
+ws = await connect("wss://example.com/ws",
+                   proxy="socks5://127.0.0.1:1080",
+                   headers={"Authorization": "Bearer token"})
 ```
 
-### Custom HTTP Headers
-```python
-ws = await connect("wss://example.com/ws", headers={"Authorization": "Bearer token"})
-```
-
-### Safety & Quality
-- GIL safety fixes for async error/timeout paths
-- Input validation for proxy scheme and header values
-- Backward compatible — `headers`/`proxy` are keyword-only
+### Type Stubs (PEP 561)
+- Full `.pyi` type stubs for IDE autocomplete and type checkers
+- `py.typed` marker included
 
 ## 🚀 Quick Start
 
@@ -73,8 +65,8 @@ pip install git+https://github.com/coseto6125/websocket-rs.git
 ### Basic Usage
 
 ```python
-# Direct usage - Sync API
-from websocket_rs.sync_client import connect
+# Sync API
+from websocket_rs.sync.client import connect
 
 with connect("ws://localhost:8765") as ws:
     ws.send("Hello")
@@ -83,32 +75,17 @@ with connect("ws://localhost:8765") as ws:
 ```
 
 ```python
-# Direct usage - Async API
+# Async API
 import asyncio
 from websocket_rs.async_client import connect
 
 async def main():
-    ws = await connect("ws://localhost:8765")
-    try:
+    async with await connect("ws://localhost:8765") as ws:
         await ws.send("Hello")
         response = await ws.recv()
         print(response)
-    finally:
-        await ws.close()
 
 asyncio.run(main())
-```
-
-```python
-# Monkeypatch mode (zero code changes)
-import websocket_rs
-websocket_rs.enable_monkeypatch()
-
-# Existing code using websockets now uses Rust implementation
-import websockets.sync.client
-with websockets.sync.client.connect("ws://localhost:8765") as ws:
-    ws.send("Hello")
-    print(ws.recv())
 ```
 
 ## 📖 API Documentation
@@ -125,42 +102,25 @@ with websockets.sync.client.connect("ws://localhost:8765") as ws:
 ### Connection Parameters
 
 ```python
-connect(
-    url: str,                    # WebSocket server URL
-    connect_timeout: float = 30, # Connection timeout (seconds)
-    receive_timeout: float = 30  # Receive timeout (seconds)
-)
+# Sync
+from websocket_rs.sync.client import ClientConnection
+ws = ClientConnection(url, connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
+
+# Async
+from websocket_rs.async_client import ClientConnection
+ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
+                      connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
 ```
 
-## 🎯 Choosing the Right Implementation
+## 🎯 When to Use
 
-### Choose **picows** if you need:
-- ✅ Absolute lowest latency (<0.1 ms)
-- ✅ Request-response pattern (chat, API calls)
-- ✅ Team comfortable with event-driven callbacks
-- ❌ NOT for: Batch/pipelined operations
-
-### Choose **websocket-rs Sync** if you need:
-- ✅ Simple blocking API
-- ✅ Good performance (0.1-0.13 ms RTT)
-- ✅ Drop-in replacement for `websockets.sync`
-- ✅ Request-response pattern
-- ✅ 1.85x faster than websocket-client
-- ❌ NOT for: Async/await integration
-
-### Choose **websocket-rs Async** if you need:
-- ✅ High-concurrency pipelining
-- ✅ Batch operations (12x faster than picows)
-- ✅ Data streaming applications
-- ✅ Integration with Python asyncio
-- ❌ NOT for: Simple request-response (use Sync instead)
-
-### Choose **websockets (Python)** if you need:
-- ✅ Rapid prototyping
-- ✅ Mature ecosystem
-- ✅ Comprehensive documentation
-- ✅ Low-frequency communication (<10 msg/s)
-- ❌ NOT for: High-performance requirements
+| Scenario | Recommendation | Why |
+|----------|---------------|-----|
+| Simple scripts, CLI tools | **Sync** | 1.8x faster, no event loop needed |
+| Large payload (16KB+) | **Sync or Async** | 3-18x faster, zero-copy parsing |
+| High concurrency | **Async** | Supports thousands of connections |
+| Small messages, low latency | **Sync** or Python websockets | Async bridge overhead for small msgs |
+| Cross-network (real servers) | **Either** | Network latency dominates, < 1% difference |
 
 ## 🔧 Advanced Installation
 
@@ -175,7 +135,7 @@ uv pip install https://github.com/coseto6125/websocket-rs/releases/download/v0.5
 
 **Requirements**:
 - Python 3.12+
-- Rust 1.70+ ([rustup.rs](https://rustup.rs/))
+- Rust 1.80+ ([rustup.rs](https://rustup.rs/))
 
 ```bash
 git clone https://github.com/coseto6125/websocket-rs.git
@@ -199,11 +159,11 @@ dependencies = [
 # Run API compatibility tests
 python tests/test_compatibility.py
 
-# Run comprehensive benchmarks (RR + Pipelined)
+# Run comprehensive benchmarks
 python tests/benchmark_server_timestamp.py
 
-# Run optimized benchmarks
-python tests/benchmark_optimized.py
+# Run micro-benchmarks (CPU overhead)
+python tests/benchmark_micro.py
 ```
 
 ## 🛠️ Development
@@ -254,19 +214,21 @@ maturin develop --release --watch
 3. **No GIL**: True parallelism for concurrent operations
 4. **Memory safety**: No segfaults, data races, or memory leaks
 
-### Performance Trade-offs
+### Performance Architecture
 
-**Request-Response Mode:**
-- ❌ PyO3 FFI overhead on every call
-- ❌ Dual runtime coordination (asyncio + Tokio)
-- ✅ Still competitive with pure Python sync
-- ✅ Better than Python async for large messages
+**Sync Client** — Pure `tungstenite` (blocking I/O), no async runtime overhead:
+```
+Python → GIL release → Rust tungstenite → socket I/O → result
+```
 
-**Pipelined Mode:**
-- ✅ FFI overhead amortized across batch
-- ✅ Tokio's concurrency advantages shine
-- ✅ No GIL blocking
-- ✅ Significant speedup over all Python alternatives
+**Async Client** — Actor pattern with `tokio-tungstenite`:
+```
+Python → mpsc channel → tokio background task → socket I/O
+         ↑ ReadyFuture fast path when data is buffered
+```
+
+The async bridge adds ~36µs per operation (channel + `call_soon_threadsafe`).
+This is negligible for large payloads or cross-network usage, but visible on localhost small messages.
 
 ## 🐛 Troubleshooting
 

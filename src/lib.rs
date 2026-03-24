@@ -6,6 +6,8 @@ mod sync_client;
 // Constants
 const DEFAULT_CONNECT_TIMEOUT: f64 = 10.0;
 const DEFAULT_RECEIVE_TIMEOUT: f64 = 10.0;
+const DEFAULT_CLOSE_TIMEOUT: f64 = 10.0;
+const DEFAULT_TCP_NODELAY: bool = true;
 
 #[pymodule]
 fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -17,6 +19,9 @@ fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register async_client module
     async_client::register_async_client(py, m)?;
+
+    // Expose version
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     Ok(())
 }

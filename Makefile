@@ -36,14 +36,11 @@ build:
 test: build
 	@echo "🧪 Running tests..."
 	. .venv/bin/activate && python tests/test_compatibility.py
-	. .venv/bin/activate && python tests/test_monkeypatch.py
 
 # Run benchmarks
 bench: build
 	@echo "📊 Running benchmarks..."
-	. .venv/bin/activate && python tests/benchmark_optimized.py
-	@echo ""
-	. .venv/bin/activate && python tests/benchmark_latency.py
+	. .venv/bin/activate && python tests/benchmark_server_timestamp.py
 
 # Clean build artifacts
 clean:
@@ -54,8 +51,8 @@ clean:
 	rm -rf .pytest_cache/
 	rm -rf __pycache__/
 	rm -rf **/__pycache__/
-	find . -name "*.so" -delete
-	find . -name "*.pyd" -delete
+	find ./websocket_rs -name "*.so" -delete 2>/dev/null || true
+	find ./websocket_rs -name "*.pyd" -delete 2>/dev/null || true
 
 # Build distribution wheels
 release:
@@ -65,4 +62,4 @@ release:
 # Quick test (no server needed)
 quick-test: build
 	@echo "🧪 Running quick tests (no server required)..."
-	. .venv/bin/activate && python tests/test_monkeypatch.py
+	. .venv/bin/activate && python tests/test_compatibility.py

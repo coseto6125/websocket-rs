@@ -19,7 +19,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
-use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT};
+use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY};
 
 type MessageReceiver = Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>;
 
@@ -73,7 +73,8 @@ fn process_message(
     match msg {
         Ok(Message::Text(text)) => Ok(text.into_pyobject(py)?.into_any().unbind()),
         Ok(Message::Binary(data)) => Ok(PyBytes::new(py, &data).into_any().unbind()),
-        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => Ok(py.None()),
+        // Ping/Pong are filtered in background task and should never reach here
+        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => unreachable!("filtered in background task"),
         Ok(Message::Close(c)) => {
             if let Some(frame) = c {
                 *close_code.write() = Some(frame.code.into());
@@ -94,7 +95,7 @@ fn get_asyncio(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     if let Some(module) = ASYNCIO.get() {
         return Ok(module.bind(py).clone());
     }
-    let module = py.import("asyncio")?;
+    let module = py.import(pyo3::intern!(py, "asyncio"))?;
     let module_perm = module.clone().unbind();
     ASYNCIO.set(module_perm).ok();
     Ok(module)
@@ -109,46 +110,41 @@ fn get_cached_event_loop<'py>(
         return Ok(loop_obj.bind(py).clone());
     }
     let asyncio = get_asyncio(py)?;
-    let event_loop = asyncio.call_method0("get_running_loop")?;
+    let event_loop = asyncio.call_method0(pyo3::intern!(py, "get_running_loop"))?;
     *cache.write() = Some(event_loop.clone().unbind());
     Ok(event_loop)
 }
 
 fn create_future<'py>(
-    _py: Python<'py>,
+    py: Python<'py>,
     event_loop: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    event_loop.call_method0("create_future")
+    event_loop.call_method0(pyo3::intern!(py, "create_future"))
 }
 
 fn complete_future<'py>(
-    _py: Python<'py>,
+    py: Python<'py>,
     event_loop: &Bound<'py, PyAny>,
     future: &Bound<'py, PyAny>,
     result: Py<PyAny>,
 ) -> PyResult<()> {
-    let set_result = future.getattr("set_result")?;
-    event_loop.call_method1("call_soon_threadsafe", (set_result, result))?;
+    let set_result = future.getattr(pyo3::intern!(py, "set_result"))?;
+    event_loop.call_method1(
+        pyo3::intern!(py, "call_soon_threadsafe"),
+        (set_result, result),
+    )?;
     Ok(())
 }
 
-fn fail_future(
-    _py: Python<'_>,
-    event_loop: &Bound<'_, PyAny>,
-    future: &Bound<'_, PyAny>,
+fn fail_future<'py>(
+    py: Python<'py>,
+    event_loop: &Bound<'py, PyAny>,
+    future: &Bound<'py, PyAny>,
     exc: PyErr,
 ) -> PyResult<()> {
-    let set_exc = future.getattr("set_exception")?;
-    event_loop.call_method1("call_soon_threadsafe", (set_exc, exc))?;
+    let set_exc = future.getattr(pyo3::intern!(py, "set_exception"))?;
+    event_loop.call_method1(pyo3::intern!(py, "call_soon_threadsafe"), (set_exc, exc))?;
     Ok(())
-}
-
-fn ready_ok<'py>(py: Python<'py>, result: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
-    let asyncio = get_asyncio(py)?;
-    let event_loop = asyncio.call_method0("get_running_loop")?;
-    let future = event_loop.call_method0("create_future")?;
-    future.call_method1("set_result", (result,))?;
-    Ok(future)
 }
 
 fn ready_fast<'py>(py: Python<'py>, result: impl IntoPyObject<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -186,9 +182,21 @@ enum Command {
 
 /// Result of WebSocket connect — carries the stream type without Py<T> ownership issues
 enum WsConnectResult {
-    Direct(tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>),
-    Proxy(Box<tokio_tungstenite::WebSocketStream<tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>>),
-    ProxyPlain(Box<tokio_tungstenite::WebSocketStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>>),
+    Direct(Box<tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>),
+    Proxy(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>,
+            >,
+        >,
+    ),
+    ProxyPlain(
+        Box<
+            tokio_tungstenite::WebSocketStream<
+                tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>,
+            >,
+        >,
+    ),
 }
 
 // Background Task Handler (Supports both Direct and Proxy Streams)
@@ -219,10 +227,10 @@ async fn start_ws_task<S>(
                         Some(cmd) => {
                             let mut close_requested = false;
                             match cmd {
-                                Command::Text(t) => { let _ = sink.send(Message::Text(Utf8Bytes::from(t))).await; }
-                                Command::Binary(b) => { let _ = sink.send(Message::Binary(Bytes::from(b))).await; }
-                                Command::Ping(d) => { let _ = sink.send(Message::Ping(Bytes::from(d))).await; }
-                                Command::Pong(d) => { let _ = sink.send(Message::Pong(Bytes::from(d))).await; }
+                                Command::Text(t) => { if sink.send(Message::Text(Utf8Bytes::from(t))).await.is_err() { break; } }
+                                Command::Binary(b) => { if sink.send(Message::Binary(Bytes::from(b))).await.is_err() { break; } }
+                                Command::Ping(d) => { if sink.send(Message::Ping(Bytes::from(d))).await.is_err() { break; } }
+                                Command::Pong(d) => { if sink.send(Message::Pong(Bytes::from(d))).await.is_err() { break; } }
                                 Command::Close => {
                                     let _ = sink.close().await;
                                     close_requested = true;
@@ -244,6 +252,10 @@ async fn start_ws_task<S>(
                 }
                 msg = stream.next() => {
                     match msg {
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => {
+                            // Filtered: don't wake recv/anext for control frames
+                            continue;
+                        }
                         Some(Ok(msg)) => {
                             if tx_msg.send(Ok(msg)).await.is_err() { break; }
                         }
@@ -278,9 +290,10 @@ pub struct AsyncClientConnection {
     stream_sync: Arc<RwLock<bool>>,
     connect_timeout: f64,
     receive_timeout: f64,
+    tcp_nodelay: bool,
     event_loop: Arc<RwLock<Option<Py<PyAny>>>>,
-    local_addr: Arc<RwLock<Option<String>>>,
-    remote_addr: Arc<RwLock<Option<String>>>,
+    local_addr: Arc<RwLock<Option<(String, u16)>>>,
+    remote_addr: Arc<RwLock<Option<(String, u16)>>>,
     subprotocol: Arc<RwLock<Option<String>>>,
     close_code: Arc<RwLock<Option<u16>>>,
     close_reason: Arc<RwLock<Option<String>>>,
@@ -289,13 +302,14 @@ pub struct AsyncClientConnection {
 #[pymethods]
 impl AsyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None))]
+    #[pyo3(signature = (url, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None, tcp_nodelay=None))]
     fn new(
         url: String,
         headers: Option<HashMap<String, String>>,
         proxy: Option<String>,
         connect_timeout: Option<f64>,
         receive_timeout: Option<f64>,
+        tcp_nodelay: Option<bool>,
     ) -> PyResult<Self> {
         // Validate proxy scheme (only socks5:// supported)
         if let Some(ref p) = proxy {
@@ -313,8 +327,9 @@ impl AsyncClientConnection {
             for (k, v) in h {
                 HeaderName::from_str(k)
                     .map_err(|_| PyValueError::new_err(format!("Invalid header name: {}", k)))?;
-                HeaderValue::from_str(v)
-                    .map_err(|_| PyValueError::new_err(format!("Invalid header value for {}", k)))?;
+                HeaderValue::from_str(v).map_err(|_| {
+                    PyValueError::new_err(format!("Invalid header value for {}", k))
+                })?;
             }
         }
 
@@ -327,6 +342,7 @@ impl AsyncClientConnection {
             stream_sync: Arc::new(RwLock::new(false)),
             connect_timeout: connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             receive_timeout: receive_timeout.unwrap_or(DEFAULT_RECEIVE_TIMEOUT),
+            tcp_nodelay: tcp_nodelay.unwrap_or(DEFAULT_TCP_NODELAY),
             event_loop: Arc::new(RwLock::new(None)),
             local_addr: Arc::new(RwLock::new(None)),
             remote_addr: Arc::new(RwLock::new(None)),
@@ -347,8 +363,8 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
 
-        let command = if let Ok(text) = message.extract::<String>() {
-            Command::Text(text)
+        let command = if let Ok(s) = message.cast::<pyo3::types::PyString>() {
+            Command::Text(s.to_str()?.to_owned())
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
             Command::Binary(bytes)
         } else {
@@ -397,13 +413,13 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let receive_timeout = self.receive_timeout;
-        let close_code = self.close_code.clone();
-        let close_reason = self.close_reason.clone();
 
+        // Fast path: try_lock + try_recv avoids spawning a tokio task
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    let result = process_message(py, msg, &close_code, &close_reason, false);
+                    let result =
+                        process_message(py, msg, &self.close_code, &self.close_reason, false);
                     match result {
                         Ok(val) => return ready_fast(py, val),
                         Err(e) => return ready_fast_err(py, e),
@@ -416,6 +432,9 @@ impl AsyncClientConnection {
             }
         }
 
+        // Slow path: clone Arcs only when we need to move them into the spawned task
+        let close_code = self.close_code.clone();
+        let close_reason = self.close_reason.clone();
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
         let future_ptr = future.clone().unbind();
@@ -524,7 +543,7 @@ impl AsyncClientConnection {
             .clone();
         let data = data.unwrap_or_default();
         match tx_cloned.try_send(Command::Ping(data)) {
-            Ok(_) => ready_ok(py, py.None()),
+            Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
@@ -565,7 +584,7 @@ impl AsyncClientConnection {
             .clone();
         let data = data.unwrap_or_default();
         match tx_cloned.try_send(Command::Pong(data)) {
-            Ok(_) => ready_ok(py, py.None()),
+            Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
                 let event_loop = get_cached_event_loop(py, &self.event_loop)?;
                 let future = create_future(py, &event_loop)?;
@@ -608,17 +627,11 @@ impl AsyncClientConnection {
     }
     #[getter]
     fn local_address(&self) -> Option<(String, u16)> {
-        self.local_addr.read().as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.local_addr.read().clone()
     }
     #[getter]
     fn remote_address(&self) -> Option<(String, u16)> {
-        self.remote_addr.read().as_ref().and_then(|s| {
-            s.rsplit_once(':')
-                .and_then(|(ip, port)| port.parse().ok().map(|p| (ip.to_string(), p)))
-        })
+        self.remote_addr.read().clone()
     }
     #[getter]
     fn close_code(&self) -> Option<u16> {
@@ -635,13 +648,23 @@ impl AsyncClientConnection {
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         // Extract all values while holding the GIL — nothing crosses the await boundary
-        let (url, headers_opt, proxy_opt, connect_timeout, local_addr, remote_addr, event_loop_cache) = {
+        let (
+            url,
+            headers_opt,
+            proxy_opt,
+            connect_timeout,
+            tcp_nodelay,
+            local_addr,
+            remote_addr,
+            event_loop_cache,
+        ) = {
             let ws = slf.bind(py).borrow();
             (
                 ws.url.clone(),
                 ws.headers.clone(),
                 ws.proxy.clone(),
                 ws.connect_timeout,
+                ws.tcp_nodelay,
                 ws.local_addr.clone(),
                 ws.remote_addr.clone(),
                 ws.event_loop.clone(),
@@ -649,7 +672,7 @@ impl AsyncClientConnection {
         };
 
         let asyncio = get_asyncio(py)?;
-        let event_loop = asyncio.call_method0("get_running_loop")?;
+        let event_loop = asyncio.call_method0(pyo3::intern!(py, "get_running_loop"))?;
         *event_loop_cache.write() = Some(event_loop.clone().unbind());
 
         let future = create_future(py, &event_loop)?;
@@ -660,7 +683,10 @@ impl AsyncClientConnection {
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 let connect_fut = async {
-                    let mut request = url.clone().into_client_request().map_err(|e| e.to_string())?;
+                    let mut request = url
+                        .clone()
+                        .into_client_request()
+                        .map_err(|e| e.to_string())?;
 
                     // Inject custom headers (already validated in new())
                     if let Some(ref headers) = headers_opt {
@@ -676,12 +702,22 @@ impl AsyncClientConnection {
                     if let Some(ref proxy_str) = proxy_opt {
                         // ── SOCKS5 proxy path ──
                         let target_url = url::Url::parse(&url).map_err(|e| e.to_string())?;
-                        let host = target_url.host_str().ok_or("Invalid target host")?.to_string();
-                        let port = target_url.port_or_known_default().ok_or("Invalid target port")?;
+                        let host = target_url
+                            .host_str()
+                            .ok_or("Invalid target host")?
+                            .to_string();
+                        let port = target_url
+                            .port_or_known_default()
+                            .ok_or("Invalid target port")?;
 
                         let proxy_url = url::Url::parse(proxy_str).map_err(|e| e.to_string())?;
-                        let proxy_host = proxy_url.host_str().ok_or("Invalid proxy host")?.to_string();
-                        let proxy_port = proxy_url.port_or_known_default().ok_or("Invalid proxy port")?;
+                        let proxy_host = proxy_url
+                            .host_str()
+                            .ok_or("Invalid proxy host")?
+                            .to_string();
+                        let proxy_port = proxy_url
+                            .port_or_known_default()
+                            .ok_or("Invalid proxy port")?;
 
                         let socks_stream = tokio_socks::tcp::Socks5Stream::connect(
                             (proxy_host.as_str(), proxy_port),
@@ -690,24 +726,36 @@ impl AsyncClientConnection {
                         .await
                         .map_err(|e| format!("SOCKS5 proxy connection failed: {}", e))?;
 
+                        // Set TCP_NODELAY and extract addresses from proxy TCP stream
+                        let tcp_ref = std::ops::Deref::deref(&socks_stream);
+                        let _ = tcp_ref.set_nodelay(tcp_nodelay);
+                        if let Ok(addr) = tcp_ref.local_addr() {
+                            *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
+                        }
+                        if let Ok(addr) = tcp_ref.peer_addr() {
+                            *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
+                        }
+
                         if target_url.scheme() == "wss" {
                             let cx = native_tls::TlsConnector::builder()
                                 .build()
                                 .map_err(|e| format!("TLS connector build failed: {}", e))?;
                             let cx = tokio_native_tls::TlsConnector::from(cx);
-                            let tls_stream = cx
-                                .connect(&host, socks_stream)
-                                .await
-                                .map_err(|e| format!("TLS handshake through proxy failed: {}", e))?;
+                            let tls_stream =
+                                cx.connect(&host, socks_stream).await.map_err(|e| {
+                                    format!("TLS handshake through proxy failed: {}", e)
+                                })?;
 
-                            let (ws_stream, _) = tokio_tungstenite::client_async(request, tls_stream)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, tls_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             return Ok(WsConnectResult::Proxy(Box::new(ws_stream)));
                         } else {
-                            let (ws_stream, _) = tokio_tungstenite::client_async(request, socks_stream)
-                                .await
-                                .map_err(|e| e.to_string())?;
+                            let (ws_stream, _) =
+                                tokio_tungstenite::client_async(request, socks_stream)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             return Ok(WsConnectResult::ProxyPlain(Box::new(ws_stream)));
                         }
                     }
@@ -715,27 +763,29 @@ impl AsyncClientConnection {
                     // ── Direct connection path ──
                     let (ws_stream, _) = connect_async(request).await.map_err(|e| e.to_string())?;
 
-                    // Extract addr info from direct connection
+                    // Set TCP_NODELAY and extract addr info from direct connection
                     match ws_stream.get_ref() {
                         MaybeTlsStream::Plain(s) => {
+                            let _ = s.set_nodelay(tcp_nodelay);
                             if let Ok(addr) = s.local_addr() {
-                                *local_addr.write() = Some(addr.to_string());
+                                *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                             if let Ok(addr) = s.peer_addr() {
-                                *remote_addr.write() = Some(addr.to_string());
+                                *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }
                         MaybeTlsStream::NativeTls(s) => {
+                            let _ = s.get_ref().get_ref().get_ref().set_nodelay(tcp_nodelay);
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
-                                *local_addr.write() = Some(addr.to_string());
+                                *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                             if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
-                                *remote_addr.write() = Some(addr.to_string());
+                                *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }
                         _ => {}
                     }
-                    Ok::<WsConnectResult, String>(WsConnectResult::Direct(ws_stream))
+                    Ok::<WsConnectResult, String>(WsConnectResult::Direct(Box::new(ws_stream)))
                 };
 
                 // Timeout wraps the entire connect future
@@ -744,13 +794,16 @@ impl AsyncClientConnection {
                         // Success: start background task with the stream
                         match ws_result {
                             WsConnectResult::Direct(ws_stream) => {
-                                start_ws_task(ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                             WsConnectResult::Proxy(ws_stream) => {
-                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                             WsConnectResult::ProxyPlain(ws_stream) => {
-                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr).await;
+                                start_ws_task(*ws_stream, slf_ptr, future_ptr, event_loop_ptr)
+                                    .await;
                             }
                         }
                     }
@@ -760,7 +813,9 @@ impl AsyncClientConnection {
                             drop(slf_ptr);
                             let future = future_ptr.bind(py);
                             let event_loop = event_loop_ptr.bind(py);
-                            if let Err(e) = fail_future(py, event_loop, future, PyConnectionError::new_err(e)) {
+                            if let Err(e) =
+                                fail_future(py, event_loop, future, PyConnectionError::new_err(e))
+                            {
                                 eprintln!("Failed to set connection error on future: {:?}", e);
                             }
                         });
@@ -775,7 +830,10 @@ impl AsyncClientConnection {
                                 py,
                                 event_loop,
                                 future,
-                                PyTimeoutError::new_err(format!("Connection timed out ({:.1}s)", connect_timeout)),
+                                PyTimeoutError::new_err(format!(
+                                    "Connection timed out ({:.1}s)",
+                                    connect_timeout
+                                )),
                             ) {
                                 eprintln!("Failed to set timeout error on future: {:?}", e);
                             }
@@ -796,7 +854,8 @@ impl AsyncClientConnection {
         _exc_value: Option<&Bound<'py, PyAny>>,
         _traceback: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        *slf.bind(py).borrow().event_loop.write() = None;
+        // Note: event_loop cache is NOT cleared here — close() needs it.
+        // The cache will be dropped with the object when GC'd.
         AsyncClientConnection::close(slf, py)
     }
 
@@ -811,13 +870,13 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
         let receive_timeout = self.receive_timeout;
-        let close_code = self.close_code.clone();
-        let close_reason = self.close_reason.clone();
 
+        // Fast path: borrow from self, no Arc clone
         if let Ok(mut guard) = rx.try_lock() {
             match guard.try_recv() {
                 Ok(msg) => {
-                    let result = process_message(py, msg, &close_code, &close_reason, true);
+                    let result =
+                        process_message(py, msg, &self.close_code, &self.close_reason, true);
                     match result {
                         Ok(val) => return ready_fast(py, val),
                         Err(e) => return ready_fast_err(py, e),
@@ -830,6 +889,9 @@ impl AsyncClientConnection {
             }
         }
 
+        // Slow path: clone only when moving into spawned task
+        let close_code = self.close_code.clone();
+        let close_reason = self.close_reason.clone();
         let event_loop = get_cached_event_loop(py, &self.event_loop)?;
         let future = create_future(py, &event_loop)?;
         let future_ptr = future.clone().unbind();
@@ -888,7 +950,7 @@ pub fn connect<'py>(
     proxy: Option<String>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None)?;
+    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None, None)?;
     let ws_cell = Py::new(py, ws)?;
     AsyncClientConnection::__aenter__(ws_cell, py)
 }
