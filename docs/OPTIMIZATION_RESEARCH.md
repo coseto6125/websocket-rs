@@ -712,3 +712,170 @@ v0.4.0 完成後：
 - Sync client: 使用 `tungstenite` (non-async),直接 blocking I/O
 - Async client: 使用 `tokio-tungstenite`,支援併發與 pipelined 操作
 - 兩種場景各有專門實作
+
+## v0.5.0 優化研究（2026-03-25）
+
+### 測試環境
+
+- Python 3.13, websockets 15.0.1, rustc 1.94.0 (LLVM 20)
+- WSL2 Linux 5.15, localhost echo server
+- 測試方法: 500 次 send/recv roundtrip, 32 bytes payload, trimmed mean of 7 runs
+
+### 已實施的微觀優化
+
+1. **`pyo3::intern!` 快取 Python 字串查找**
+   - 適用: `complete_future`, `fail_future`, `create_future`, `get_asyncio`, `get_cached_event_loop`
+   - 原理: `intern!` 將字串比較從 hash lookup 降為 pointer equality
+   - 影響: 每次 slow-path recv/send 少數次 `getattr`/`call_method` 調用加速
+
+2. **Async `send` 改用 `cast` + `to_str`**
+   - 替換: `message.extract::<String>()` → `message.cast::<PyString>().to_str()?.to_owned()`
+   - 原理: 避免 `extract` 的額外 UTF-8 validation + copy
+   - 影響: 每次 send 省一次完整 string copy
+
+3. **Sync `recv` 零拷貝**
+   - 替換: `text.to_string()` → 直接 move（`RecvResult` enum）
+   - 原理: tungstenite 回傳的 `String`/`Vec<u8>` 直接 move,不做中間拷貝
+   - 影響: 大訊息時顯著（16KB 時 Sync 快 3.2x vs websockets）
+
+4. **Sync `send` 消除雙重分配**
+   - 替換: `to_string_lossy().to_string()` → `to_str()?.to_owned()`
+   - 原理: 避免 `Cow<str>` 中間分配
+
+5. **Sync `recv` timeout 偵測改用 `ErrorKind`**
+   - 替換: `e.to_string().contains("timed out")` → `matches!(io_err.kind(), TimedOut | WouldBlock)`
+   - 原理: 避免 error path 的 string 格式化 + 子字串搜尋
+
+6. **地址存儲改用 `(String, u16)` tuple**
+   - 替換: `String`（如 `"127.0.0.1:8765"`）→ `(String, u16)`
+   - 原理: getter 不再每次做 `rsplit_once` + `parse`
+
+7. **背景 task 過濾 Ping/Pong**
+   - 原理: Ping/Pong 不送進 channel,避免無意義的 channel 喚醒 + GIL 獲取
+
+8. **Defer Arc::clone 到 slow path**
+   - 原理: `recv`/`__anext__` 的 fast path 直接借用 `&self`,不 clone `close_code`/`close_reason` Arc
+
+9. **`ping`/`pong` 改用 `ready_fast`**
+   - 替換: `ready_ok`（3 次 Python 跨語言調用）→ `ready_fast`（純 Rust ReadyFuture）
+   - 原理: 省掉 `get_running_loop` + `create_future` + `set_result`
+
+10. **`WsConnectResult::Direct` 加 `Box`**
+    - 原理: 修 clippy `large_enum_variant`（320 bytes → 8 bytes）,減少棧使用
+
+### v0.5.0 效能測試結果
+
+基於 500 次 roundtrip, 32 bytes, trimmed mean of 7:
+
+| 實作               | 時間       | per-op    | vs websockets |
+|-------------------|-----------|-----------|---------------|
+| websocket-rs Sync | 50.9 ms   | 101.9 µs  | **1.81x 快**  |
+| websockets Sync   | 92.3 ms   | 184.5 µs  | 1.00x         |
+| websockets Async  | 91.0 ms   | 182.1 µs  | 1.00x         |
+| websocket-rs Async| 109.3 ms  | 218.6 µs  | 0.83x (慢 17%)|
+
+**大訊息 Sync 效能（16KB payload）:**
+- websocket-rs: **3.2x** 快於 websockets
+
+### 測試過的架構替代方案
+
+#### 13. `pyo3_async_runtimes::tokio::future_into_py` 直接橋接 ❌
+
+- **結果**: ❌ **慢 84%**（41.5ms vs 22.5ms / 100 roundtrips）
+- **架構**: 砍掉 mpsc channel + 背景 task,send/recv 直接用 `future_into_py` 操作 WebSocket stream
+- **失敗原因**:
+  1. `future_into_py` 每次調用建 3-4 個 Python 物件（`asyncio.Future`, `PyDoneCallback`, `Cancellable`）
+  2. 多層 `R::spawn()`（外層 + 內層 + `spawn_blocking`）
+  3. 無條件 `add_done_callback` 附加
+  4. 完全失去 ReadyFuture 快速路徑
+- **結論**: ❌ `future_into_py` 的固定開銷 > mpsc channel 的開銷
+
+#### 14. PyO3 Native `Coroutine` + `tokio::spawn` ❌
+
+- **結果**: ❌ **慢 43%**（32.3ms vs 22.5ms / 100 roundtrips）
+- **架構**: 使用 PyO3 0.27 的 `pyo3::impl_::coroutine::new_coroutine` + `experimental-async` feature
+- **優於方案 13 的原因**:
+  - Coroutine 是 lazy 的 — 如果 future 立即完成,不建 `asyncio.Future`
+  - 少了 `PyDoneCallback` 和多層 spawn 開銷
+- **仍然失敗的原因**:
+  - `Coroutine::poll` 跑在 Python event loop 執行緒上,無 tokio context
+  - 必須用 `handle.spawn(future)` 把 future 送回 tokio runtime
+  - 這個 `spawn` 本身有 ~10µs 跨執行緒 task queue 開銷
+  - 依然失去 ReadyFuture 快速路徑
+- **結論**: ❌ 比 `future_into_py` 好,但仍不如 channel + ReadyFuture
+
+#### 15. `std::sync::RwLock` 取代 `parking_lot::RwLock`（rustc 1.94）⚠️
+
+- **結果**: ⚠️ **差距在誤差範圍內**
+- **測試數據**（trimmed mean of 7, 500 roundtrips, rustc 1.94）:
+
+| 版本                    | Async    | Sync     |
+|------------------------|----------|----------|
+| parking_lot + #[inline]| 109.3 ms | 50.4 ms  |
+| std::sync - #[inline]  | 111.2 ms | 50.8 ms  |
+
+- **與 v0.3.1 結論的差異**: v0.3.1 時 parking_lot 慢 5.6%,但在 v0.5.0 + rustc 1.94 下差距消失
+- **可能原因**: rustc 1.92+ 改進了 `std::sync` 實作; v0.5.0 的其他優化改變了 hot path profile
+- **結論**: ⚠️ 差異不顯著,保持 parking_lot 不動（避免無謂改動風險）
+
+#### 16. rustc 1.90 → 1.94（LLVM 19 → 20）升級 ⚠️
+
+- **結果**: ⚠️ **差距在誤差範圍內**
+- **測試數據**（per-op, 同一 codebase）:
+
+| rustc 版本 | Sync per-op |
+|-----------|-------------|
+| 1.90      | ~98 µs      |
+| 1.94      | ~101 µs     |
+
+- **結論**: ⚠️ LLVM 20 的 codegen 改進未在此場景顯現,差異 < 3% 在 noise 範圍
+
+### 架構瓶頸最終分析
+
+#### 為什麼 Async 比 Python websockets 慢 17%?
+
+```
+websockets (Python):
+  Python event loop → 直接操作 socket → 回傳結果
+  全程同一執行緒,零跨執行緒開銷
+
+websocket-rs (Rust):
+  Python event loop → mpsc channel → tokio background task → socket I/O
+  socket I/O → tokio task → mpsc channel → call_soon_threadsafe → Python
+  每次 recv slow path 付出 ~36µs "過橋稅"
+```
+
+**recv slow path 開銷分解**:
+- mpsc channel recv: ~5 µs
+- `call_soon_threadsafe`: ~10 µs（event loop lock + 喚醒 selector）
+- `create_future` + `set_result`: ~10 µs（Python 物件建立）
+- GIL acquire: ~5 µs
+- 其他: ~6 µs
+
+**為什麼 fast path 不夠?**
+
+Request-Response 模式下,`recv()` 被呼叫時 server 回應尚未到達,`try_lock + try_recv` 幾乎 100% miss。
+Fast path 只在 Pipelined 模式（buffer 有數據）才能命中。
+
+#### 結論: 不走 tokio 的替代方案
+
+| 方案                        | 可行性 | 預估效果      | 開發成本 |
+|----------------------------|--------|--------------|---------|
+| 預取模式（send 後自動等 recv）  | 中     | 10-20% 改善   | 中      |
+| eventfd 取代 call_soon_threadsafe | 中   | 5-10% 改善   | 高      |
+| Rust 跑在 Python event loop 上    | 低   | 可能追平      | 巨大    |
+| Unix domain socket 支援           | 高   | 網路層 ~30µs  | 低      |
+
+**跨機器場景下 bridge 開銷可忽略**: 網路延遲（1-100ms）遠大於 bridge 開銷（~36µs）,
+在真實部署中 websocket-rs Async 與 Python websockets 體感相同。
+
+### v0.5.0 最終結論
+
+**Sync**: 已達到極致,穩定 **1.8x** 快於 websockets。大訊息時高達 **3.2x**。
+
+**Async**: 慢 17% 是 PyO3 + tokio 跨執行緒架構的固有限制。
+已測試 3 種替代架構（future_into_py / PyO3 Coroutine / std::sync）均無法改善。
+Actor Pattern + channel + ReadyFuture 是當前 PyO3 架構下的最優解。
+
+**推薦策略**: 接受 Async 的架構限制,發揮 Sync 的效能優勢。
+在跨機器場景下 Async 的 17% 差距被網路延遲掩蓋,實際體感無差異。
