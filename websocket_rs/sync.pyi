@@ -25,7 +25,7 @@ def connect(
     headers: dict[str, Any] | None = None
 ) -> Response:
     """
-    Establishes an asynchronous WebSocket connection.
+    Establishes an synchronous WebSocket connection.
 
     Args:
         url: server URL (e.g., `"ws://localhost:8765"`).
