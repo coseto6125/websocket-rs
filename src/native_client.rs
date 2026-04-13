@@ -20,7 +20,7 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
     PyTypeError, PyValueError,
@@ -393,7 +393,7 @@ impl WSMessage {
     unsendable
 )]
 pub struct NativeClient {
-    state: Arc<Mutex<State>>,
+    state: Arc<RefCell<State>>,
 }
 
 fn build_handshake(
@@ -559,7 +559,7 @@ impl NativeClient {
             None
         };
 
-        let mut s = self.state.lock();
+        let mut s = self.state.borrow_mut();
         s.transport = Some(transport);
         s.transport_write = Some(write);
         s.transport_get_buf_size = get_buf_size;
@@ -568,7 +568,7 @@ impl NativeClient {
     }
 
     fn data_received(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
 
         // Fast path: if our internal buf is empty and the handshake is already done,
         // parse frames straight out of `data` and only copy the tail (if any) back into
@@ -634,13 +634,13 @@ impl NativeClient {
     /// Called by asyncio transport when its send buffer crosses the high-water mark.
     /// We stop draining into the transport; subsequent send() calls buffer internally.
     fn pause_writing(&self) {
-        self.state.lock().paused = true;
+        self.state.borrow_mut().paused = true;
     }
 
     /// Called when the transport drains below the low-water mark. Flush whatever we
     /// queued while paused, then clear the flag.
     fn resume_writing(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.paused = false;
         // Drain queued frames. Each one is a fully-encoded PyBytes.
         let transport = match state.transport.as_ref() {
@@ -657,7 +657,7 @@ impl NativeClient {
     }
 
     fn connection_lost(&self, py: Python<'_>, _exc: Py<PyAny>) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.closed = true;
         Self::fail_all_pending(py, &mut state, "Connection lost");
         state.transport = None;
@@ -668,7 +668,7 @@ impl NativeClient {
     /// Encode a single binary frame and write it directly to the transport.
     /// Zero-copy: the encoded frame is materialised straight into Python memory.
     fn send(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -783,7 +783,7 @@ impl NativeClient {
         // If the transport has paused us, buffer the encoded frame until resume_writing.
         // Re-lock briefly to check the flag and push if needed.
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             if state.paused {
                 state.write_queue.push_back(out.unbind());
                 return Ok(());
@@ -830,7 +830,7 @@ impl NativeClient {
 
     /// Returns an asyncio.Future that completes with the next received frame payload.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         // Fast path: message already in backlog — bypass asyncio.Future entirely.
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
@@ -853,7 +853,7 @@ impl NativeClient {
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
-            .lock()
+            .borrow_mut()
             .pending_recv
             .push_back(fut.clone().unbind());
         if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
@@ -864,7 +864,7 @@ impl NativeClient {
 
     #[getter]
     fn is_open(&self) -> bool {
-        let s = self.state.lock();
+        let s = self.state.borrow_mut();
         s.handshake_done && !s.closed && s.transport.is_some()
     }
 
@@ -876,7 +876,7 @@ impl NativeClient {
     /// Async iterator step. Returns the next WSMessage; raises StopAsyncIteration
     /// when the connection is closed (vs recv() which raises ConnectionError).
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
             return ready_ok(py, payload.into_any());
@@ -895,7 +895,7 @@ impl NativeClient {
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
-            .lock()
+            .borrow_mut()
             .pending_recv
             .push_back(fut.clone().unbind());
         if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
@@ -923,17 +923,17 @@ impl NativeClient {
 
     #[getter]
     fn subprotocol(&self) -> Option<String> {
-        self.state.lock().subprotocol.clone()
+        self.state.borrow_mut().subprotocol.clone()
     }
 
     #[getter]
     fn close_code(&self) -> Option<u16> {
-        self.state.lock().close_code
+        self.state.borrow_mut().close_code
     }
 
     #[getter]
     fn close_reason(&self) -> Option<String> {
-        self.state.lock().close_reason.clone()
+        self.state.borrow_mut().close_reason.clone()
     }
 
     /// Send a ping frame. Payload must be ≤125 bytes (control-frame limit).
@@ -945,7 +945,7 @@ impl NativeClient {
                 "ping payload exceeds 125 bytes (WS control-frame limit)",
             ));
         }
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -963,7 +963,7 @@ impl NativeClient {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.closed {
             return Ok(());
         }
@@ -1001,7 +1001,7 @@ impl NativeClient {
     /// Parse and dispatch all complete frames currently sitting in state.buf.
     /// Also completes the HTTP/101 handshake on first invocation.
     fn process_buffered_frames(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
 
         if !state.handshake_done {
             let Some(end) = find_header_end(&state.buf) else {
@@ -1224,7 +1224,7 @@ fn connect<'py>(
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
     let client = NativeClient {
-        state: Arc::new(Mutex::new(State {
+        state: Arc::new(RefCell::new(State {
             transport: None,
             buf: BytesMut::with_capacity(16384),
             handshake_done: false,
@@ -1265,7 +1265,7 @@ fn connect<'py>(
         &subprotocols_vec,
         compression,
     );
-    state_arc.lock().expected_accept = expected;
+    state_arc.borrow_mut().expected_accept = expected;
 
     // Create the handshake future. Cache `loop.create_future` and
     // `asyncio.wait_for` bound methods so the recv/anext hot paths don't
@@ -1276,7 +1276,7 @@ fn connect<'py>(
     let wait_for = asyncio.getattr(pyo3::intern!(py, "wait_for"))?;
     let handshake_fut = create_future.call0()?;
     {
-        let mut st = state_arc.lock();
+        let mut st = state_arc.borrow_mut();
         st.handshake_fut = Some(handshake_fut.clone().unbind());
         st.loop_ref = Some(loop_.clone().unbind());
         st.create_future = Some(create_future.unbind());
