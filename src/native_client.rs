@@ -447,6 +447,10 @@ impl WSMessage {
     unsendable
 )]
 pub struct NativeClient {
+    // Arc + RefCell is intentional: pyclass(unsendable) ensures single-thread
+    // access, and we share ownership with PyCFunction closures that capture
+    // the state. Send/Sync isn't required since unsendable enforces it via PyO3.
+    #[allow(clippy::arc_with_non_send_sync)]
     state: Arc<RefCell<State>>,
 }
 
@@ -563,49 +567,6 @@ fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
 #[cfg(not(unix))]
 fn native_send(_fd: i32, _buf: &[u8]) -> isize {
     -1 // Windows: fall back to transport.write
-}
-
-/// Scatter-gather variant of `native_send`. Sends `header` followed by
-/// `payload` in one syscall via `sendmsg(2)`, avoiding the merge-into-one-buffer
-/// memcpy that the simple `send` path requires. Returns total bytes written
-/// across both iovecs, or -1 on error / EAGAIN.
-#[cfg(unix)]
-fn native_sendmsg(fd: std::os::unix::io::RawFd, header: &[u8], payload: &[u8]) -> isize {
-    let flags: libc::c_int = {
-        #[cfg(target_os = "linux")]
-        {
-            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            libc::MSG_DONTWAIT
-        }
-    };
-    let iov = [
-        libc::iovec {
-            iov_base: header.as_ptr() as *mut _,
-            iov_len: header.len(),
-        },
-        libc::iovec {
-            iov_base: payload.as_ptr() as *mut _,
-            iov_len: payload.len(),
-        },
-    ];
-    let msg = libc::msghdr {
-        msg_name: std::ptr::null_mut(),
-        msg_namelen: 0,
-        msg_iov: iov.as_ptr() as *mut _,
-        msg_iovlen: 2,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
-        msg_flags: 0,
-    };
-    unsafe { libc::sendmsg(fd, &msg, flags) }
-}
-
-#[cfg(not(unix))]
-fn native_sendmsg(_fd: i32, _header: &[u8], _payload: &[u8]) -> isize {
-    -1
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
@@ -1506,6 +1467,9 @@ fn connect<'py>(
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
     let client = NativeClient {
+        // Arc<RefCell> by design: pyclass(unsendable) ensures single-thread
+        // access; PyCFunction closures share state with the client.
+        #[allow(clippy::arc_with_non_send_sync)]
         state: Arc::new(RefCell::new(State {
             transport: None,
             buf: BytesMut::with_capacity(16384),
