@@ -36,28 +36,28 @@ framework limits, not real-world workloads.
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.3k** | 13.0k | 12.4k | 11.3k | 8.9k | 11.1k |
-| 8 KB  | **14.2k** | 12.1k | 12.3k | 11.0k | 9.2k | 9.7k |
-| 100 KB | **10.2k** | 9.7k | 9.2k | 9.0k | 7.4k | 4.3k |
-| 1 MB  | 3.9k | **4.3k** | **4.3k** | 3.5k | 3.0k | 543 |
+| 256 B | **14.0k** | 12.4k | 12.7k | 11.7k | 9.5k | 11.6k |
+| 8 KB  | **14.1k** | 13.2k | 12.3k | 10.2k | 8.8k | 9.5k |
+| 100 KB | **10.1k** | 9.5k | 9.7k | 9.1k | 7.7k | 4.3k |
+| 1 MB  | 3.9k | **4.2k** | **4.2k** | 3.5k | 3.2k | 547 |
 
 ### Against fastwebsockets server (plain TCP)
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.8k** | 12.7k | 12.8k | 11.3k | 9.5k | 11.5k |
-| 8 KB  | **14.6k** | 12.6k | 12.6k | 11.7k | 9.4k | 10.1k |
-| 100 KB | **10.5k** | **10.5k** | 10.0k | 9.7k | 8.1k | 4.3k |
-| 1 MB  | 3.9k | **4.4k** | 3.9k | 3.7k | 3.3k | 554 |
+| 256 B | **14.4k** | 12.8k | 13.0k | 11.7k | 9.5k | 11.4k |
+| 8 KB  | **14.6k** | 12.8k | 13.2k | 11.2k | 9.7k | 10.4k |
+| 100 KB | **11.1k** | 10.8k | 10.7k | 9.7k | 8.3k | 4.5k |
+| 1 MB  | 4.2k | **4.7k** | 4.0k | 3.5k | 3.0k | 502 |
 
 ### Against picows server (plain TCP)
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.1k** | 11.8k | 12.0k | 10.7k | 8.8k | 10.7k |
-| 8 KB  | **13.3k** | 12.3k | 11.3k | 9.9k | 8.4k | 9.2k |
-| 100 KB | **9.8k** | 9.4k | 8.9k | 8.1k | 7.4k | 4.2k |
-| 1 MB  | **3.3k** | **3.3k** | 3.1k | 3.0k | 2.5k | 512 |
+| 256 B | **13.7k** | 12.1k | 11.8k | 10.7k | 8.7k | 11.0k |
+| 8 KB  | **12.8k** | 11.5k | 11.3k | 10.9k | 8.7k | 9.3k |
+| 100 KB | **9.6k** | 9.0k | 8.9k | 8.5k | 7.1k | 4.1k |
+| 1 MB  | 3.3k | **3.5k** | 3.1k | 2.9k | 2.6k | 483 |
 
 ### TLS (wss://) — tokio-tungstenite server, rustls
 
@@ -65,14 +65,14 @@ Same RR methodology, but every client connects via `wss://` to a
 tokio-tungstenite TLS echo server using a self-signed cert from
 `tests/certs/`. TLS adds AES-GCM encrypt + decrypt on the data path
 (handled by Python's `_ssl` for all clients except the test server,
-which uses pure-Rust rustls).
+which uses pure-Rust rustls). 3-run averaged:
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **12.7k** | 9.1k | 9.3k | 8.5k | 7.8k | 9.3k |
-| 8 KB  | **10.4k** | 8.5k | 7.9k | 7.5k | 6.5k | 7.8k |
-| 100 KB | **5.2k** | 4.2k | 4.0k | 4.0k | 3.7k | 3.1k |
-| 1 MB  | 606 | 699 | **701** | 652 | 652 | 317 |
+| 256 B | **13.4k** | 9.3k | 9.4k | 8.9k | 7.9k | 9.6k |
+| 8 KB  | **11.6k** | 8.7k | 8.8k | 8.1k | 7.4k | 8.6k |
+| 100 KB | **7.2k** | 6.0k | 6.2k | 5.6k | 5.1k | 3.7k |
+| 1 MB  | 1.43k | 1.60k | **1.63k** | 1.50k | 1.47k | 470 |
 
 **TLS overhead**: the same payload runs 25–60% slower under TLS than
 plain TCP. TLS dominates the data path at large sizes; the WS framing
