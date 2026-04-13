@@ -20,7 +20,6 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
-use std::cell::RefCell;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
     PyTypeError, PyValueError,
@@ -29,6 +28,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use std::cell::RefCell;
 use std::io::Read as _;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
