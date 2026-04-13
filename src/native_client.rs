@@ -175,7 +175,7 @@ struct State {
     /// Raw socket fd for plain-TCP connections. `None` when the transport is
     /// TLS-wrapped (SSL state machine would be bypassed by raw send) or when
     /// the runtime refused to hand us the underlying socket.
-    raw_fd: Option<std::os::unix::io::RawFd>,
+    raw_fd: Option<i32>,
     create_future: Option<Py<PyAny>>,
     wait_for: Option<Py<PyAny>>,
     /// Negotiated subprotocol (Sec-WebSocket-Protocol response value), if any.
