@@ -115,6 +115,12 @@ struct State {
     /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
     /// lookups on every recv() slow-path.
     loop_ref: Option<Py<PyAny>>,
+    /// `transport.write`, `loop.create_future`, `asyncio.wait_for` cached once
+    /// at connect. Hot paths call through these instead of doing attribute
+    /// lookup / re-importing `asyncio` per call.
+    transport_write: Option<Py<PyAny>>,
+    create_future: Option<Py<PyAny>>,
+    wait_for: Option<Py<PyAny>>,
     /// Negotiated subprotocol (Sec-WebSocket-Protocol response value), if any.
     subprotocol: Option<String>,
     /// Close-frame fields (populated after receiving a CLOSE opcode).
@@ -443,8 +449,17 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 impl NativeClient {
     // ---- asyncio.Protocol interface ----
 
-    fn connection_made(&self, transport: Py<PyAny>) {
-        self.state.lock().transport = Some(transport);
+    fn connection_made(&self, py: Python<'_>, transport: Py<PyAny>) -> PyResult<()> {
+        // Cache transport.write as a bound method — every send() then calls
+        // through this directly instead of resolving the "write" attribute.
+        let write = transport
+            .bind(py)
+            .getattr(pyo3::intern!(py, "write"))?
+            .unbind();
+        let mut s = self.state.lock();
+        s.transport = Some(transport);
+        s.transport_write = Some(write);
+        Ok(())
     }
 
     fn data_received(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
@@ -655,8 +670,8 @@ impl NativeClient {
         if !state.handshake_done {
             return Err(PyRuntimeError::new_err("WebSocket handshake not complete"));
         }
-        let transport = state
-            .transport
+        let write = state
+            .transport_write
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
@@ -764,7 +779,7 @@ impl NativeClient {
                 return Ok(());
             }
         }
-        transport.bind(py).call_method1("write", (out,))?;
+        write.bind(py).call1((out,))?;
         Ok(())
     }
 
@@ -782,25 +797,22 @@ impl NativeClient {
             drop(state);
             return ready_err(py, PyConnectionError::new_err("Connection closed"));
         }
-        // Slow path: message not yet arrived. Use asyncio.Future so data_received
-        // can complete it across the callback boundary.
-        let loop_ref = state
-            .loop_ref
+        // Slow path: use cached loop.create_future + optional asyncio.wait_for.
+        let create_future = state
+            .create_future
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let wait_for_cached = state.wait_for.as_ref().map(|w| w.clone_ref(py));
         let timeout = state.receive_timeout;
         drop(state);
-        let fut = loop_ref.bind(py).call_method0("create_future")?;
+        let fut = create_future.bind(py).call0()?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
-        // If a per-recv timeout is set, wrap in asyncio.wait_for so recv() raises
-        // TimeoutError after `receive_timeout` seconds.
-        if let Some(t) = timeout {
-            let asyncio = py.import("asyncio")?;
-            return asyncio.call_method1("wait_for", (fut, t));
+        if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
+            return wait_for.bind(py).call1((fut, t));
         }
         Ok(fut)
     }
@@ -828,21 +840,21 @@ impl NativeClient {
             drop(state);
             return ready_err(py, PyStopAsyncIteration::new_err("Connection closed"));
         }
-        let loop_ref = state
-            .loop_ref
+        let create_future = state
+            .create_future
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let wait_for_cached = state.wait_for.as_ref().map(|w| w.clone_ref(py));
         let timeout = state.receive_timeout;
         drop(state);
-        let fut = loop_ref.bind(py).call_method0("create_future")?;
+        let fut = create_future.bind(py).call0()?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
-        if let Some(t) = timeout {
-            let asyncio = py.import("asyncio")?;
-            return asyncio.call_method1("wait_for", (fut, t));
+        if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
+            return wait_for.bind(py).call1((fut, t));
         }
         Ok(fut)
     }
@@ -1168,6 +1180,9 @@ fn connect<'py>(
             recv_ba: None,
             recv_ba_write_pos: 0,
             loop_ref: None,
+            transport_write: None,
+            create_future: None,
+            wait_for: None,
             subprotocol: None,
             close_code: None,
             close_reason: None,
@@ -1194,14 +1209,20 @@ fn connect<'py>(
     );
     state_arc.lock().expected_accept = expected;
 
-    // Create the handshake future and park it
+    // Create the handshake future. Cache `loop.create_future` and
+    // `asyncio.wait_for` bound methods so the recv/anext hot paths don't
+    // need to re-resolve them.
     let asyncio = py.import("asyncio")?;
     let loop_ = asyncio.call_method0("get_running_loop")?;
-    let handshake_fut = loop_.call_method0("create_future")?;
+    let create_future = loop_.getattr(pyo3::intern!(py, "create_future"))?;
+    let wait_for = asyncio.getattr(pyo3::intern!(py, "wait_for"))?;
+    let handshake_fut = create_future.call0()?;
     {
         let mut st = state_arc.lock();
         st.handshake_fut = Some(handshake_fut.clone().unbind());
         st.loop_ref = Some(loop_.clone().unbind());
+        st.create_future = Some(create_future.unbind());
+        st.wait_for = Some(wait_for.unbind());
     }
 
     // Launch the low-level create_connection + post-connection handshake send as a task

@@ -60,7 +60,10 @@ python-source = "."
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
+# Tests use asyncio.run() directly — pytest-asyncio is not a dependency.
+filterwarnings = [
+    "ignore::DeprecationWarning:uvloop",
+]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v"
