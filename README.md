@@ -283,7 +283,7 @@ MIT License - See [LICENSE](LICENSE)
 - [Tokio](https://tokio.rs/) - Async runtime
 - [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) - WebSocket implementation
 - [websockets](https://github.com/python-websockets/websockets) - Python WebSocket library
-- [picows](https://github.com/tarasko/picows) - High-performance Python WebSocket client
+- [picows](https://github.com/tarasko/picows) - High-performance Python WebSocket client. Special thanks to [@tarasko](https://github.com/tarasko) for [issue #11](https://github.com/coseto6125/websocket-rs/issues/11), which prompted the cross-validation benchmark methodology (multiple servers, controlled CPU pinning, statistically meaningful iteration counts) now used throughout `tests/benchmark_*.py`. The result table you see above wouldn't exist without that nudge.
 
 ## 📚 Further Reading
 
