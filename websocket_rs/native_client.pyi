@@ -6,8 +6,7 @@ or better than picows while remaining a pure Python-facing API.
 
 Still missing vs the legacy ``async_client``:
 - SOCKS5 proxy
-- Explicit ``receive_timeout`` (use ``asyncio.wait_for(ws.recv(), t)``)
-- Fragmented messages, permessage-deflate
+- permessage-deflate compression
 """
 
 from __future__ import annotations
@@ -90,6 +89,7 @@ async def connect(
     subprotocols: list[str] | None = None,
     ssl_context: _ssl.SSLContext | None = None,
     connect_timeout: float | None = None,
+    receive_timeout: float | None = None,
 ) -> NativeClient:
     """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
 
@@ -102,5 +102,8 @@ async def connect(
       decrypted bytes.
     - ``connect_timeout`` wraps the full TCP+TLS+handshake sequence in
       ``asyncio.wait_for``; raises ``TimeoutError`` on expiry.
+    - ``receive_timeout`` wraps every ``recv()`` / ``async for`` step in
+      ``asyncio.wait_for``; the backlog fast-path is not wrapped so
+      already-queued messages return immediately.
     """
     ...

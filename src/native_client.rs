@@ -57,13 +57,14 @@ fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
 const MIN_HDR: usize = 2;
 
 /// Parse a single server frame header (no mask — server->client frames are never masked).
-/// Returns (opcode, payload_len, header_size) or None if not enough data.
-fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
+/// Returns (fin, opcode, payload_len, header_size) or None if not enough data.
+fn parse_header(buf: &[u8]) -> Option<(bool, u8, usize, usize)> {
     if buf.len() < MIN_HDR {
         return None;
     }
     let b0 = buf[0];
     let b1 = buf[1];
+    let fin = (b0 & 0x80) != 0;
     let opcode = b0 & 0x0F;
     let plen_short = b1 & 0x7F;
     let (plen, hdr) = match plen_short {
@@ -85,7 +86,7 @@ fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
         _ => unreachable!(),
     };
     // Server must NOT mask; we don't enforce here (picows/tungstenite both accept).
-    Some((opcode, plen, hdr))
+    Some((fin, opcode, plen, hdr))
 }
 
 struct State {
@@ -115,6 +116,13 @@ struct State {
     /// Close-frame fields (populated after receiving a CLOSE opcode).
     close_code: Option<u16>,
     close_reason: Option<String>,
+    /// Optional per-recv timeout (seconds). Applied via asyncio.wait_for wrapper
+    /// only when the slow path would block — backlog fast-path skips it.
+    receive_timeout: Option<f64>,
+    /// Fragmented-message reassembly: accumulates continuation frame payloads
+    /// until FIN=1 arrives. First frame's opcode is stashed here.
+    fragment_buf: Option<BytesMut>,
+    fragment_opcode: u8,
 }
 
 /// Pre-completed awaitable. Yields the stored result via StopIteration on first
@@ -383,19 +391,24 @@ impl NativeClient {
         // parse frames straight out of `data` and only copy the tail (if any) back into
         // buf. Servers like picows that deliver one frame per write hit this path and
         // save a memcpy per callback.
-        if state.handshake_done && state.buf.is_empty() {
+        if state.handshake_done
+            && state.buf.is_empty()
+            && state.fragment_buf.is_none()
+        {
             let mut off = 0usize;
-            while let Some((opcode, plen, hdr)) = parse_header(&data[off..]) {
+            while let Some((fin, opcode, plen, hdr)) = parse_header(&data[off..]) {
                 if data.len() - off < hdr + plen {
+                    break;
+                }
+                // Fragmented frames (fin=false, or opcode=0x0 continuation) need
+                // accumulation — fall through to the slow path.
+                if !fin || opcode == 0x0 {
                     break;
                 }
                 let total = hdr + plen;
                 let slice = &data[off + hdr..off + total];
                 match opcode {
                     0x1 | 0x2 => {
-                        // One memcpy into a fresh Bytes (no shared-buffer split available
-                        // since we don't own `data`), zero-copy from there to the Python
-                        // layer via WSMessage's buffer protocol.
                         let payload = Bytes::copy_from_slice(slice);
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
@@ -415,6 +428,8 @@ impl NativeClient {
             }
             if off < data.len() {
                 state.buf.extend_from_slice(&data[off..]);
+                drop(state);
+                return self.process_buffered_frames(py);
             }
             return Ok(());
         }
@@ -663,12 +678,19 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let timeout = state.receive_timeout;
         drop(state);
         let fut = loop_ref.bind(py).call_method0("create_future")?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
+        // If a per-recv timeout is set, wrap in asyncio.wait_for so recv() raises
+        // TimeoutError after `receive_timeout` seconds.
+        if let Some(t) = timeout {
+            let asyncio = py.import("asyncio")?;
+            return asyncio.call_method1("wait_for", (fut, t));
+        }
         Ok(fut)
     }
 
@@ -700,12 +722,17 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let timeout = state.receive_timeout;
         drop(state);
         let fut = loop_ref.bind(py).call_method0("create_future")?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
+        if let Some(t) = timeout {
+            let asyncio = py.import("asyncio")?;
+            return asyncio.call_method1("wait_for", (fut, t));
+        }
         Ok(fut)
     }
 
@@ -839,7 +866,7 @@ impl NativeClient {
         }
 
         loop {
-            let Some((opcode, plen, hdr)) = parse_header(&state.buf) else {
+            let Some((fin, opcode, plen, hdr)) = parse_header(&state.buf) else {
                 break;
             };
             if state.buf.len() < hdr + plen {
@@ -848,13 +875,45 @@ impl NativeClient {
             let total = hdr + plen;
             match opcode {
                 0x1 | 0x2 => {
-                    // Zero-copy: advance past header, then split_to() hands us an
-                    // Arc-backed Bytes for the payload range. No memcpy at all —
-                    // the PyBytes alloc that used to cost one per frame is gone.
+                    // Data frame (text / binary). FIN=1 and no pending fragment =
+                    // complete message, zero-copy. Otherwise start accumulating.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen).freeze();
-                    let msg = Py::new(py, WSMessage { data: payload })?;
-                    Self::deliver_message(py, &mut state, msg)?;
+                    if fin && state.fragment_buf.is_none() {
+                        let msg = Py::new(py, WSMessage { data: payload })?;
+                        Self::deliver_message(py, &mut state, msg)?;
+                    } else {
+                        // Start (or replace, if a protocol error — lenient) a fragment
+                        // collector seeded with this first frame's payload.
+                        let mut acc = BytesMut::with_capacity(plen);
+                        acc.extend_from_slice(&payload);
+                        state.fragment_buf = Some(acc);
+                        state.fragment_opcode = opcode;
+                        if fin {
+                            // Degenerate FIN=1 on first data frame with an existing
+                            // fragment_buf — deliver what we have.
+                            let done = state.fragment_buf.take().unwrap().freeze();
+                            state.fragment_opcode = 0;
+                            let msg = Py::new(py, WSMessage { data: done })?;
+                            Self::deliver_message(py, &mut state, msg)?;
+                        }
+                    }
+                }
+                0x0 => {
+                    // Continuation frame — append to fragment_buf; deliver on FIN.
+                    state.buf.advance(hdr);
+                    let payload = state.buf.split_to(plen);
+                    if let Some(acc) = state.fragment_buf.as_mut() {
+                        acc.extend_from_slice(&payload);
+                    }
+                    if fin {
+                        if let Some(acc) = state.fragment_buf.take() {
+                            let done = acc.freeze();
+                            state.fragment_opcode = 0;
+                            let msg = Py::new(py, WSMessage { data: done })?;
+                            Self::deliver_message(py, &mut state, msg)?;
+                        }
+                    }
                 }
                 0x8 => {
                     // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
@@ -934,7 +993,7 @@ impl NativeClient {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None))]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
@@ -942,6 +1001,7 @@ fn connect<'py>(
     subprotocols: Option<Vec<String>>,
     ssl_context: Option<Py<PyAny>>,
     connect_timeout: Option<f64>,
+    receive_timeout: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
@@ -963,6 +1023,9 @@ fn connect<'py>(
             subprotocol: None,
             close_code: None,
             close_reason: None,
+            receive_timeout,
+            fragment_buf: None,
+            fragment_opcode: 0,
         })),
     };
     let state_arc = client.state.clone();

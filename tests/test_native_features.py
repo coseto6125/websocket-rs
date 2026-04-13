@@ -154,6 +154,86 @@ def test_async_context_manager(server):
     asyncio.run(run())
 
 
+def test_receive_timeout_raises(server):
+    """receive_timeout should trigger TimeoutError when no message arrives."""
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{PORT}", receive_timeout=0.3)
+        # Don't send — server has nothing to echo, so recv should time out.
+        t0 = time.perf_counter()
+        try:
+            await ws.recv()
+            raise AssertionError("expected TimeoutError")
+        except (asyncio.TimeoutError, TimeoutError):
+            elapsed = time.perf_counter() - t0
+            assert 0.25 < elapsed < 1.0, f"timeout off: {elapsed}s"
+        ws.close()
+
+    asyncio.run(run())
+
+
+def test_fragmented_message_assembled():
+    """Hand-craft a fragmented binary message and ensure client reassembles it."""
+    import multiprocessing as mp
+    import os
+    import socket as _s
+    import struct as _st
+    import threading
+
+    # Tiny ad-hoc WS server that accepts one connection and sends a fragmented
+    # binary message (two frames: FIN=0 opcode=2, then FIN=1 opcode=0).
+    # Avoids launching websockets (which always emits single-frame messages).
+
+    evt = threading.Event()
+
+    def tiny_server():
+        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 8888))
+        srv.listen(1)
+        evt.set()
+        conn, _ = srv.accept()
+        # Read handshake
+        data = b""
+        while b"\r\n\r\n" not in data:
+            data += conn.recv(4096)
+        # Parse Sec-WebSocket-Key
+        import base64
+        from hashlib import sha1
+
+        key_line = [ln for ln in data.decode("latin-1").split("\r\n") if ln.lower().startswith("sec-websocket-key:")][0]
+        key = key_line.split(":", 1)[1].strip()
+        accept = base64.b64encode(sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        conn.sendall(
+            f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode()
+        )
+        # Wait for any incoming (client sends something) — then reply with fragments
+        conn.recv(4096)
+        # Frame 1: FIN=0, opcode=2 (binary), 5 bytes payload
+        conn.sendall(bytes([0x02, 5]) + b"hello")
+        time.sleep(0.01)
+        # Frame 2: FIN=1, opcode=0 (continuation), 5 bytes payload
+        conn.sendall(bytes([0x80, 5]) + b"world")
+        time.sleep(0.5)
+        conn.close()
+        srv.close()
+
+    t = threading.Thread(target=tiny_server, daemon=True)
+    t.start()
+    evt.wait(timeout=2)
+
+    async def run():
+        ws = await connect("ws://127.0.0.1:8888")
+        ws.send(b"go")
+        msg = await asyncio.wait_for(ws.recv(), timeout=2)
+        assert bytes(msg) == b"helloworld", f"got {bytes(msg)!r}"
+        ws.close()
+
+    asyncio.run(run())
+    t.join(timeout=2)
+
+
 def test_connect_timeout_on_unreachable():
     # TEST-NET-1: 192.0.2.x guaranteed unroutable per RFC 5737.
     async def run():
