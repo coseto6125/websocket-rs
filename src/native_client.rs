@@ -1101,6 +1101,7 @@ async def _connect_helper(create_conn_coro, req_bytes, handshake_fut, client, co
 pub fn register_native_client(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "native_client")?;
     m.add_class::<NativeClient>()?;
+    m.add_class::<WSMessage>()?;
     m.add_function(wrap_pyfunction!(connect, &m)?)?;
     parent.add_submodule(&m)?;
     // Also register in sys.modules so `from websocket_rs.native_client import ...` works.
