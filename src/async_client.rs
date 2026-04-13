@@ -2,7 +2,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use pyo3::exceptions::{
-    PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError, PyValueError,
+    PyBlockingIOError, PyConnectionError, PyRuntimeError, PyStopAsyncIteration, PyTimeoutError,
+    PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -361,6 +362,36 @@ impl AsyncClientConnection {
             close_code: Arc::new(RwLock::new(None)),
             close_reason: Arc::new(RwLock::new(None)),
         })
+    }
+
+    /// Fire-and-forget synchronous send. Returns None on success without producing
+    /// an awaitable — skips Future/await machinery for tight pipelined loops.
+    /// Raises BlockingIOError if the send queue is full (caller should fall back to `await send`).
+    fn send_nowait(&self, message: Bound<'_, PyAny>) -> PyResult<()> {
+        let tx = self
+            .tx_cmd
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
+
+        let command = if let Ok(pb) = message.cast::<PyBytes>() {
+            Command::Binary(Bytes::copy_from_slice(pb.as_bytes()))
+        } else if let Ok(s) = message.cast::<pyo3::types::PyString>() {
+            Command::Text(Utf8Bytes::from(s.to_str()?))
+        } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
+            Command::Binary(Bytes::from(bytes))
+        } else {
+            return Err(PyRuntimeError::new_err("Message must be str or bytes"));
+        };
+
+        match tx.try_send(command) {
+            Ok(_) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(PyBlockingIOError::new_err(
+                "Send queue full; use `await send()` to apply backpressure",
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(PyRuntimeError::new_err("WebSocket is not connected"))
+            }
+        }
     }
 
     fn send<'py>(

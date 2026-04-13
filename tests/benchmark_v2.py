@@ -127,6 +127,36 @@ async def bench_websockets_pipelined(uri: str, size: int, n: int) -> dict:
     return stats(rtt_lats, send_lats, recv_lats, "websockets")
 
 
+async def bench_websocket_rs_pipelined_nowait(uri: str, size: int, n: int) -> dict:
+    """Pipelined using send_nowait — zero-Future send path, mirrors picows transport.send()."""
+    base = b"a" * size
+    send_lats, recv_lats, rtt_lats = {}, {}, {}
+    client_send_times = {}
+
+    ws = await websocket_rs.async_client.connect(uri)
+    try:
+        for i in range(WARMUP):
+            await ws.send(struct.pack("=I", 9999) + b"w")
+            await ws.recv()
+
+        sent = recv = 0
+        while recv < n:
+            while sent < n and (sent - recv) < WINDOW:
+                client_send_times[sent] = time.perf_counter()
+                ws.send_nowait(struct.pack("=I", sent) + base)
+                sent += 1
+            response = await ws.recv()
+            t_recv = time.perf_counter()
+            recv += 1
+            mid, t_srv_recv, t_srv_send = parse_response(response, size)
+            send_lats[mid] = (t_srv_recv - client_send_times[mid]) * 1000
+            recv_lats[mid] = (t_recv - t_srv_send) * 1000
+            rtt_lats[mid] = (t_recv - client_send_times[mid]) * 1000
+    finally:
+        await ws.close()
+    return stats(rtt_lats, send_lats, recv_lats, "ws-rs nowait")
+
+
 async def bench_websocket_rs_pipelined(uri: str, size: int, n: int) -> dict:
     base = b"a" * size
     send_lats, recv_lats, rtt_lats = {}, {}, {}
@@ -400,6 +430,7 @@ async def main():
             if PICOWS_AVAILABLE:
                 _print(await asyncio.to_thread(lambda s=size: asyncio.run(bench_picows_pipelined(URI, s, NUM_MESSAGES))))
             _print(await bench_websocket_rs_pipelined(URI, size, NUM_MESSAGES))
+            _print(await bench_websocket_rs_pipelined_nowait(URI, size, NUM_MESSAGES))
             print()
     finally:
         proc.terminate()
