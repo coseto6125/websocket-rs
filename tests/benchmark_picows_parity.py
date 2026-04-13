@@ -337,7 +337,7 @@ async def run_matrix(label: str):
                 if asyncio.iscoroutinefunction(fn):
                     n = await run_one_async(fn, size, DURATION)
                 else:
-                    n = run_one_sync(fn, size, DURATION)
+                    n = await asyncio.to_thread(run_one_sync, fn, size, DURATION)
                 cells.append(fmt_rps(n / DURATION))
             except Exception as e:
                 cells.append(f"FAIL:{type(e).__name__}")

@@ -137,34 +137,38 @@ async def native_cb_pipelined(uri, size, n):
     done = loop.create_future()
     send_times = {}
     rtts = []
-    st = {"ws": None, "sent": 0, "received": 0, "in_warmup": True, "w_done": 0}
+    ws_holder = [None]
+    sent = received = w_done = 0
+    in_warmup = True
 
     def on_msg(msg):
-        if st["in_warmup"]:
-            st["w_done"] += 1
-            if st["w_done"] >= WARMUP:
-                st["in_warmup"] = False
+        nonlocal sent, received, w_done, in_warmup
+        if in_warmup:
+            w_done += 1
+            if w_done >= WARMUP:
+                in_warmup = False
                 _fill()
             return
         t_recv = time.perf_counter()
         mid = struct.unpack_from("=I", memoryview(msg))[0]
-        rtts.append((t_recv - send_times[mid]) * 1000)
-        st["received"] += 1
-        if st["received"] >= n:
+        rtts.append((t_recv - send_times.pop(mid)) * 1000)
+        received += 1
+        if received >= n:
             if not done.done():
                 done.set_result(None)
             return
         _fill()
 
     def _fill():
-        ws = st["ws"]
-        while st["sent"] < n and (st["sent"] - st["received"]) < WINDOW:
-            send_times[st["sent"]] = time.perf_counter()
-            ws.send(struct.pack("=I", st["sent"]) + base)
-            st["sent"] += 1
+        nonlocal sent
+        ws = ws_holder[0]
+        while sent < n and (sent - received) < WINDOW:
+            send_times[sent] = time.perf_counter()
+            ws.send(struct.pack("=I", sent) + base)
+            sent += 1
 
     ws = await native_connect(uri, on_message=on_msg)
-    st["ws"] = ws
+    ws_holder[0] = ws
     for _ in range(WARMUP):
         ws.send(struct.pack("=I", 9999) + b"w")
     await done
