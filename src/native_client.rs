@@ -174,6 +174,10 @@ struct State {
     /// Pool of pre-generated mask keys (each entry packs 4 mask bytes as u32).
     /// Refilled in batches of 256 to amortise the rand call. Pop from the back.
     mask_pool: Vec<u32>,
+    /// Reusable scratch buffer for send-side frame assembly. Avoids a per-send
+    /// `Vec::with_capacity()` allocation in the hot pipelined loop. Mirrors
+    /// picows' `_write_buffer` MemoryBuffer.
+    send_buf: Vec<u8>,
     /// Frames buffered while paused; drained on resume_writing.
     write_queue: VecDeque<Py<PyBytes>>,
     /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
@@ -1044,29 +1048,27 @@ impl NativeClient {
                 truth
             };
             if drained {
-                // Mask payload into a fresh Vec (source PyBytes/PyString is read-only).
-                let mut masked: Vec<u8> = Vec::with_capacity(plen);
-                masked.extend_from_slice(payload);
-                apply_mask(&mut masked, mask_key);
+                // Reuse the per-connection send_buf instead of fresh allocating
+                // each call — picows uses this pattern via _write_buffer. The
+                // scratch buffer holds header + masked payload contiguously so
+                // a single send(2) covers everything.
                 let total = header.len() + plen;
-                let written = native_sendmsg(fd, header, &masked);
+                let written = {
+                    let mut st = self.state.borrow_mut();
+                    st.send_buf.clear();
+                    st.send_buf.extend_from_slice(header);
+                    st.send_buf.extend_from_slice(payload);
+                    apply_mask(&mut st.send_buf[header.len()..], mask_key);
+                    native_send(fd, &st.send_buf)
+                };
                 if written == total as isize {
                     return Ok(());
                 }
                 if written > 0 {
-                    // Partial: hand remainder to asyncio so ordering is preserved.
                     let n = written as usize;
-                    let remaining = total - n;
-                    let tail = PyBytes::new_with(py, remaining, |buf| {
-                        if n < header.len() {
-                            let h_left = header.len() - n;
-                            buf[..h_left].copy_from_slice(&header[n..]);
-                            buf[h_left..].copy_from_slice(&masked);
-                        } else {
-                            buf.copy_from_slice(&masked[n - header.len()..]);
-                        }
-                        Ok(())
-                    })?;
+                    let st = self.state.borrow();
+                    let tail = PyBytes::new(py, &st.send_buf[n..]);
+                    drop(st);
                     self.state.borrow_mut().buf_known_empty = false;
                     write.bind(py).call1((tail,))?;
                     return Ok(());
@@ -1518,6 +1520,7 @@ fn connect<'py>(
             paused: false,
             buf_known_empty: false,
             mask_pool: Vec::with_capacity(256),
+            send_buf: Vec::with_capacity(65536 + 14),
             write_queue: VecDeque::new(),
             loop_ref: None,
             transport_write: None,
