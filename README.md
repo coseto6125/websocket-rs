@@ -10,18 +10,31 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 
 ## 🎯 Performance
 
-### Request-Response Throughput (picows-parity benchmark, 10s, RPS)
+### Request-Response Throughput — plain TCP (picows-parity, 10s, RPS)
 
-Matching picows's official benchmark methodology — RR mode (send → wait → recv → repeat), neutral Rust echo server (tokio-tungstenite), pinned cores, uvloop, N≈267–15.1k per cell over 10s:
+Matching picows's official benchmark methodology — RR mode (send → wait → recv → repeat), neutral Rust echo server (tokio-tungstenite), pinned cores, uvloop, 1-second discarded pre-pass per cell:
 
 | Payload | **ws-rs sync** | **ws-rs async** | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **15.1k** | 12.9k | 12.8k | 11.0k | 9.2k | 10.9k |
-| 8 KB  | **13.9k** | 12.5k | 12.2k | 10.8k | 9.0k | 10.7k |
-| 100 KB | **10.0k** | 9.7k | 9.6k | 8.8k | 7.4k | 4.6k |
-| 2 MB  | 2.5k | **2.8k** | 2.7k | 2.3k | 2.1k | 267 |
+| 256 B | **14.3k** | 13.0k | 12.4k | 11.3k | 8.9k | 11.1k |
+| 8 KB  | **14.2k** | 12.1k | 12.3k | 11.0k | 9.2k | 9.7k |
+| 100 KB | **10.2k** | 9.7k | 9.2k | 9.0k | 7.4k | 4.3k |
+| 1 MB  | 3.9k | **4.3k** | **4.3k** | 3.5k | 3.0k | 543 |
 
-> websocket-rs leads in **24/24 cells** across three server architectures (tokio-tungstenite, fastwebsockets, picows-server). Sync API wins 256 B–100 KB (no asyncio overhead); async wins at 2 MB. Margin over picows is 2–18%; over websockets/aiohttp is 15–65%; over websocket-client is 2–10× at ≥100 KB.
+> ws-rs wins or ties **12/12** plain-TCP cells across three server architectures (tokio-tungstenite, fastwebsockets, picows-server). Sync wins 256 B–100 KB (no asyncio overhead); async ties picows at 1 MB. Lead over picows is 2–18%; over websockets/aiohttp is 15–65%; over websocket-client is 2–10× at ≥100 KB.
+
+### Request-Response Throughput — TLS / wss:// (rustls)
+
+Same RR methodology, every client connects via `wss://` to a tokio-tungstenite TLS echo server (pure-Rust rustls path):
+
+| Payload | **ws-rs sync** | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **12.7k** | 9.1k | 9.3k | 8.5k | 7.8k | 9.3k |
+| 8 KB  | **10.4k** | 8.5k | 7.9k | 7.5k | 6.5k | 7.8k |
+| 100 KB | **5.2k** | 4.2k | 4.0k | 4.0k | 3.7k | 3.1k |
+| 1 MB  | 606 | 699 | **701** | 652 | 652 | 317 |
+
+> Sync wins TLS 256 B–100 KB by 30–60% over every competitor. At 1 MB, async ties picows (within 0.3%) and beats websockets/aiohttp by 7%. 1 MB is the realistic upper bound for production WS — Cloudflare's per-frame hard cap, Azure SignalR's default, well above AWS API Gateway WS (32 KB).
 
 ### vs websockets 15.0 — Sync vs Async API (localhost, 200 roundtrips)
 
@@ -34,9 +47,9 @@ Matching picows's official benchmark methodology — RR mode (send → wait → 
 | 256 KB  | **7.7x** faster | **7.7x** faster |
 | 1 MB    | **13.3x** faster | **18.1x** faster |
 
-> Larger payloads amplify Rust's zero-copy parsing advantage. Async overtakes Python websockets starting at 8KB+.
+> Larger payloads amplify Rust's zero-copy parsing advantage.
 
-📊 **[Full benchmarks — all sizes, all servers, pipelined mode, cases where we lose](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
+📊 **[Full benchmarks — all 3 servers, both TCP & TLS, latency distributions](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
 ## ✨ What's New in v0.6.0
 
