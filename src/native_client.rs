@@ -681,7 +681,10 @@ impl NativeClient {
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
         let raw_fd = state.raw_fd;
-        let get_buf_size = state.transport_get_buf_size.as_ref().map(|m| m.clone_ref(py));
+        let get_buf_size = state
+            .transport_get_buf_size
+            .as_ref()
+            .map(|m| m.clone_ref(py));
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
         let (raw_payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
