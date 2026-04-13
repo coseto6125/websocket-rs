@@ -17,7 +17,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use base64::Engine;
-use bytes::Bytes;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -92,7 +91,7 @@ struct State {
     handshake_fut: Option<Py<PyAny>>,
     expected_accept: String,
     pending_recv: VecDeque<Py<PyAny>>,
-    backlog: VecDeque<Bytes>,
+    backlog: VecDeque<Py<PyBytes>>,
     closed: bool,
     /// asyncio transport has passed its high-water mark — hold off on writes.
     paused: bool,
@@ -191,10 +190,11 @@ impl NativeClient {
             let total = hdr + plen;
             match opcode {
                 0x1 | 0x2 => {
-                    // Take payload as Bytes (cheap Arc) to avoid copying again later.
-                    let payload: Bytes = Bytes::copy_from_slice(&state.buf[hdr..total]);
+                    // Single memcpy: straight from buf slice into a PyBytes.
+                    // Previous path did buf -> Bytes -> PyBytes (two memcpys).
+                    let result = PyBytes::new(py, &state.buf[hdr..total]).unbind();
                     state.buf.drain(..total);
-                    Self::deliver_payload(py, &mut state, payload)?;
+                    Self::deliver_pybytes(py, &mut state, result)?;
                 }
                 0x8 => {
                     state.buf.drain(..total);
@@ -330,7 +330,7 @@ impl NativeClient {
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
             let fut = create_loop_future(py)?;
-            fut.call_method1("set_result", (PyBytes::new(py, &payload),))?;
+            fut.call_method1("set_result", (payload,))?;
             return Ok(fut);
         }
         if state.closed {
@@ -376,11 +376,11 @@ impl NativeClient {
 
 // Helpers (non-pymethod)
 impl NativeClient {
-    fn deliver_payload(py: Python<'_>, state: &mut State, payload: Bytes) -> PyResult<()> {
+    fn deliver_pybytes(py: Python<'_>, state: &mut State, payload: Py<PyBytes>) -> PyResult<()> {
         if let Some(fut) = state.pending_recv.pop_front() {
             let fb = fut.bind(py);
             if !fb.call_method0("done")?.extract::<bool>().unwrap_or(false) {
-                fb.call_method1("set_result", (PyBytes::new(py, &payload),))?;
+                fb.call_method1("set_result", (payload,))?;
             }
         } else {
             state.backlog.push_back(payload);
