@@ -872,7 +872,6 @@ impl NativeClient {
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
         let raw_fd = st.raw_fd;
-        let get_buf_size = st.transport_get_buf_size.as_ref().map(|m| m.clone_ref(py));
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
         let (raw_payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
@@ -981,8 +980,9 @@ impl NativeClient {
             let drained = if st.buf_known_empty {
                 true
             } else {
-                let truth = match get_buf_size {
-                    Some(ref m) => m
+                // Lazy: clone the get_buf_size method only on cache miss.
+                let truth = match st.transport_get_buf_size.as_ref() {
+                    Some(m) => m
                         .bind(py)
                         .call0()
                         .and_then(|v| v.extract::<isize>())
