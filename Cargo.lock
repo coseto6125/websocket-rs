@@ -1395,6 +1395,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "native-tls",
  "parking_lot",
  "pyo3",
