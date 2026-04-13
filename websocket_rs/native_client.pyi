@@ -116,9 +116,7 @@ async def connect(
     - ``on_message`` switches delivery to a synchronous callback invoked
       from the asyncio Protocol ``data_received`` path. When set, messages
       are NOT queued for :meth:`NativeClient.recv` — the callback receives
-      each :class:`WSMessage` directly and must be fast (no awaits). This
-      bypasses the future/task machinery and cuts p99 tail latency for
-      high-throughput pipelined workloads at the cost of a less idiomatic
-      API. For typical async/await usage, leave this as ``None``.
+      each :class:`WSMessage` directly and must not ``await``. Leave as
+      ``None`` for typical async/await usage.
     """
     ...
