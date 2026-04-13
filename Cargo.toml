@@ -16,6 +16,14 @@ categories = ["network-programming", "asynchronous"]
 name = "websocket_rs"
 crate-type = ["cdylib"]
 
+[[bin]]
+name = "ws_echo_server"
+path = "benches/ws_echo_server.rs"
+required-features = ["echo-server-bin"]
+
+[features]
+echo-server-bin = []
+
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py312"] }
 tokio-tungstenite = { version = "0.28", features = ["native-tls"] }

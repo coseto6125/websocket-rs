@@ -94,6 +94,10 @@ struct State {
     pending_recv: VecDeque<Py<PyAny>>,
     backlog: VecDeque<Bytes>,
     closed: bool,
+    /// asyncio transport has passed its high-water mark — hold off on writes.
+    paused: bool,
+    /// Frames buffered while paused; drained on resume_writing.
+    write_queue: VecDeque<Py<PyBytes>>,
 }
 
 /// WebSocket client running as an asyncio.Protocol implementation in Rust.
@@ -214,6 +218,31 @@ impl NativeClient {
         Ok(())
     }
 
+    /// Called by asyncio transport when its send buffer crosses the high-water mark.
+    /// We stop draining into the transport; subsequent send() calls buffer internally.
+    fn pause_writing(&self) {
+        self.state.lock().paused = true;
+    }
+
+    /// Called when the transport drains below the low-water mark. Flush whatever we
+    /// queued while paused, then clear the flag.
+    fn resume_writing(&self, py: Python<'_>) -> PyResult<()> {
+        let mut state = self.state.lock();
+        state.paused = false;
+        // Drain queued frames. Each one is a fully-encoded PyBytes.
+        let transport = match state.transport.as_ref() {
+            Some(t) => t.clone_ref(py),
+            None => return Ok(()),
+        };
+        let mut queue = std::mem::take(&mut state.write_queue);
+        drop(state);
+        let tb = transport.bind(py);
+        while let Some(pb) = queue.pop_front() {
+            tb.call_method1("write", (pb,))?;
+        }
+        Ok(())
+    }
+
     fn connection_lost(&self, py: Python<'_>, _exc: Py<PyAny>) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -282,6 +311,15 @@ impl NativeClient {
             Ok(())
         })?;
 
+        // If the transport has paused us, buffer the encoded frame until resume_writing.
+        // Re-lock briefly to check the flag and push if needed.
+        {
+            let mut state = self.state.lock();
+            if state.paused {
+                state.write_queue.push_back(out.unbind());
+                return Ok(());
+            }
+        }
         transport.bind(py).call_method1("write", (out,))?;
         Ok(())
     }
@@ -397,6 +435,8 @@ fn connect<'py>(
             pending_recv: VecDeque::new(),
             backlog: VecDeque::new(),
             closed: false,
+            paused: false,
+            write_queue: VecDeque::new(),
         })),
     };
     let state_arc = client.state.clone();
