@@ -740,29 +740,36 @@ impl NativeClient {
     /// slow path (handshake-in-progress / fragmented / compressed) routes
     /// through `data_received_inner` which uses `state.buf` as its working
     /// area — in that case we report the full window as consumed.
-    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+    /// Returns `(consumed, next_frame_needed)`. `next_frame_needed` is
+    /// `Some(N)` when parse stopped on a partial frame: `recv_pos` (after
+    /// caller's compaction) must reach `N` before the next parse pass can
+    /// complete that frame. Caller writes it onto State once, outside any
+    /// per-frame borrow churn.
+    fn parse_recv_data(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+    ) -> PyResult<(usize, Option<usize>)> {
         let can_fast_path = {
             let st = self.state.borrow();
             st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()
         };
         if !can_fast_path {
             self.data_received_inner(py, data)?;
-            return Ok(data.len());
+            return Ok((data.len(), None));
         }
         let mut off = 0usize;
+        let mut needed: Option<usize> = None;
         while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
             if data.len() - off < hdr + plen {
-                // Frame header parsed but payload incomplete. Record how
-                // many total bytes recv_pos must reach before parsing
-                // could yield this frame, so subsequent buffer_updated
-                // calls can short-circuit until then.
-                self.state.borrow_mut().next_frame_needed = Some(off + hdr + plen);
+                // Threshold is the post-compaction size — caller drops the
+                // already-consumed `[..off]` region before the next pass.
+                needed = Some(hdr + plen);
                 break;
             }
             if !fin || opcode == OP_CONTINUATION || rsv1 {
-                // Fragment / compressed — bail to slow path with what's left.
                 self.data_received_inner(py, &data[off..])?;
-                return Ok(data.len());
+                return Ok((data.len(), None));
             }
             let total = hdr + plen;
             let payload_slice = &data[off + hdr..off + total];
@@ -781,13 +788,13 @@ impl NativeClient {
                         let tb = t.bind(py);
                         let _ = tb.call_method0("close");
                     }
-                    return Ok(off + total);
+                    return Ok((off + total, None));
                 }
                 _ => {}
             }
             off += total;
         }
-        Ok(off)
+        Ok((off, needed))
     }
 
     fn data_received<'py>(&self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<()> {
@@ -1400,7 +1407,7 @@ impl NativeClient {
         // `state.buf` / `state.backlog` / `state.pending_callback_msgs` get
         // mutated. Pointer stays valid for the slice's lifetime.
         let data = unsafe { std::slice::from_raw_parts(ptr, total) };
-        let consumed = self.parse_recv_data(py, data)?;
+        let (consumed, needed) = self.parse_recv_data(py, data)?;
         {
             let mut st = self.state.borrow_mut();
             let recv_pos = st.recv_pos;
@@ -1408,6 +1415,7 @@ impl NativeClient {
                 st.recv_buf.copy_within(consumed..recv_pos, 0);
             }
             st.recv_pos = recv_pos.saturating_sub(consumed);
+            st.next_frame_needed = needed;
         }
         self.flush_pending_callbacks(py)
     }
@@ -1683,11 +1691,6 @@ fn connect<'py>(
         })),
     };
     let state_arc = client.state.clone();
-    // For ws:// (plain TCP) instantiate the BufferedProtocol-enabled
-    // subclass — asyncio detects `get_buffer` / `buffer_updated` and uses
-    // the zero-alloc kernel write path. For wss:// (TLS) instantiate the
-    // bare base class — the SSLProtocol's small-record callbacks make
-    // BufferedProtocol net-negative (see NativeClientBuffered docs).
     let client_obj: Py<PyAny> = if is_tls {
         Py::new(py, client)?.into_any()
     } else {
