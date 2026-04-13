@@ -855,24 +855,24 @@ impl NativeClient {
 
     /// Encode a single binary frame and write it directly to the transport.
     /// Zero-copy: the encoded frame is materialised straight into Python memory.
-    fn send(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
-        let state = self.state.borrow_mut();
-        if state.closed {
+    fn send(&self, py: Python<'_>, message: &Bound<'_, PyAny>) -> PyResult<()> {
+        // Hold a single borrow_mut throughout. asyncio's transport.write /
+        // get_write_buffer_size are internal Python calls that don't re-enter
+        // our methods, so it's safe. Saves ~5 separate borrow ops per send.
+        let mut st = self.state.borrow_mut();
+        if st.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
-        if !state.handshake_done {
+        if !st.handshake_done {
             return Err(PyRuntimeError::new_err("WebSocket handshake not complete"));
         }
-        let write = state
+        let write = st
             .transport_write
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
-        let raw_fd = state.raw_fd;
-        let get_buf_size = state
-            .transport_get_buf_size
-            .as_ref()
-            .map(|m| m.clone_ref(py));
+        let raw_fd = st.raw_fd;
+        let get_buf_size = st.transport_get_buf_size.as_ref().map(|m| m.clone_ref(py));
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
         let (raw_payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
@@ -892,7 +892,7 @@ impl NativeClient {
         // each message matches client_no_context_takeover semantics and sidesteps
         // the reset() pitfalls in miniz_oxide. We reserve enough output capacity
         // up front so compress_vec finishes in a single call.
-        let compressed = state.deflate.is_some();
+        let compressed = st.deflate.is_some();
         let deflate_buf: Vec<u8> = if compressed {
             let mut comp = Compress::new(Compression::default(), false);
             // Worst case: small overhead on random data; highly compressible
@@ -931,7 +931,6 @@ impl NativeClient {
         } else {
             raw_payload
         };
-        drop(state);
 
         let plen = payload.len();
         let header_len =
@@ -941,19 +940,14 @@ impl NativeClient {
                 _ => 8,
             } + 4; // 4-byte mask
 
-        // Pull a pre-generated mask key from the pool; refill in a batch of
-        // 256 (1024 random bytes) to amortise the rand syscall. Pool refill
-        // takes a brief borrow_mut on state.
+        // Pull a pre-generated mask key from the pool — already holding st.
         let mask_key: [u8; 4] = {
-            let mut st = self.state.borrow_mut();
             if st.mask_pool.is_empty() {
                 let mut buf = [0u32; 256];
                 rand::rng().fill(&mut buf[..]);
                 st.mask_pool.extend(buf.iter().copied());
             }
-            // Safety: just refilled if empty.
-            let key_u32 = st.mask_pool.pop().unwrap();
-            key_u32.to_ne_bytes()
+            st.mask_pool.pop().unwrap().to_ne_bytes()
         };
 
         // Encode header onto the stack (max 14 bytes: 2 + 8 length + 4 mask).
@@ -975,23 +969,16 @@ impl NativeClient {
         let header = &header_buf[..pos + 4];
         debug_assert_eq!(header.len(), header_len);
 
-        // Pause check is cheap; do it once before deciding fast vs slow path.
-        if self.state.borrow().paused {
-            // Slow path: build merged PyBytes and queue it for resume_writing.
+        if st.paused {
             let out = self.build_merged_frame(py, header, payload, mask_key)?;
-            self.state.borrow_mut().write_queue.push_back(out.unbind());
+            st.write_queue.push_back(out.unbind());
             return Ok(());
         }
 
-        // Native sendmsg fast path: when transport is plain TCP and asyncio's
-        // internal buffer is empty, we go straight to the kernel with a 2-iovec
-        // sendmsg(). The mask still has to be applied to a writable copy of the
-        // payload, but we skip allocating and filling a merged PyBytes. We use
-        // the cached `buf_known_empty` flag to skip the get_write_buffer_size()
-        // Python call on the hot path; on a cold start (or after a fallback to
-        // transport.write) we fall through to query asyncio explicitly.
+        // Native send fast path. The buf_known_empty cache lets us skip the
+        // Python call to get_write_buffer_size() in the steady state.
         if let Some(fd) = raw_fd {
-            let drained = if self.state.borrow().buf_known_empty {
+            let drained = if st.buf_known_empty {
                 true
             } else {
                 let truth = match get_buf_size {
@@ -1004,41 +991,33 @@ impl NativeClient {
                     None => false,
                 };
                 if truth {
-                    self.state.borrow_mut().buf_known_empty = true;
+                    st.buf_known_empty = true;
                 }
                 truth
             };
             if drained {
-                // Reuse the per-connection send_buf instead of fresh allocating
-                // each call — picows uses this pattern via _write_buffer. The
-                // scratch buffer holds header + masked payload contiguously so
-                // a single send(2) covers everything.
                 let total = header.len() + plen;
-                let written = {
-                    let mut st = self.state.borrow_mut();
-                    st.send_buf.clear();
-                    st.send_buf.extend_from_slice(header);
-                    st.send_buf.extend_from_slice(payload);
-                    apply_mask(&mut st.send_buf[header.len()..], mask_key);
-                    native_send(fd, &st.send_buf)
-                };
+                st.send_buf.clear();
+                st.send_buf.extend_from_slice(header);
+                st.send_buf.extend_from_slice(payload);
+                apply_mask(&mut st.send_buf[header.len()..], mask_key);
+                let written = native_send(fd, &st.send_buf);
                 if written == total as isize {
                     return Ok(());
                 }
                 if written > 0 {
                     let n = written as usize;
-                    let st = self.state.borrow();
                     let tail = PyBytes::new(py, &st.send_buf[n..]);
+                    st.buf_known_empty = false;
                     drop(st);
-                    self.state.borrow_mut().buf_known_empty = false;
                     write.bind(py).call1((tail,))?;
                     return Ok(());
                 }
-                // EAGAIN / error: fall through to slow path so asyncio reports it.
             }
         }
         let out = self.build_merged_frame(py, header, payload, mask_key)?;
-        self.state.borrow_mut().buf_known_empty = false;
+        st.buf_known_empty = false;
+        drop(st);
         write.bind(py).call1((out,))?;
         Ok(())
     }
