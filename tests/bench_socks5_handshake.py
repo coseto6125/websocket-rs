@@ -74,6 +74,7 @@ def _handle_socks5(conn: socket.socket):
             return
         # Reply: VER=0x05, REP=0x00 (success), RSV=0x00, ATYP=0x01, bind addr+port (zeros ok)
         conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+
         # Bidi relay until either side closes — we don't actually do any work
         # in this test (clients close immediately), so minimal relay is fine.
         def pump(a: socket.socket, b: socket.socket):
@@ -111,9 +112,7 @@ def _serve_tcp_target(port: int, ready: threading.Event):
     while True:
         conn, _ = srv.accept()
         # Hold the connection briefly so the client sees EstablishedSocket.
-        threading.Thread(
-            target=lambda c=conn: (c.recv(1), c.close()), daemon=True
-        ).start()
+        threading.Thread(target=lambda c=conn: (c.recv(1), c.close()), daemon=True).start()
 
 
 # ---------- Three implementations ----------

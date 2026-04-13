@@ -11,10 +11,9 @@ legacy module is deprecated and will be removed in 2.0.
 from __future__ import annotations
 
 import ssl as _ssl
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from types import TracebackType
 from typing import Self
-
 
 class WSMessage:
     """Zero-copy view over a received WebSocket frame payload.
@@ -30,7 +29,6 @@ class WSMessage:
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> int: ...
     def __repr__(self) -> str: ...
-
 
 class NativeClient:
     """WebSocket client integrated directly with asyncio.Protocol.
@@ -70,7 +68,6 @@ class NativeClient:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None: ...
-
     @property
     def is_open(self) -> bool: ...
     @property
@@ -79,7 +76,6 @@ class NativeClient:
     def close_code(self) -> int | None: ...
     @property
     def close_reason(self) -> str | None: ...
-
 
 async def connect(
     uri: str,
@@ -91,6 +87,7 @@ async def connect(
     receive_timeout: float | None = None,
     proxy: str | None = None,
     compression: bool = False,
+    on_message: Callable[[WSMessage], None] | None = None,
 ) -> NativeClient:
     """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
 
@@ -116,5 +113,29 @@ async def connect(
       server doesn't echo the extension header the client silently falls
       back to sending uncompressed frames. ``picows`` exposes the RSV1 bit
       but does not compress or decompress for you.
+    - ``on_message`` switches delivery to a synchronous callback invoked
+      from the asyncio Protocol ``data_received`` path. When set, messages
+      are NOT queued for :meth:`NativeClient.recv` — the callback receives
+      each :class:`WSMessage` directly and must not ``await``. Leave as
+      ``None`` for typical async/await usage.
+    """
+    ...
+
+
+class NativeClientBuffered(NativeClient):
+    """Subclass of :class:`NativeClient` that enables asyncio's
+    BufferedProtocol path (``get_buffer`` + ``buffer_updated``). uvloop
+    writes kernel data directly into an internal reusable buffer,
+    skipping the per-recv ``bytes`` allocation the plain Protocol path
+    incurs. ~15% win on 64 KB pipelined throughput vs the base class.
+
+    Instances are produced transparently by :func:`connect` when the URI
+    scheme is ``ws://`` (plain TCP). For ``wss://``, :func:`connect`
+    returns a bare :class:`NativeClient` — asyncio's SSLProtocol delivers
+    TLS records in ≤16 KB chunks, and the per-callback
+    ``PyMemoryView_FromMemory`` + RefCell churn makes BufferedProtocol
+    net-negative on the TLS path.
+
+    Do not instantiate directly; always go through :func:`connect`.
     """
     ...

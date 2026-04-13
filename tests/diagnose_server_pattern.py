@@ -17,7 +17,6 @@ import signal
 import struct
 import subprocess
 import time
-from hashlib import sha1
 
 import uvloop
 
@@ -137,9 +136,7 @@ async def probe(uri_host, port, payload_size):
         "total": proto.received_total,
         "expected": proto.target_bytes,
         "first_delay": (proto.first_chunk_ts - t_send) * 1000 if proto.first_chunk_ts else None,
-        "fan_out": (proto.last_chunk_ts - proto.first_chunk_ts) * 1000
-        if proto.last_chunk_ts and proto.first_chunk_ts
-        else 0.0,
+        "fan_out": (proto.last_chunk_ts - proto.first_chunk_ts) * 1000 if proto.last_chunk_ts and proto.first_chunk_ts else 0.0,
     }
 
 
@@ -290,10 +287,7 @@ async def main():
                 samples = [await probe("127.0.0.1", port, size) for _ in range(5)]
                 samples.sort(key=lambda s: len(s["chunks"]))
                 med = samples[len(samples) // 2]
-                print(
-                    f"  {label:18} chunks={len(med['chunks']):2d}  "
-                    f"sizes={med['chunks'][:3]}{'...' if len(med['chunks']) > 3 else ''}"
-                )
+                print(f"  {label:18} chunks={len(med['chunks']):2d}  sizes={med['chunks'][:3]}{'...' if len(med['chunks']) > 3 else ''}")
 
         print("\n=== Pipelined probe (100 msgs back-to-back) ===")
         for size in (4096, 16384, 65536):
@@ -304,10 +298,7 @@ async def main():
                 from collections import Counter
 
                 dist = Counter(r["chunk_sizes"]).most_common(4)
-                print(
-                    f"  {label:18} {r['n_chunks']:3d} chunks  total={r['total_ms']:.3f}ms  "
-                    f"size_distribution={dist}"
-                )
+                print(f"  {label:18} {r['n_chunks']:3d} chunks  total={r['total_ms']:.3f}ms  size_distribution={dist}")
     finally:
         for _, p, _ in servers:
             try:

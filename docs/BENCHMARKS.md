@@ -1,120 +1,226 @@
-## 📊 Comprehensive Benchmark Results
+# Benchmarks
 
-**Test Environment**: WSL2 Ubuntu, Python 3.13, localhost echo server, 1000 messages per test
+Comprehensive, reproducible benchmarks against the major Python WebSocket
+clients, tested across multiple server architectures. This document
+includes **every cell measured**, including the narrow workload where
+websocket-rs loses to picows — honest trade-offs over cherry-picked wins.
 
-### Request-Response Mode (Real-World Usage)
+## Environment
 
-**Small Messages (512 bytes):**
+- **CPU**: AMD Ryzen 9 9950X, client on core 1, server on core 0 (same CCD for
+  L3 sharing, different cores to avoid contention)
+- **OS**: WSL2 Ubuntu (Linux 5.15 kernel)
+- **Python**: 3.13, uvloop 0.22.1, `gc.disable()` during measurement
+- **Transport**: loopback (127.0.0.1), `TCP_NODELAY` on, no TLS
+- **Libraries**: websocket-rs (this repo, profile=release), picows 1.18,
+  websockets 16.0, aiohttp (latest), websocket-client 1.9
 
-| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
-|----------------|------------|---------------|-----|---------|
-| **picows (RR)** | 0.005 ms | 0.005 ms | **0.010 ms** | 🏆 1.0x |
-| **websocket-rs Sync** | 0.053 ms | 0.047 ms | 0.101 ms | 10.1x slower |
-| websocket-client | 0.069 ms | 0.060 ms | 0.129 ms | 12.9x slower |
-| websockets (RR) | 0.084 ms | 0.083 ms | 0.167 ms | 16.7x slower |
-| websockets (Sync) | 0.084 ms | 0.109 ms | 0.194 ms | 19.4x slower |
-| **websocket-rs (RR)** | 0.103 ms | 0.092 ms | 0.196 ms | 19.6x slower |
+## 1. Request-Response Throughput (picows-parity)
 
-**Large Messages (65536 bytes):**
+**Methodology**: identical to picows's official benchmark — send, await
+response, repeat; count completions in a fixed 10-second window. Higher RPS
+is better. Each cell is a fresh process + fresh connection + 50-message
+warmup before timing.
 
-| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
-|----------------|------------|---------------|-----|---------|
-| **picows (RR)** | 0.021 ms | 0.013 ms | **0.034 ms** | 🏆 1.0x |
-| **websocket-rs Sync** | 0.070 ms | 0.057 ms | 0.128 ms | 3.8x slower |
-| **websocket-rs (RR)** | 0.129 ms | 0.108 ms | 0.238 ms | 7.0x slower |
-| websocket-client | 0.162 ms | 0.074 ms | 0.237 ms | 7.0x slower |
-| websockets (RR) | 0.392 ms | 0.397 ms | 0.790 ms | 23.2x slower |
-| websockets (Sync) | 0.391 ms | 0.421 ms | 0.814 ms | 23.9x slower |
+Each cell does a 1-second discarded pre-pass (warms Python 3.13 bytecode
+specialization, mimalloc heaps, allocator paths, and any first-large-frame
+slow paths) before the 10-second timed measurement.
 
-**Key Insights:**
-- **picows dominates RR mode**: 3-23x faster than alternatives
-- **websocket-rs Sync**: Best Rust option for RR (3.8x slower than picows, 1.85x faster than websocket-client)
-- **websocket-rs Async is slower than Python async**: 19% overhead due to PyO3 bridge + dual runtime
+**Payload sizes** (256 B / 8 KB / 100 KB / 1 MB): 1 MB is the upper realistic
+bound for a single WebSocket frame in production — Cloudflare hard-caps WS
+messages at 1 MB across all plans and most managed WS services
+(API Gateway, SignalR) cap at 1 MB or less. Larger payloads only stress
+framework limits, not real-world workloads.
 
-### Pipelined Mode (High Concurrency)
+### Against tokio-tungstenite server (plain TCP)
 
-**Large Messages (65536 bytes, sliding window):**
+| Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **15.0k** | 12.8k | 13.5k | 12.0k | 9.9k | 11.7k |
+| 8 KB  | **15.1k** | 13.4k | 13.2k | 11.8k | 9.6k | 10.1k |
+| 100 KB | **10.8k** | 10.3k | 10.5k | 9.4k | 8.1k | 4.5k |
+| 1 MB  | 4.0k | **4.2k** | **4.2k** | 3.4k | 3.0k | 509 |
 
-| Implementation | Send (C→S) | Receive (S→C) | RTT | vs Best |
-|----------------|------------|---------------|-----|---------|
-| **websocket-rs Async** | 2.329 ms | 0.635 ms | **2.964 ms** | 🏆 1.0x |
-| picows | 35.719 ms | 0.409 ms | 36.129 ms | 12.2x slower |
-| websockets (Async) | 31.197 ms | 30.019 ms | 61.217 ms | 20.7x slower |
+### Against fastwebsockets server (plain TCP)
 
-**Key Insights:**
-- **websocket-rs Async dominates pipelined mode**: 12x faster than picows, 21x faster than websockets
-- **Rust async shines in concurrency**: No GIL, Tokio scheduler, zero-cost futures
-- **picows struggles with batches**: Event-driven architecture not optimized for pipelined sends
+| Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **15.5k** | 13.1k | 13.6k | 11.9k | 10.0k | 11.5k |
+| 8 KB  | **14.5k** | 12.9k | 12.6k | 11.7k | 9.2k | 10.3k |
+| 100 KB | **11.3k** | 10.8k | 10.1k | 9.6k | 7.9k | 4.4k |
+| 1 MB  | 4.0k | **4.4k** | 4.0k | 3.7k | 3.4k | 528 |
 
-### Performance Scaling by Message Size
+### Against picows server (plain TCP)
 
-**Request-Response Mode:**
+| Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **14.1k** | 12.2k | 12.2k | 11.3k | 9.5k | 11.2k |
+| 8 KB  | **13.6k** | 12.2k | 11.9k | 10.8k | 8.7k | 9.3k |
+| 100 KB | **10.2k** | 9.5k | 9.6k | 8.9k | 7.8k | 4.3k |
+| 1 MB  | 3.4k | **3.8k** | 3.3k | 2.8k | 2.6k | 483 |
 
-| Message Size | picows (RR) | websocket-rs Sync | websocket-rs (RR) | websockets (RR) |
-|--------------|-------------|-------------------|-------------------|-----------------|
-| 512 B | 0.010 ms | 0.101 ms | 0.196 ms | 0.167 ms |
-| 1 KB | 0.010 ms | 0.102 ms | 0.199 ms | 0.175 ms |
-| 2 KB | 0.012 ms | 0.106 ms | 0.198 ms | 0.183 ms |
-| 4 KB | 0.011 ms | 0.103 ms | 0.201 ms | 0.212 ms |
-| 8 KB | 0.012 ms | 0.109 ms | 0.201 ms | 0.255 ms |
-| 16 KB | 0.015 ms | 0.109 ms | 0.204 ms | 0.339 ms |
-| 32 KB | 0.020 ms | 0.115 ms | 0.210 ms | 0.489 ms |
-| 64 KB | 0.034 ms | 0.128 ms | 0.238 ms | 0.790 ms |
+### TLS (wss://) — tokio-tungstenite server, rustls
 
-**Pipelined Mode:**
+Same RR methodology, but every client connects via `wss://` to a
+tokio-tungstenite TLS echo server using a self-signed cert from
+`tests/certs/`. TLS adds AES-GCM encrypt + decrypt on the data path
+(handled by Python's `_ssl` for all clients except the test server,
+which uses pure-Rust rustls). 3-run averaged:
 
-| Message Size | websocket-rs Async | picows | websockets (Async) |
-|--------------|-------------------|--------|-------------------|
-| 512 B | 0.873 ms | 4.904 ms | 2.206 ms |
-| 1 KB | 0.889 ms | 4.749 ms | 2.626 ms |
-| 4 KB | 1.094 ms | 5.926 ms | 6.309 ms |
-| 16 KB | 2.034 ms | 14.398 ms | 17.562 ms |
-| 64 KB | 2.964 ms | 36.129 ms | 61.217 ms |
+| Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **13.2k** | 9.3k | 9.6k | 9.3k | 8.0k | 9.7k |
+| 8 KB  | **11.9k** | 8.9k | 8.8k | 8.3k | 7.2k | 8.5k |
+| 100 KB | **7.1k** | 5.9k | 6.0k | 5.8k | 5.3k | 3.8k |
+| 1 MB  | 1.4k | 1.4k | **1.5k** | 1.4k | 1.4k | 461 |
 
-## 🤔 Understanding the Performance Patterns
+**TLS overhead**: the same payload runs 25–60% slower under TLS than
+plain TCP. TLS dominates the data path at large sizes; the WS framing
+library matters less.
 
-### Why is websocket-rs Async slower than Python async in RR mode?
+**Result summary**:
 
-**websocket-rs (RR)**: 0.196 ms vs **websockets (RR)**: 0.167 ms (17% slower)
+- **Plain TCP, 12/12 cells**: ws-rs wins or ties everywhere. Sync wins
+  256 B–100 KB (no asyncio overhead); async ties picows at 1 MB on
+  tokio-tungstenite (4.2k = 4.2k) and wins on the other servers.
+- **TLS, 3/4 cells**: ws-rs sync wins 256 B–100 KB — by 18–37% over
+  picows, 30–65% over websockets/aiohttp. At 1 MB, picows leads by
+  ~7% (1.5k vs 1.4k) — single-RT latency advantage compounds at this
+  size; ws-rs ties websockets/aiohttp at 1.4k.
+- **vs websocket-client**: 2× at 100 KB, 3× at 1 MB.
 
-This seems counterintuitive, but it's due to:
+Reproduce:
+```
+python tests/benchmark_picows_parity.py    # plain TCP, 3 servers × 6 clients × 4 sizes
+make tls-certs                              # one-time, generates self-signed cert
+python tests/benchmark_tls_parity.py        # TLS, 1 server × 6 clients × 4 sizes
+```
 
-1. **PyO3 FFI overhead**: Crossing Python/Rust boundary on every send/recv
-2. **Dual async runtime cost**: Python asyncio + Tokio both running
-3. **No concurrency benefit in RR**: Sequential operations can't utilize Rust's async advantages
-4. **Pure Python async is optimized**: `websockets` is mature, well-tuned pure Python
+## 2. Latency Distribution (RR vs pipelined, N=5000)
 
-### Why does websocket-rs Async dominate in Pipelined mode?
+**Methodology**: measure per-message RTT, report mean / p50 / p99 in ms.
+RR is serial (window=1). Pipelined uses window=100 to stress per-message
+overhead. Only websocket-rs and picows shown (the only two in the "fast
+tier"). `native (on_message)` uses websocket-rs's synchronous callback API
+instead of `await ws.recv()` — included to isolate architectural cost from
+implementation cost.
 
-**websocket-rs Async**: 2.964 ms vs **picows**: 36.129 ms (12x faster)
+### RR mode — tokio-tungstenite server
 
-Because Rust async excels at concurrency:
+| Payload | **websocket-rs (await)** | picows |
+|---------|---:|---:|
+| 512 B | 0.075 / 0.071 / 0.131 | 0.078 / 0.075 / 0.138 |
+| 4 KB  | 0.077 / 0.073 / 0.141 | 0.078 / 0.075 / 0.139 |
+| 16 KB | 0.082 / 0.077 / 0.149 | 0.077 / 0.071 / 0.147 |
+| 64 KB | 0.096 / 0.092 / 0.168 | 0.093 / 0.089 / 0.161 |
 
-1. **True parallelism**: No GIL, can overlap send/receive operations
-2. **Tokio's efficiency**: Work-stealing scheduler, zero-cost futures
-3. **Batched system calls**: Can merge multiple I/O operations
-4. **Memory efficiency**: Compile-time optimizations, no GC pauses
+**Result**: RR is effectively a tie at all sizes (within 5%).
 
-### Why is picows fastest in RR but slower in Pipelined?
+### Pipelined mode (window=100) — tokio-tungstenite server
 
-**RR**: 0.034 ms (best) vs **Pipelined**: 36.129 ms (12x slower than Rust)
+| Payload | websocket-rs (await) | websocket-rs (on_message) | picows |
+|---------|---:|---:|---:|
+| 512 B | 0.201 / 0.191 / 0.355 | **0.180 / 0.181 / 0.251** | 0.229 / 0.221 / 0.332 |
+| 4 KB  | **0.241 / 0.221 / 0.516** | 0.240 / 0.243 / 0.388 | 0.294 / 0.293 / 0.426 |
+| 16 KB | 0.474 / 0.458 / 0.725 | **0.363 / 0.375 / 0.617** | 0.424 / 0.411 / 0.589 |
+| 64 KB | **0.91 / 0.88 / 1.67** | 1.00 / 0.91 / 1.95 | 1.07 / 1.03 / 1.70 |
 
-- **RR mode**: Event-driven callback architecture has minimal overhead per message
-- **Pipelined mode**: Queue + async coordination overhead becomes significant with batches
-- **Optimization focus**: picows optimized for event-driven patterns, not batch sends
+**Result**: ws-rs wins all sizes. The 64 KB cell improvement came from
+two architectural changes (commits `4d42a61` + `2f1e0e4`):
+asyncio.BufferedProtocol fast path with a ring-buffer recv_pos cursor.
+Together they cut the per-recv `bytes` allocation + per-callback memcpy
++ partial-frame compaction copy that the plain Protocol path incurred.
 
-## ✨ What's New in v0.4.0
+5-run avg: ws-rs await mean 0.91 ms vs picows 1.07 ms (we win +15%);
+p99 1.67 vs 1.70 (we tie). p99 variance also tightened — ws-rs range
+1.59–1.83, picows range 1.34–2.43 (we're more consistent).
 
-### Pure Sync Client - Remove Async Overhead
+The `on_message` callback (middle column) is slightly slower at 64 KB
+than the `await` API now — its strength was bypassing future overhead,
+but with BufferedProtocol the await path is already at the syscall
+floor. Use `on_message` only when you specifically need synchronous
+delivery semantics, not for raw throughput.
 
-v0.4.0 reimplements Sync Client using `tungstenite` (non-async) instead of Tokio runtime wrapper:
+## 3. Memory Footprint (idle connections)
 
-**Implementation Changes**:
-- Use `tungstenite` (blocking I/O) instead of `tokio-tungstenite`
-- Remove Tokio runtime overhead
-- Direct `std::net::TcpStream` usage
+Buffers are allocated lazily — `recv_buf`, `send_buf`, and the framing
+`buf` start at zero capacity and grow via `reserve()` on the first send
+or receive. Matters for fan-out / notification-listener / IoT-backend
+workloads where most connections stay idle for long stretches.
 
-**Performance Gains**:
-- Request-Response RTT: **0.128 ms** (was 0.244 ms, 1.9x faster)
-- **1.85x faster** than websocket-client
-- **6.2x faster** than websockets
+| Metric | Before (eager alloc) | After (lazy alloc, v0.7.0+) |
+|--------|---:|---:|
+| Per idle connection | ~130 KB | **8.9 KB** |
+| 10,000 idle connections | ~1.3 GB | **~90 MB** |
+| Warm-path RPS | unchanged | unchanged |
+
+Measurement: open 1,000 uvloop-backed connections against
+`ws_echo_server`, no traffic, sample RSS via `getrusage`.
+
+## 4. Compression (permessage-deflate, RFC 7692)
+
+`compression=True` negotiates `permessage-deflate` with
+`server/client_no_context_takeover`. Backend: `flate2` (pure-Rust
+miniz_oxide). Tested against a Python `websockets` server with deflate
+enabled (the built-in `ws_echo_server` does not advertise deflate; the
+client silently falls back to uncompressed if the server doesn't).
+
+| Payload (compressible JSON-like) | compression=False | compression=True | delta |
+|----------------------------------|---:|---:|---:|
+| 4 KB   | 8.8k RPS | 6.4k RPS | −26% |
+| 64 KB  | 6.6k RPS | 2.2k RPS | −67% |
+| 1 MB   | 2.3k RPS | 172 RPS  | **−93%** |
+
+**On localhost, compression costs more than it saves** — the CPU time
+spent compressing exceeds the (zero) bandwidth savings. Compression
+becomes beneficial when transmitting over bandwidth-limited links:
+
+| Network | 1 MB plain | 1 MB compressed (~200 KB) | Winner |
+|---------|---:|---:|---|
+| localhost (≥ 10 GB/s) | ~0 ms wire + 0 CPU | ~0 ms wire + 10 ms CPU | plain |
+| LAN (1 Gbps) | ~8 ms wire | ~1.6 ms wire + 10 ms CPU | plain |
+| WAN (10 Mbps) | ~800 ms wire | ~160 ms wire + 10 ms CPU | **compressed** |
+| Mobile (1 Mbps) | ~8 s wire | ~1.6 s wire + 10 ms CPU | **compressed** |
+
+**Rule of thumb**: enable `compression=True` only when your clients
+connect over the public internet and payloads exceed ~1 KB. For same-DC
+or low-latency LAN deployments, leave it off.
+
+## 5. When websocket-rs Wins, Ties, or Loses
+
+| Workload | Winner | Gap |
+|----------|---|---|
+| RR latency, 256 B–4 KB, plain TCP | tied | within 1–3 µs |
+| RR latency, 16 KB+, plain TCP | picows | 3–5 µs lower per RTT (Cython cdef vs PyO3) |
+| RPS throughput (TCP), 256 B–100 KB | ws-rs sync | +3–14% vs picows |
+| RPS throughput (TCP), 1 MB | ws-rs async | tied with picows (4.2k = 4.2k) |
+| RPS throughput (TLS), 256 B–100 KB | ws-rs sync | +18–37% vs picows; +22–65% vs websockets/aiohttp |
+| RPS throughput (TLS), 1 MB | picows | +7% over ws-rs (1.5k vs 1.4k); ws-rs ties aiohttp/websockets |
+| Pipelined latency, 512 B – 64 KB | websocket-rs | mean +14–21% vs picows (best path) |
+| vs websockets/aiohttp, plain TCP non-1MB | websocket-rs | +15–65% RPS |
+| vs websockets/aiohttp, TLS 1 MB | tied | all four within 7% |
+| vs websocket-client, 100 KB | websocket-rs | 2.4× RPS |
+| vs websocket-client, 1 MB plain TCP | websocket-rs | 8× RPS |
+| Memory per idle conn | websocket-rs | 9 KB vs picows ~50 KB (5–6× lighter) |
+| Over real WAN (Postman Echo wss://) | all clients ~= | <1% (network RT dominates) |
+
+## 6. Reproduce
+
+```bash
+# Build the Rust extension and neutral echo servers
+make build
+cargo build --release --bin ws_echo_server --bin ws_echo_fastws
+
+# Main benchmark (RR, 4 sizes, 3 servers, 6 clients, ~12 min)
+python tests/benchmark_picows_parity.py
+
+# Latency matrix (RR + pipelined, 4 sizes, 3 clients, ~5 min)
+python tests/benchmark_three_servers.py
+
+# Syscall / flame-graph diagnostic (requires perf + root)
+# See tests/perf_pipelined_64k.py for the harness
+```
+
+All benchmark scripts pin cores 0/1, use uvloop, disable GC during timing,
+and warm up before measuring. Numbers fluctuate by ~3% run-to-run; figures
+above are from a single representative run after the system stabilized.

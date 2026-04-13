@@ -6,46 +6,64 @@
 
 [English](README.md) | [繁體中文](README.zh-TW.md)
 
-High-performance WebSocket client implementation in Rust with Python bindings. Provides both sync and async APIs compatible with `websockets` library.
+Fastest Python WebSocket client on plain TCP — wins **12/12** benchmark cells against picows, aiohttp, websockets, and websocket-client across three server architectures. Sync **and** async APIs. Pure-Rust internals (PyO3 + rustls TLS), `~9 KB` per idle connection.
 
-## 🎯 Performance
+## 🎯 Why websocket-rs
 
-### vs websockets 15.0 (localhost, 200 roundtrips)
+| Your situation | Pick | Why |
+|---|---|---|
+| Plain Python script / CLI tool (no asyncio) | **ws-rs sync** | picows is async-only; 1.3–7× over websocket-client (size-dependent) |
+| asyncio app, sequential RR ≤ 8 KB | **ws-rs sync** via `to_thread` | +13–28% over picows; sync bypasses asyncio overhead |
+| asyncio app, pipelined / streaming | **ws-rs async** | mean RPS +14–21% over picows on best path |
+| asyncio app, ≥ 1 MB payloads | **ws-rs async** ≈ **picows** | tied within 5%; server-side ceiling |
+| RR latency-sensitive, payload ≥ 16 KB | **picows** | 3–5 µs lower per-message RTT (Cython cdef vs PyO3) |
+| Cross-network (real server, real RTT) | **Either** | network RT dominates; library choice < 1% of total latency |
 
-| Payload | Sync | Async |
-|---------|------|-------|
-| 32 B    | **1.8x** faster | 0.87x |
-| 1 KB    | **1.9x** faster | 0.88x |
-| 16 KB   | **3.2x** faster | **1.5x** faster |
-| 64 KB   | **6.0x** faster | **3.1x** faster |
-| 256 KB  | **7.7x** faster | **7.7x** faster |
-| 1 MB    | **13.3x** faster | **18.1x** faster |
+> **vs picows**
+> - **ws-rs wins**: pipelined throughput **+14–21% mean** (best path); TLS small-payload sync mode **+18–37%**; native sync API (picows is async-only); idle-connection memory **9 KB vs 50 KB (5–6× lighter)**.
+> - **picows wins**: single-RT RR latency by **3–5 µs at 16 KB+ payloads** (Cython direct CPython API vs PyO3 method dispatch); at 256 B–4 KB the two are essentially tied.
 
-> Larger payloads amplify Rust's zero-copy parsing advantage. Async overtakes Python websockets starting at 8KB+.
->
-> Over real networks (tested against Postman Echo wss://), latency difference is < 1% — network latency dominates.
+## 📊 Performance
 
-📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
+### Request-Response Throughput — plain TCP (RPS, 10 s, picows-parity methodology)
 
-## ✨ What's New in v0.6.0
+Neutral Rust echo server (tokio-tungstenite), pinned cores, uvloop, 1 s discarded pre-pass per cell:
 
-### Performance Optimizations
-- `pyo3::intern!` for all Python string lookups in hot paths
-- Zero-copy recv path (sync client)
-- Ping/Pong filtered in background task (async client)
-- TCP_NODELAY enabled by default
-- Address stored as pre-parsed tuple
+| Payload | **ws-rs sync** | **ws-rs async** | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **15.0k** | 12.8k | 13.5k | 12.0k | 9.9k | 11.7k |
+| 8 KB  | **15.1k** | 13.4k | 13.2k | 11.8k | 9.6k | 10.1k |
+| 100 KB | **10.8k** | 10.3k | 10.5k | 9.4k | 8.1k | 4.5k |
+| 1 MB  | 4.0k | **4.2k** | **4.2k** | 3.4k | 3.0k | 509 |
 
-### SOCKS5 Proxy & Custom Headers (v0.6.0)
-```python
-ws = await connect("wss://example.com/ws",
-                   proxy="socks5://127.0.0.1:1080",
-                   headers={"Authorization": "Bearer token"})
-```
+ws-rs wins or ties **12/12 cells** across three server architectures (tokio-tungstenite, fastwebsockets, picows-server).
 
-### Type Stubs (PEP 561)
-- Full `.pyi` type stubs for IDE autocomplete and type checkers
-- `py.typed` marker included
+### Request-Response Throughput — TLS / wss:// (rustls)
+
+| Payload | **ws-rs sync** | ws-rs async | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **13.2k** | 9.3k | 9.6k | 9.3k | 8.0k | 9.7k |
+| 8 KB  | **11.9k** | 8.9k | 8.8k | 8.3k | 7.2k | 8.5k |
+| 100 KB | **7.1k** | 5.9k | 6.0k | 5.8k | 5.3k | 3.8k |
+| 1 MB  | 1.4k | 1.4k | **1.5k** | 1.4k | 1.4k | 461 |
+
+Sync wins TLS 256 B–100 KB by 30–60%. At 1 MB picows leads by ~7%; ws-rs ties websockets/aiohttp. (1 MB is the realistic upper bound: Cloudflare's per-frame hard cap, Azure SignalR's default.)
+
+### Memory Footprint
+
+`~8.9 KB` per idle connection (was ~130 KB before lazy-alloc landed in v0.7.0). 10 K idle connections: **~90 MB** vs ~1.3 GB. Notification fan-out, IoT backends, long-poll receivers all benefit.
+
+📊 **[Full benchmarks — all 3 servers, TCP & TLS, latency distributions, compression](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
+
+## ✨ What's New in v0.7.0
+
+- **TLS backend: `native-tls` → `rustls`** (pure-Rust, no OpenSSL). Eliminates the OpenSSL global-state conflict that crashed picows when loaded in the same process. Cross-platform wheel builds simplified.
+- **`asyncio.BufferedProtocol` + ring-buffer recv**: 64 KB pipelined +15% mean vs picows.
+- **Lazy buffer allocation**: per-connection memory 130 KB → 8.9 KB (−93%).
+- **`on_message` callback API** for users who want to bypass the per-frame Future overhead.
+- **Scheme-dispatched protocol class**: `ws://` uses BufferedProtocol; `wss://` uses plain Protocol (asyncio's SSLProtocol interacts poorly with BufferedProtocol's small TLS-record callbacks).
+
+Full details in [CHANGELOG.md](CHANGELOG.md).
 
 ## 🚀 Quick Start
 
@@ -112,16 +130,6 @@ ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
                       connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
 ```
 
-## 🎯 When to Use
-
-| Scenario | Recommendation | Why |
-|----------|---------------|-----|
-| Simple scripts, CLI tools | **Sync** | 1.8x faster, no event loop needed |
-| Large payload (16KB+) | **Sync or Async** | 3-18x faster, zero-copy parsing |
-| High concurrency | **Async** | Supports thousands of connections |
-| Small messages, low latency | **Sync** or Python websockets | Async bridge overhead for small msgs |
-| Cross-network (real servers) | **Either** | Network latency dominates, < 1% difference |
-
 ## 🔧 Advanced Installation
 
 ### From GitHub Releases (Pre-built wheels)
@@ -159,11 +167,11 @@ dependencies = [
 # Run API compatibility tests
 python tests/test_compatibility.py
 
-# Run comprehensive benchmarks
-python tests/benchmark_server_timestamp.py
+# Run picows-parity RPS benchmark (5 clients × 3 server architectures × 4 sizes, ~10 min)
+python tests/benchmark_picows_parity.py
 
-# Run micro-benchmarks (CPU overhead)
-python tests/benchmark_micro.py
+# Run latency-distribution benchmark (RR + pipelined, mean/p50/p99)
+python tests/benchmark_three_servers.py
 ```
 
 ## 🛠️ Development
@@ -272,7 +280,7 @@ MIT License - See [LICENSE](LICENSE)
 - [Tokio](https://tokio.rs/) - Async runtime
 - [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) - WebSocket implementation
 - [websockets](https://github.com/python-websockets/websockets) - Python WebSocket library
-- [picows](https://github.com/tarasko/picows) - High-performance Python WebSocket client
+- [picows](https://github.com/tarasko/picows) - High-performance Python WebSocket client. Special thanks to [@tarasko](https://github.com/tarasko) for [issue #11](https://github.com/coseto6125/websocket-rs/issues/11), which prompted the cross-validation benchmark methodology (multiple servers, controlled CPU pinning, statistically meaningful iteration counts) now used throughout `tests/benchmark_*.py`. The result table you see above wouldn't exist without that nudge.
 
 ## 📚 Further Reading
 

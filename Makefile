@@ -1,6 +1,6 @@
 # Makefile for WebSocket-RS development
 
-.PHONY: help install dev test bench clean build release
+.PHONY: help install dev test bench clean build release tls-certs
 
 # Default target
 help:
@@ -13,6 +13,7 @@ help:
 	@echo "make clean     - Clean build artifacts"
 	@echo "make build     - Build release version"
 	@echo "make release   - Build wheels for distribution"
+	@echo "make tls-certs - Generate self-signed cert for TLS benchmarks (localhost)"
 
 # Install dependencies
 install:
@@ -58,6 +59,18 @@ clean:
 release:
 	@echo "📦 Building distribution wheels..."
 	. .venv/bin/activate && maturin build --release
+
+# Generate self-signed cert + key for TLS benchmarks (localhost only, 10y)
+tls-certs:
+	@mkdir -p tests/certs
+	@openssl req -x509 -newkey rsa:2048 -days 3650 -nodes \
+		-keyout tests/certs/key.pem -out tests/certs/cert.pem \
+		-subj "/CN=127.0.0.1" \
+		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+		-addext "basicConstraints=critical,CA:FALSE" \
+		-addext "extendedKeyUsage=serverAuth" 2>/dev/null
+	@chmod 600 tests/certs/key.pem
+	@echo "✅ Wrote tests/certs/{cert,key}.pem (test-only, gitignored, end-entity cert)"
 
 # Quick test (no server needed)
 quick-test: build

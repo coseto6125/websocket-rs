@@ -2,7 +2,6 @@
 
 import asyncio
 import multiprocessing as mp
-import struct
 import time
 
 import pytest
@@ -44,9 +43,7 @@ def _server(port, ready, cfg):
                     return p
             return None
 
-        async with websockets.serve(
-            echo, "127.0.0.1", port, select_subprotocol=select_subprotocol
-        ):
+        async with websockets.serve(echo, "127.0.0.1", port, select_subprotocol=select_subprotocol):
             ready.set()
             await asyncio.Future()
 
@@ -164,7 +161,7 @@ def test_receive_timeout_raises(server):
         try:
             await ws.recv()
             raise AssertionError("expected TimeoutError")
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             elapsed = time.perf_counter() - t0
             assert 0.25 < elapsed < 1.0, f"timeout off: {elapsed}s"
         ws.close()
@@ -174,10 +171,7 @@ def test_receive_timeout_raises(server):
 
 def test_fragmented_message_assembled():
     """Hand-craft a fragmented binary message and ensure client reassembles it."""
-    import multiprocessing as mp
-    import os
     import socket as _s
-    import struct as _st
     import threading
 
     # Tiny ad-hoc WS server that accepts one connection and sends a fragmented
@@ -205,8 +199,7 @@ def test_fragmented_message_assembled():
         key = key_line.split(":", 1)[1].strip()
         accept = base64.b64encode(sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
         conn.sendall(
-            f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode()
+            f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode()
         )
         # Wait for any incoming (client sends something) — then reply with fragments
         conn.recv(4096)
@@ -236,7 +229,6 @@ def test_fragmented_message_assembled():
 
 def test_socks5_proxy_tunnelled_handshake(server):
     """Connect to the echo server THROUGH a minimal in-proc SOCKS5 proxy."""
-    import socket as _s
     import threading
 
     from tests.bench_socks5_handshake import _serve_socks5  # reuse the no-auth proxy
@@ -394,7 +386,7 @@ def test_connect_timeout_on_unreachable():
         try:
             await connect("ws://192.0.2.1:9999", connect_timeout=0.3)
             raise AssertionError("expected timeout")
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             elapsed = time.perf_counter() - t0
             # Should unblock well before the default OS connect timeout (~75s).
             assert elapsed < 2.0, f"timeout didn't fire: {elapsed}s"

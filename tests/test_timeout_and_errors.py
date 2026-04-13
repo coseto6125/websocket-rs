@@ -32,9 +32,7 @@ def test_sync_connect_timeout():
     # 192.0.2.1 is TEST-NET, guaranteed to be unreachable (RFC 5737)
     start = time.perf_counter()
     try:
-        with websocket_rs.sync.client.ClientConnection(
-            "ws://192.0.2.1:9999", connect_timeout=1.0
-        ) as ws:
+        with websocket_rs.sync.client.ClientConnection("ws://192.0.2.1:9999", connect_timeout=1.0) as ws:
             pass
         assert False, "Should have raised"
     except TimeoutError:
@@ -74,9 +72,7 @@ def test_sync_send_after_close():
 
 def test_sync_recv_timeout():
     """recv should raise TimeoutError after receive_timeout."""
-    with websocket_rs.sync.client.ClientConnection(
-        "ws://localhost:8766", receive_timeout=0.5
-    ) as ws:
+    with websocket_rs.sync.client.ClientConnection("ws://localhost:8766", receive_timeout=0.5) as ws:
         ws.send("hello")
         ws.recv()  # consume echo
         start = time.perf_counter()
@@ -104,9 +100,7 @@ async def test_async_send_after_close():
 
 async def test_async_recv_timeout():
     """Async: recv should raise TimeoutError."""
-    ws = websocket_rs.async_client.ClientConnection(
-        "ws://localhost:8766", receive_timeout=0.5
-    )
+    ws = websocket_rs.async_client.ClientConnection("ws://localhost:8766", receive_timeout=0.5)
     async with ws:
         await ws.send("hello")
         await ws.recv()
@@ -123,9 +117,7 @@ async def test_async_connect_timeout():
     """Async: connect_timeout should raise TimeoutError."""
     start = time.perf_counter()
     try:
-        ws = websocket_rs.async_client.ClientConnection(
-            "ws://192.0.2.1:9999", connect_timeout=1.0
-        )
+        ws = websocket_rs.async_client.ClientConnection("ws://192.0.2.1:9999", connect_timeout=1.0)
         async with ws:
             pass
         assert False, "Should have raised"
