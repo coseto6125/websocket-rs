@@ -1653,7 +1653,12 @@ fn connect<'py>(
         #[allow(clippy::arc_with_non_send_sync)]
         state: Arc::new(RefCell::new(State {
             transport: None,
-            buf: BytesMut::with_capacity(16384),
+            // Buffers start empty — first send / recv / fragment triggers
+            // growth via the existing `reserve()` paths. Saves ~130 KB/conn
+            // for connections that stay idle (notification listeners,
+            // long-poll style fan-out). Cost: one-time alloc + page faults
+            // on the first message (~5 μs); not visible past warmup.
+            buf: BytesMut::new(),
             handshake_done: false,
             handshake_fut: None,
             expected_accept: String::new(),
@@ -1664,9 +1669,9 @@ fn connect<'py>(
             closed: false,
             paused: false,
             buf_known_empty: false,
-            mask_pool: Vec::with_capacity(256),
-            send_buf: Vec::with_capacity(65536 + 14),
-            recv_buf: Vec::with_capacity(65536 + 14),
+            mask_pool: Vec::new(),
+            send_buf: Vec::new(),
+            recv_buf: Vec::new(),
             recv_pos: 0,
             next_frame_needed: None,
             write_queue: VecDeque::new(),
