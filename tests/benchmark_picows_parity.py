@@ -59,7 +59,7 @@ except ImportError:
 
 
 PORT = 8833
-SIZES = (256, 8 * 1024, 100 * 1024, 2 * 1024 * 1024)
+SIZES = (256, 8 * 1024, 100 * 1024, 1024 * 1024)
 DURATION = float(os.environ.get("DURATION", "10"))
 WARMUP = 50
 # Discarded timing pre-pass per cell: warms Python 3.13 bytecode specialization,

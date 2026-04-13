@@ -23,6 +23,11 @@
 每個測試組合皆有 1 秒的丟棄前置暖身（warm Python 3.13 bytecode specialization、
 mimalloc 堆、配置器路徑及任何首個大 frame 的慢路徑），再進入 10 秒實際計時。
 
+**Payload 大小**（256 B / 8 KB / 100 KB / 1 MB）：1 MB 是 production 環境下
+單一 WebSocket frame 的真實上限 — Cloudflare 對所有方案硬性限制 WS 訊息
+≤ 1 MB，多數 hosted WS 服務（API Gateway、SignalR）也設 1 MB 或更低。
+更大的 payload 只是壓測 framework 極限，與真實用戶情境無關。
+
 ### 對 tokio-tungstenite server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |

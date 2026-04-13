@@ -26,6 +26,12 @@ Each cell does a 1-second discarded pre-pass (warms Python 3.13 bytecode
 specialization, mimalloc heaps, allocator paths, and any first-large-frame
 slow paths) before the 10-second timed measurement.
 
+**Payload sizes** (256 B / 8 KB / 100 KB / 1 MB): 1 MB is the upper realistic
+bound for a single WebSocket frame in production — Cloudflare hard-caps WS
+messages at 1 MB across all plans and most managed WS services
+(API Gateway, SignalR) cap at 1 MB or less. Larger payloads only stress
+framework limits, not real-world workloads.
+
 ### Against tokio-tungstenite server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
