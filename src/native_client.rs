@@ -20,7 +20,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PyString};
+use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
 
@@ -97,6 +97,12 @@ struct State {
     paused: bool,
     /// Frames buffered while paused; drained on resume_writing.
     write_queue: VecDeque<Py<PyBytes>>,
+    /// asyncio BufferedProtocol receive buffer. Python-side bytearray exposed
+    /// to asyncio via memoryview so it writes directly into our memory without
+    /// constructing a bytes object per callback.
+    recv_ba: Option<Py<PyByteArray>>,
+    /// Byte offset in recv_ba where asyncio will write the next chunk.
+    recv_ba_write_pos: usize,
 }
 
 /// WebSocket client running as an asyncio.Protocol implementation in Rust.
@@ -216,44 +222,84 @@ impl NativeClient {
             }
         }
 
-        // Parse any frames in buffer.
-        loop {
-            let Some((opcode, plen, hdr)) = parse_header(&state.buf) else {
-                break;
-            };
-            if state.buf.len() < hdr + plen {
-                break;
-            }
-            // Drain header
-            let total = hdr + plen;
-            match opcode {
-                0x1 | 0x2 => {
-                    // Single memcpy: straight from buf slice into a PyBytes.
-                    // Previous path did buf -> Bytes -> PyBytes (two memcpys).
-                    let result = PyBytes::new(py, &state.buf[hdr..total]).unbind();
-                    state.buf.drain(..total);
-                    Self::deliver_pybytes(py, &mut state, result)?;
-                }
-                0x8 => {
-                    state.buf.drain(..total);
-                    state.closed = true;
-                    Self::fail_all_pending(py, &mut state, "Connection closed by peer");
-                    if let Some(t) = state.transport.as_ref() {
-                        let tb = t.bind(py);
-                        let _ = tb.call_method0("close");
-                    }
-                    break;
-                }
-                // 0x9 ping / 0xA pong: ignored for MVP (server-side echoes not expected)
-                0x0 | 0x9 | 0xA => {
-                    state.buf.drain(..total);
-                }
-                _ => {
-                    state.buf.drain(..total);
-                }
-            }
+        drop(state);
+        self.process_buffered_frames(py)
+    }
+
+    // ---- asyncio.BufferedProtocol interface (preferred path on uvloop) ----
+    //
+    // uvloop and CPython's asyncio both prefer BufferedProtocol when get_buffer /
+    // buffer_updated are present — they write bytes directly into a memoryview we
+    // hand out, skipping the `bytes` object allocation that data_received incurs.
+
+    /// Return a writable memoryview into our internal bytearray where asyncio
+    /// should place the next chunk of bytes. Grows the bytearray if necessary.
+    fn get_buffer<'py>(&self, py: Python<'py>, size_hint: isize) -> PyResult<Bound<'py, PyAny>> {
+        let want = size_hint.max(16384) as usize + 1024;
+        let mut state = self.state.lock();
+
+        // Lazy-init the bytearray on first call.
+        let existing_len = if let Some(ba) = state.recv_ba.as_ref() {
+            ba.bind(py).len()
+        } else {
+            let ba = PyByteArray::new_with(py, 64 * 1024, |_| Ok(()))?;
+            state.recv_ba = Some(ba.unbind());
+            64 * 1024
+        };
+
+        let needed = state.recv_ba_write_pos + want;
+        if existing_len < needed {
+            // Extend bytearray with zeros. Use Python-side `extend`.
+            let ba = state.recv_ba.as_ref().unwrap().bind(py);
+            let zeros = PyByteArray::new_with(py, needed - existing_len, |_| Ok(()))?;
+            ba.call_method1("extend", (zeros,))?;
         }
-        Ok(())
+
+        let ba_ref = state.recv_ba.as_ref().unwrap().clone_ref(py);
+        let start = state.recv_ba_write_pos as isize;
+        drop(state);
+        let ba_bound = ba_ref.bind(py);
+        let mv = py
+            .import("builtins")?
+            .getattr("memoryview")?
+            .call1((ba_bound,))?;
+        let slice = PySlice::new(py, start, isize::MAX, 1);
+        mv.get_item(slice)
+    }
+
+    /// Called by asyncio after it writes `nbytes` into the memoryview we handed out.
+    fn buffer_updated(&self, py: Python<'_>, nbytes: isize) -> PyResult<()> {
+        let nbytes = nbytes as usize;
+        if nbytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.state.lock();
+        let write_start = state.recv_ba_write_pos;
+        state.recv_ba_write_pos += nbytes;
+
+        // Copy the newly-written bytes from the bytearray into state.buf so the
+        // existing parse logic (which owns a Vec<u8>) can run unchanged. This still
+        // avoids the per-callback `bytes` object that vanilla data_received
+        // materialises in asyncio-land.
+        let ba_ref = state.recv_ba.as_ref().unwrap().clone_ref(py);
+        let ba_bound = ba_ref.bind(py);
+        // PyByteArray::as_bytes is unsafe: the data pointer is valid while we hold the GIL
+        // and don't mutate the bytearray concurrently; both hold here.
+        let slice = unsafe { ba_bound.as_bytes() };
+        state
+            .buf
+            .extend_from_slice(&slice[write_start..write_start + nbytes]);
+
+        // If the bytearray's consumed bytes are large, reset write_pos back to 0 so
+        // we don't grow it unboundedly.
+        if state.recv_ba_write_pos > 1 << 20 {
+            state.recv_ba_write_pos = 0;
+        }
+        drop(state);
+
+        // Reuse the same parse path data_received uses. We pass an empty slice since
+        // the data is already in state.buf.
+        self.process_buffered_frames(py)
     }
 
     /// Called by asyncio transport when its send buffer crosses the high-water mark.
@@ -414,6 +460,75 @@ impl NativeClient {
 
 // Helpers (non-pymethod)
 impl NativeClient {
+    /// Parse and dispatch all complete frames currently sitting in state.buf.
+    /// Also completes the HTTP/101 handshake on first invocation.
+    fn process_buffered_frames(&self, py: Python<'_>) -> PyResult<()> {
+        let mut state = self.state.lock();
+
+        if !state.handshake_done {
+            let Some(end) = find_header_end(&state.buf) else {
+                return Ok(());
+            };
+            let headers = String::from_utf8_lossy(&state.buf[..end]);
+            let expected = state.expected_accept.clone();
+            let matched = headers.lines().any(|l| {
+                l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
+                    && l.contains(&expected)
+            });
+            state.buf.drain(..end);
+            if !matched {
+                if let Some(fut) = state.handshake_fut.take() {
+                    let fut_b = fut.bind(py);
+                    let exc = PyConnectionError::new_err("WebSocket handshake failed");
+                    let _ = fut_b.call_method1("set_exception", (exc,));
+                }
+                return Ok(());
+            }
+            state.handshake_done = true;
+            if let Some(fut) = state.handshake_fut.take() {
+                let fut_b = fut.bind(py);
+                if !fut_b
+                    .call_method0("done")?
+                    .extract::<bool>()
+                    .unwrap_or(false)
+                {
+                    let _ = fut_b.call_method1("set_result", (py.None(),));
+                }
+            }
+        }
+
+        loop {
+            let Some((opcode, plen, hdr)) = parse_header(&state.buf) else {
+                break;
+            };
+            if state.buf.len() < hdr + plen {
+                break;
+            }
+            let total = hdr + plen;
+            match opcode {
+                0x1 | 0x2 => {
+                    let result = PyBytes::new(py, &state.buf[hdr..total]).unbind();
+                    state.buf.drain(..total);
+                    Self::deliver_pybytes(py, &mut state, result)?;
+                }
+                0x8 => {
+                    state.buf.drain(..total);
+                    state.closed = true;
+                    Self::fail_all_pending(py, &mut state, "Connection closed by peer");
+                    if let Some(t) = state.transport.as_ref() {
+                        let tb = t.bind(py);
+                        let _ = tb.call_method0("close");
+                    }
+                    break;
+                }
+                _ => {
+                    state.buf.drain(..total);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn deliver_pybytes(py: Python<'_>, state: &mut State, payload: Py<PyBytes>) -> PyResult<()> {
         if let Some(fut) = state.pending_recv.pop_front() {
             let fb = fut.bind(py);
@@ -475,6 +590,8 @@ fn connect<'py>(
             closed: false,
             paused: false,
             write_queue: VecDeque::new(),
+            recv_ba: None,
+            recv_ba_write_pos: 0,
         })),
     };
     let state_arc = client.state.clone();
