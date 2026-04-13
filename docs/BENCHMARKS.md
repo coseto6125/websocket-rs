@@ -190,16 +190,19 @@ or low-latency LAN deployments, leave it off.
 
 | Workload | Winner | Gap |
 |----------|---|---|
-| RR, any size, plain TCP | websocket-rs ~= picows | <5% |
-| RPS throughput (TCP), 256 B–100 KB | ws-rs sync | +2–18% vs picows |
-| RPS throughput (TCP), 1 MB | ws-rs async | tied with picows |
-| RPS throughput (TLS), 256 B–100 KB | ws-rs sync | +18–37% vs picows; +30–65% vs websockets/aiohttp |
+| RR latency, 256 B–4 KB, plain TCP | tied | within 1–3 µs |
+| RR latency, 16 KB+, plain TCP | picows | 3–5 µs lower per RTT (Cython cdef vs PyO3) |
+| RPS throughput (TCP), 256 B–100 KB | ws-rs sync | +3–14% vs picows |
+| RPS throughput (TCP), 1 MB | ws-rs async | tied with picows (4.2k = 4.2k) |
+| RPS throughput (TLS), 256 B–100 KB | ws-rs sync | +18–37% vs picows; +22–65% vs websockets/aiohttp |
 | RPS throughput (TLS), 1 MB | picows | +7% over ws-rs (1.5k vs 1.4k); ws-rs ties aiohttp/websockets |
-| Pipelined, 512 B / 4 KB / 16 KB / 64 KB | websocket-rs | mean +14–25% vs picows |
-| vs websockets/aiohttp, all cells | websocket-rs | +15–65% RPS |
-| vs websocket-client, 100 KB | websocket-rs | ~2× RPS |
-| vs websocket-client, 1 MB | websocket-rs | 3× RPS |
-| Over real WAN (Postman Echo wss://) | all clients ~= | <1% (network dominates) |
+| Pipelined latency, 512 B – 64 KB | websocket-rs | mean +14–21% vs picows (best path) |
+| vs websockets/aiohttp, plain TCP non-1MB | websocket-rs | +15–65% RPS |
+| vs websockets/aiohttp, TLS 1 MB | tied | all four within 7% |
+| vs websocket-client, 100 KB | websocket-rs | 2.4× RPS |
+| vs websocket-client, 1 MB plain TCP | websocket-rs | 8× RPS |
+| Memory per idle conn | websocket-rs | 9 KB vs picows ~50 KB (5–6× lighter) |
+| Over real WAN (Postman Echo wss://) | all clients ~= | <1% (network RT dominates) |
 
 ## 6. Reproduce
 

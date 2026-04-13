@@ -182,16 +182,19 @@ miniz_oxide）。測試對 Python `websockets` server（內建
 
 | 工作負載 | 勝者 | 差距 |
 |----------|---|---|
-| RR，任意大小，純 TCP | websocket-rs ~= picows | <5% |
-| RPS 吞吐量（TCP），256 B–100 KB | ws-rs sync | 對 picows +2–18% |
-| RPS 吞吐量（TCP），1 MB | ws-rs async | 與 picows 並列 |
-| RPS 吞吐量（TLS），256 B–100 KB | ws-rs sync | 對 picows +18–37%；對 websockets/aiohttp +30–65% |
+| RR 延遲，256 B–4 KB，純 TCP | 並列 | 1–3 µs 內 |
+| RR 延遲，16 KB+，純 TCP | picows | 每筆 RTT 低 3–5 µs（Cython cdef vs PyO3） |
+| RPS 吞吐量（TCP），256 B–100 KB | ws-rs sync | 對 picows +3–14% |
+| RPS 吞吐量（TCP），1 MB | ws-rs async | 與 picows 並列（4.2k = 4.2k） |
+| RPS 吞吐量（TLS），256 B–100 KB | ws-rs sync | 對 picows +18–37%；對 websockets/aiohttp +22–65% |
 | RPS 吞吐量（TLS），1 MB | picows | 對 ws-rs +7%（1.5k vs 1.4k）；ws-rs 與 aiohttp/websockets 並列 |
-| Pipelined，512 B / 4 KB / 16 KB / 64 KB | websocket-rs | mean +14–25% vs picows |
-| 對 websockets/aiohttp，所有測試組合 | websocket-rs | RPS +15–65% |
-| 對 websocket-client，100 KB | websocket-rs | RPS ~2× |
-| 對 websocket-client，1 MB | websocket-rs | RPS 7–10× |
-| 真實 WAN（Postman Echo wss://） | 所有客戶端 ~= | <1%（網路主導） |
+| Pipelined 延遲，512 B – 64 KB | websocket-rs | best path mean 對 picows +14–21% |
+| 對 websockets/aiohttp，純 TCP 非 1MB | websocket-rs | RPS +15–65% |
+| 對 websockets/aiohttp，TLS 1 MB | 並列 | 四方都在 7% 內 |
+| 對 websocket-client，100 KB | websocket-rs | RPS 2.4× |
+| 對 websocket-client，純 TCP 1 MB | websocket-rs | RPS 8× |
+| 每條 idle 連線記憶體 | websocket-rs | 9 KB vs picows ~50 KB（輕 5-6 倍） |
+| 真實 WAN（Postman Echo wss://） | 所有客戶端 ~= | <1%（網路 RT 主導） |
 
 ## 6. 重現方式
 
