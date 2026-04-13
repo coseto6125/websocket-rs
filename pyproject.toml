@@ -99,4 +99,5 @@ dev = [
     # published and the native crates use Unix-only fd primitives.
     "rloop>=0.2.0; sys_platform == 'linux'",
     "granian>=2.7.3; sys_platform != 'win32'",
+    "picows>=1.18.0; sys_platform != 'win32'",
 ]
