@@ -173,10 +173,10 @@ fn ready_fast_err<'py>(py: Python<'py>, err: PyErr) -> PyResult<Bound<'py, PyAny
 
 #[derive(Debug)]
 enum Command {
-    Text(String),
-    Binary(Vec<u8>),
-    Ping(Vec<u8>),
-    Pong(Vec<u8>),
+    Text(Utf8Bytes),
+    Binary(Bytes),
+    Ping(Bytes),
+    Pong(Bytes),
     Close,
 }
 
@@ -208,8 +208,8 @@ async fn start_ws_task<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (tx_cmd_val, mut rx_cmd) = mpsc::channel::<Command>(64);
-    let (tx_msg, rx_msg_val) = mpsc::channel::<Result<Message, String>>(64);
+    let (tx_cmd_val, mut rx_cmd) = mpsc::channel::<Command>(256);
+    let (tx_msg, rx_msg_val) = mpsc::channel::<Result<Message, String>>(256);
 
     Python::attach(|py| {
         let mut ws_mut = slf_ptr.bind(py).borrow_mut();
@@ -224,18 +224,29 @@ async fn start_ws_task<S>(
             tokio::select! {
                 cmd = rx_cmd.recv() => {
                     match cmd {
-                        Some(cmd) => {
+                        Some(first) => {
                             let mut close_requested = false;
-                            match cmd {
-                                Command::Text(t) => { if sink.send(Message::Text(Utf8Bytes::from(t))).await.is_err() { break; } }
-                                Command::Binary(b) => { if sink.send(Message::Binary(Bytes::from(b))).await.is_err() { break; } }
-                                Command::Ping(d) => { if sink.send(Message::Ping(Bytes::from(d))).await.is_err() { break; } }
-                                Command::Pong(d) => { if sink.send(Message::Pong(Bytes::from(d))).await.is_err() { break; } }
-                                Command::Close => {
-                                    let _ = sink.close().await;
-                                    close_requested = true;
+                            // Feed first command, then drain all pending without flushing — single flush at end
+                            // batches syscalls for pipelined workloads.
+                            let mut current = Some(first);
+                            let mut feed_err = false;
+                            loop {
+                                let Some(cmd) = current.take() else { break };
+                                match cmd {
+                                    Command::Text(t) => { if sink.feed(Message::Text(t)).await.is_err() { feed_err = true; break; } }
+                                    Command::Binary(b) => { if sink.feed(Message::Binary(b)).await.is_err() { feed_err = true; break; } }
+                                    Command::Ping(d) => { if sink.feed(Message::Ping(d)).await.is_err() { feed_err = true; break; } }
+                                    Command::Pong(d) => { if sink.feed(Message::Pong(d)).await.is_err() { feed_err = true; break; } }
+                                    Command::Close => {
+                                        let _ = sink.close().await;
+                                        close_requested = true;
+                                        break;
+                                    }
                                 }
+                                current = rx_cmd.try_recv().ok();
                             }
+                            if feed_err { break; }
+                            if !close_requested && sink.flush().await.is_err() { break; }
                             if close_requested {
                                 while let Some(msg) = stream.next().await {
                                     match msg {
@@ -363,10 +374,12 @@ impl AsyncClientConnection {
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
 
-        let command = if let Ok(s) = message.cast::<pyo3::types::PyString>() {
-            Command::Text(s.to_str()?.to_owned())
+        let command = if let Ok(pb) = message.cast::<PyBytes>() {
+            Command::Binary(Bytes::copy_from_slice(pb.as_bytes()))
+        } else if let Ok(s) = message.cast::<pyo3::types::PyString>() {
+            Command::Text(Utf8Bytes::from(s.to_str()?))
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
-            Command::Binary(bytes)
+            Command::Binary(Bytes::from(bytes))
         } else {
             return Err(PyRuntimeError::new_err("Message must be str or bytes"));
         };
@@ -541,7 +554,7 @@ impl AsyncClientConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
-        let data = data.unwrap_or_default();
+        let data = Bytes::from(data.unwrap_or_default());
         match tx_cloned.try_send(Command::Ping(data)) {
             Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
@@ -582,7 +595,7 @@ impl AsyncClientConnection {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?
             .clone();
-        let data = data.unwrap_or_default();
+        let data = Bytes::from(data.unwrap_or_default());
         match tx_cloned.try_send(Command::Pong(data)) {
             Ok(_) => ready_fast(py, py.None()),
             Err(mpsc::error::TrySendError::Full(cmd)) => {
