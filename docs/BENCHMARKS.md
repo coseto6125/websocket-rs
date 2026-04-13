@@ -22,37 +22,36 @@ response, repeat; count completions in a fixed 10-second window. Higher RPS
 is better. Each cell is a fresh process + fresh connection + 50-message
 warmup before timing.
 
+Each cell does a 1-second discarded pre-pass (warms Python 3.13 bytecode
+specialization, mimalloc heaps, allocator paths, and any first-large-frame
+slow paths) before the 10-second timed measurement.
+
 ### Against tokio-tungstenite server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.4k** | 13.2k | 12.3k | 10.6k | 9.0k | 10.5k |
-| 8 KB  | **13.9k** | 12.6k | 12.2k | 10.8k | 9.2k | 9.7k |
-| 100 KB | **10.2k** | 9.9k | 9.7k | 8.7k | 7.6k | 4.4k |
-| 2 MB  | 1.0k¹ | **2.4k** | **2.4k** | 2.2k | 2.1k | 260 |
-
-¹ Cold-start anomaly: subsequent runs of the same cell measure 2.2–2.4k
-RPS (consistent with the other servers below). The first 2 MB request to a
-freshly-spawned tokio-tungstenite server appears to trigger a one-off slow
-path (likely TCP buffer auto-tune + first-large-frame allocator priming).
+| 256 B | **14.8k** | 13.2k | 12.5k | 10.7k | 9.6k | 10.6k |
+| 8 KB  | **13.2k** | 12.5k | 11.7k | 10.4k | 8.7k | 10.2k |
+| 100 KB | **10.3k** | 9.5k | 10.0k | 8.6k | 7.4k | 4.5k |
+| 2 MB  | 2.3k | **2.6k** | **2.6k** | 2.2k | 2.0k | 261 |
 
 ### Against fastwebsockets server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.2k** | 12.7k | 12.1k | 11.1k | 9.1k | 11.2k |
-| 8 KB  | **14.8k** | 13.0k | 13.0k | 11.4k | 9.5k | 9.6k |
-| 100 KB | **10.3k** | 10.1k | 10.3k | 8.9k | 7.8k | 4.4k |
-| 2 MB  | 2.1k | **2.6k** | 2.2k | 2.2k | 1.9k | 266 |
+| 256 B | **14.3k** | 13.0k | 12.5k | 11.1k | 9.2k | 10.9k |
+| 8 KB  | **13.7k** | 12.5k | 12.2k | 10.6k | 8.8k | 10.3k |
+| 100 KB | **11.2k** | 10.6k | 10.2k | 9.4k | 8.0k | 4.6k |
+| 2 MB  | 2.2k | **2.8k** | 2.4k | 2.2k | 2.0k | 261 |
 
 ### Against picows server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.7k** | 13.2k | 12.7k | 11.5k | 9.7k | 11.2k |
-| 8 KB  | **14.0k** | 12.8k | 11.4k | 10.0k | 8.5k | 9.8k |
-| 100 KB | **9.4k** | 9.2k | 9.0k | 8.2k | 7.1k | 4.4k |
-| 2 MB  | 1.9k | **2.1k** | 1.9k | 1.9k | 1.7k | 259 |
+| 256 B | **14.0k** | 12.4k | 12.1k | 10.4k | 8.9k | 10.7k |
+| 8 KB  | **13.2k** | 12.0k | 11.1k | 9.9k | 8.4k | 9.7k |
+| 100 KB | **9.6k** | 9.0k | 8.7k | 8.1k | 6.8k | 4.4k |
+| 2 MB  | 2.0k | **2.1k** | 1.9k | 1.8k | 1.6k | 254 |
 
 **Result**: websocket-rs leads in **all 24 matrix cells** across all three
 server architectures.

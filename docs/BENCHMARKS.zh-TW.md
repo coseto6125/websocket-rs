@@ -20,36 +20,35 @@
 10 秒視窗內計算完成數。RPS 越高越好。每一格皆為全新 process + 全新連線
 + 50 筆訊息暖身後再計時。
 
+每一格皆有 1 秒的丟棄前置暖身（warm Python 3.13 bytecode specialization、
+mimalloc 堆、配置器路徑及任何首個大 frame 的慢路徑），再進入 10 秒實際計時。
+
 ### 對 tokio-tungstenite server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B   | **14.4k** | 13.2k | 12.3k | 10.6k | 9.0k | 10.5k |
-| 8 KB    | **13.9k** | 12.6k | 12.2k | 10.8k | 9.2k | 9.7k  |
-| 100 KB  | **10.2k** | 9.9k  | 9.7k  | 8.7k  | 7.6k | 4.4k  |
-| 2 MB    | 1.0k¹     | **2.4k** | **2.4k** | 2.2k | 2.1k | 260 |
-
-¹ Cold-start 異常：同一格後續執行為 2.2–2.4k RPS（與其他 server 一致）。
-首次對新啟動的 tokio-tungstenite server 發送 2 MB 訊息會觸發一次性慢路徑
-（推測為 TCP buffer auto-tune + 首個大 frame 配置器初始化）。
+| 256 B   | **14.8k** | 13.2k | 12.5k | 10.7k | 9.6k | 10.6k |
+| 8 KB    | **13.2k** | 12.5k | 11.7k | 10.4k | 8.7k | 10.2k |
+| 100 KB  | **10.3k** | 9.5k  | 10.0k | 8.6k  | 7.4k | 4.5k  |
+| 2 MB    | 2.3k      | **2.6k** | **2.6k** | 2.2k | 2.0k | 261 |
 
 ### 對 fastwebsockets server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B   | **14.2k** | 12.7k | 12.1k | 11.1k | 9.1k | 11.2k |
-| 8 KB    | **14.8k** | 13.0k | 13.0k | 11.4k | 9.5k | 9.6k  |
-| 100 KB  | **10.3k** | 10.1k | 10.3k | 8.9k  | 7.8k | 4.4k  |
-| 2 MB    | 2.1k      | **2.6k** | 2.2k | 2.2k | 1.9k | 266 |
+| 256 B   | **14.3k** | 13.0k | 12.5k | 11.1k | 9.2k | 10.9k |
+| 8 KB    | **13.7k** | 12.5k | 12.2k | 10.6k | 8.8k | 10.3k |
+| 100 KB  | **11.2k** | 10.6k | 10.2k | 9.4k  | 8.0k | 4.6k  |
+| 2 MB    | 2.2k      | **2.8k** | 2.4k | 2.2k | 2.0k | 261 |
 
 ### 對 picows server
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B   | **14.7k** | 13.2k | 12.7k | 11.5k | 9.7k | 11.2k |
-| 8 KB    | **14.0k** | 12.8k | 11.4k | 10.0k | 8.5k | 9.8k  |
-| 100 KB  | **9.4k**  | 9.2k  | 9.0k  | 8.2k  | 7.1k | 4.4k  |
-| 2 MB    | 1.9k      | **2.1k** | 1.9k | 1.9k | 1.7k | 259 |
+| 256 B   | **14.0k** | 12.4k | 12.1k | 10.4k | 8.9k | 10.7k |
+| 8 KB    | **13.2k** | 12.0k | 11.1k | 9.9k  | 8.4k | 9.7k  |
+| 100 KB  | **9.6k**  | 9.0k  | 8.7k  | 8.1k  | 6.8k | 4.4k  |
+| 2 MB    | 2.0k      | **2.1k** | 1.9k | 1.8k | 1.6k | 254 |
 
 **結果**：websocket-rs 在三種 server 架構共 **24 格全部領先**。
 
