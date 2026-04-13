@@ -37,7 +37,7 @@ except ImportError:
 
 WINDOW = 100
 WARMUP = 200
-N = 1000
+N = 5000
 
 
 # ---------- Servers ----------
@@ -47,7 +47,13 @@ def start_rust_server(bin_name: str, port: int) -> subprocess.Popen:
     path = f"target/release/{bin_name}"
     if not os.path.exists(path):
         raise RuntimeError(f"{path} not built")
-    p = subprocess.Popen([path, str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Pin server to core 0 (client process pins itself to core 1 below) — same
+    # CCD on Ryzen 9950X for L3 sharing while avoiding contention.
+    p = subprocess.Popen(
+        ["taskset", "-c", "0", path, str(port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     import socket as _s
 
     for _ in range(50):
@@ -62,9 +68,15 @@ def start_rust_server(bin_name: str, port: int) -> subprocess.Popen:
 
 def _picows_echo_proc(port: int, ready):
     import asyncio
+    import os
 
     import uvloop
 
+    # Pin server to core 0 (matches Rust echo binaries).
+    try:
+        os.sched_setaffinity(0, {0})
+    except Exception:
+        pass
     uvloop.install()
     from picows import WSCloseCode, WSFrame, WSListener, WSMsgType, WSTransport, ws_create_server
 
@@ -257,6 +269,12 @@ async def run_against(server_label: str, port: int):
 
 
 async def main():
+    # Pin client (this process) to core 1; servers are pinned to core 0 above.
+    # Same CCD on Ryzen 9950X for L3 sharing without core-migration noise.
+    try:
+        os.sched_setaffinity(0, {1})
+    except Exception:
+        pass
     servers = [
         ("tokio-tungstenite", "rust", "ws_echo_server", 8830),
         ("fastwebsockets", "rust", "ws_echo_fastws", 8831),
