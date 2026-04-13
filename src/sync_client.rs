@@ -12,6 +12,44 @@ use crate::{
     DEFAULT_CLOSE_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY,
 };
 
+/// Cached rustls ClientConfig — built lazily on first TLS connect. Loads
+/// the system trust store via rustls-native-certs, then additionally
+/// trusts certs from `SSL_CERT_FILE` env var if set (matches OpenSSL's
+/// behavior — native-tls honored this; users with private CAs / self-
+/// signed certs in dev environments expect the env var to work).
+pub(crate) fn build_rustls_client_config() -> PyResult<std::sync::Arc<rustls::ClientConfig>> {
+    use std::sync::OnceLock;
+    static CONFIG: OnceLock<std::sync::Arc<rustls::ClientConfig>> = OnceLock::new();
+    if let Some(c) = CONFIG.get() {
+        return Ok(c.clone());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    if !native.errors.is_empty() {
+        return Err(PyConnectionError::new_err(format!(
+            "Failed to load native certs: {:?}",
+            native.errors
+        )));
+    }
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        let pem = std::fs::read(&path).map_err(|e| {
+            PyConnectionError::new_err(format!("SSL_CERT_FILE {} unreadable: {}", path, e))
+        })?;
+        for cert in rustls_pemfile::certs(&mut pem.as_slice()).flatten() {
+            let _ = roots.add(cert);
+        }
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let arc = std::sync::Arc::new(config);
+    let _ = CONFIG.set(arc.clone());
+    Ok(arc)
+}
+
 enum RecvResult {
     Text(String),
     Binary(Vec<u8>),
@@ -20,7 +58,7 @@ enum RecvResult {
 /// Type-erased stream for WebSocket (avoids generic type in pyclass)
 enum WsStream {
     Plain(TcpStream),
-    Tls(Box<native_tls::TlsStream<TcpStream>>),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
 }
 
 impl Read for WsStream {
@@ -143,14 +181,17 @@ impl SyncClientConnection {
             let _ = tcp.set_read_timeout(Some(connect_dur));
             let _ = tcp.set_write_timeout(Some(connect_dur));
 
-            // Build stream (plain or TLS) and do WS handshake
+            // Build stream (plain or TLS) and do WS handshake. TLS via
+            // rustls (pure Rust, no OpenSSL — avoids global-state conflict
+            // with Python's _ssl when both libraries co-exist in process).
             let ws_stream = if is_tls {
-                let connector = native_tls::TlsConnector::builder()
-                    .build()
-                    .map_err(|e| PyConnectionError::new_err(format!("TLS build failed: {}", e)))?;
-                let tls = connector.connect(&host, tcp).map_err(|e| {
-                    PyConnectionError::new_err(format!("TLS handshake failed: {}", e))
+                let config = build_rustls_client_config()?;
+                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                    .map_err(|e| PyConnectionError::new_err(format!("Invalid server name: {}", e)))?;
+                let conn = rustls::ClientConnection::new(config, server_name).map_err(|e| {
+                    PyConnectionError::new_err(format!("TLS init failed: {}", e))
                 })?;
+                let tls = rustls::StreamOwned::new(conn, tcp);
                 WsStream::Tls(Box::new(tls))
             } else {
                 WsStream::Plain(tcp)

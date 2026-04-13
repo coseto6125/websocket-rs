@@ -186,7 +186,7 @@ enum WsConnectResult {
     Proxy(
         Box<
             tokio_tungstenite::WebSocketStream<
-                tokio_native_tls::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>,
+                tokio_rustls::client::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>,
             >,
         >,
     ),
@@ -737,12 +737,14 @@ impl AsyncClientConnection {
                         }
 
                         if target_url.scheme() == "wss" {
-                            let cx = native_tls::TlsConnector::builder()
-                                .build()
-                                .map_err(|e| format!("TLS connector build failed: {}", e))?;
-                            let cx = tokio_native_tls::TlsConnector::from(cx);
+                            let config = crate::sync_client::build_rustls_client_config()
+                                .map_err(|e| format!("rustls config: {}", e))?;
+                            let server_name =
+                                rustls::pki_types::ServerName::try_from(host.clone())
+                                    .map_err(|e| format!("Invalid server name: {}", e))?;
+                            let cx = tokio_rustls::TlsConnector::from(config);
                             let tls_stream =
-                                cx.connect(&host, socks_stream).await.map_err(|e| {
+                                cx.connect(server_name, socks_stream).await.map_err(|e| {
                                     format!("TLS handshake through proxy failed: {}", e)
                                 })?;
 
@@ -774,12 +776,13 @@ impl AsyncClientConnection {
                                 *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }
-                        MaybeTlsStream::NativeTls(s) => {
-                            let _ = s.get_ref().get_ref().get_ref().set_nodelay(tcp_nodelay);
-                            if let Ok(addr) = s.get_ref().get_ref().get_ref().local_addr() {
+                        MaybeTlsStream::Rustls(s) => {
+                            let tcp = s.get_ref().0;
+                            let _ = tcp.set_nodelay(tcp_nodelay);
+                            if let Ok(addr) = tcp.local_addr() {
                                 *local_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
-                            if let Ok(addr) = s.get_ref().get_ref().get_ref().peer_addr() {
+                            if let Ok(addr) = tcp.peer_addr() {
                                 *remote_addr.write() = Some((addr.ip().to_string(), addr.port()));
                             }
                         }

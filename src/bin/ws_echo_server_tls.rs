@@ -1,12 +1,14 @@
 //! TLS variant of ws_echo_server. Loads cert.pem + key.pem from
-//! tests/certs/ and serves wss:// on the given port. Used to benchmark
-//! WebSocket clients under realistic production transport (rustls/openssl
-//! handshake + AES-GCM encryption) instead of plain TCP loopback.
+//! tests/certs/ and serves wss:// on the given port. Uses rustls (pure
+//! Rust, no OpenSSL) to avoid the global-state conflict that
+//! native-tls + Python's _ssl produces in the same process.
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use native_tls::{Identity, TlsAcceptor};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -16,15 +18,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .and_then(|a| a.parse().ok())
         .unwrap_or(8821);
+
+    // Load PEM cert + key (rustls accepts these natively via rustls-pemfile).
     let cert_pem = std::fs::read("tests/certs/cert.pem")?;
     let key_pem = std::fs::read("tests/certs/key.pem")?;
-    let identity = Identity::from_pkcs8(&cert_pem, &key_pem)?;
-    let acceptor = TlsAcceptor::new(identity)?;
-    let acceptor = tokio_native_tls::TlsAcceptor::from(acceptor);
+
+    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err("no certs in cert.pem".into());
+    }
+
+    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_pem.as_slice())?
+        .ok_or("no private key in key.pem")?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse()?;
     let listener = TcpListener::bind(&addr).await?;
-    eprintln!("ws_echo_server_tls listening on {addr}");
+    eprintln!("ws_echo_server_tls (rustls) listening on {addr}");
 
     loop {
         let (stream, _) = listener.accept().await?;

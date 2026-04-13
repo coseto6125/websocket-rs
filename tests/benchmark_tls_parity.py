@@ -214,11 +214,7 @@ def bench_wsclient_sync(size: int, duration: float) -> int:
 CLIENTS: list[tuple[str, bool, object]] = [
     ("ws-rs-async", True, bench_native),
     ("ws-rs-sync", True, bench_native_sync),
-    # picows TLS segfaults under sustained load in our matrix harness
-    # (single isolated runs work — likely a state-corruption bug in
-    # picows's wss path under WARMUP=50 + tight RR loop). Skipped to keep
-    # the rest of the matrix runnable. Tracked as a workaround, not a fix.
-    # ("picows", PICOWS, bench_picows if PICOWS else None),
+    ("picows", PICOWS, bench_picows if PICOWS else None),
     ("websockets", WEBSOCKETS, bench_websockets if WEBSOCKETS else None),
     ("aiohttp", AIOHTTP, bench_aiohttp if AIOHTTP else None),
     ("ws-client", WSCLIENT, bench_wsclient_sync if WSCLIENT else None),
@@ -271,7 +267,7 @@ async def main():
     try:
         await asyncio.sleep(0.3)
         enabled = [(name, fn) for name, ok, fn in CLIENTS if ok and fn is not None]
-        print(f"=== Server: tokio-tungstenite (TLS, native-tls) ===")
+        print(f"=== Server: tokio-tungstenite (TLS, rustls) ===")
         header = f"{'size':>8} " + " ".join(f"{name:>11}" for name, _ in enabled)
         print(header)
         print("-" * len(header))
