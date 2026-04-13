@@ -1,9 +1,10 @@
 # Migrating to `websocket_rs.connect`
 
 The canonical high-performance entry point is now `websocket_rs.connect`,
-backed by the new asyncio.Protocol-native client (runs on the asyncio loop
-thread, AVX2-vectorised masking, zero-copy recv). It beats picows by
-23–69 % on pipelined throughput against neutral third-party servers.
+backed by the new asyncio.Protocol-native client: runs on the asyncio loop
+thread, AVX2-vectorised masking, zero-copy recv via a buffer-protocol
+`WSMessage`. Both throughput and tail latency improve substantially over
+the legacy tokio-backed path.
 
 The old `websocket_rs.async_client.connect` still works but is deprecated
 and will be removed in 2.0.
@@ -36,7 +37,7 @@ async def handler():
 
 | Old API                            | New API                              | Why |
 |------------------------------------|--------------------------------------|-----|
-| `await ws.send(msg)`               | `ws.send(msg)` (sync)                | `transport.write` is already non-blocking; the `await` was pure overhead. Same pattern as picows. |
+| `await ws.send(msg)`               | `ws.send(msg)` (sync)                | `transport.write` is already non-blocking; the `await` was pure overhead. |
 | `msg = await ws.recv()` → `bytes`  | `msg = await ws.recv()` → `WSMessage`| `WSMessage` wraps a shared `Bytes` slice — zero memcpy on the hot path. Supports the buffer protocol. |
 | `isinstance(msg, bytes)` → `True`  | Use `isinstance(msg, (bytes, WSMessage))` or just `len(msg)` | `WSMessage` does not subclass `bytes` — any `bytes` subclass would require a forced copy. |
 | `msg[i:j]` → `bytes`               | `msg[i:j]` → `bytes`                 | Slicing still returns a real `bytes` (a short copy).  `memoryview(msg)[i:j]` stays zero-copy. |

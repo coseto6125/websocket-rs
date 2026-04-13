@@ -84,7 +84,7 @@ fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
         }
         _ => unreachable!(),
     };
-    // Server must NOT mask; we don't enforce here (picows/tungstenite both accept).
+    // Server must NOT mask; we don't enforce (most server libs accept anyway).
     Some((opcode, plen, hdr))
 }
 
@@ -121,7 +121,11 @@ struct State {
 /// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
 /// is already available in the backlog — saves one create_future + one set_result
 /// per call.
-#[pyclass(name = "_ReadyMessage", module = "websocket_rs.native_client", unsendable)]
+#[pyclass(
+    name = "_ReadyMessage",
+    module = "websocket_rs.native_client",
+    unsendable
+)]
 struct ReadyMessage {
     result: Option<PyResult<Py<PyAny>>>,
 }
@@ -294,7 +298,11 @@ impl WSMessage {
 ///
 /// Instances are produced by :func:`websocket_rs.native_client.connect` — direct
 /// construction via ``NativeClient()`` is unsupported.
-#[pyclass(name = "NativeClient", module = "websocket_rs.native_client", unsendable)]
+#[pyclass(
+    name = "NativeClient",
+    module = "websocket_rs.native_client",
+    unsendable
+)]
 pub struct NativeClient {
     state: Arc<Mutex<State>>,
 }
@@ -381,8 +389,8 @@ impl NativeClient {
 
         // Fast path: if our internal buf is empty and the handshake is already done,
         // parse frames straight out of `data` and only copy the tail (if any) back into
-        // buf. Servers like picows that deliver one frame per write hit this path and
-        // save a memcpy per callback.
+        // buf. Servers that deliver one frame per write hit this path and save a
+        // memcpy per callback.
         if state.handshake_done && state.buf.is_empty() {
             let mut off = 0usize;
             while let Some((opcode, plen, hdr)) = parse_header(&data[off..]) {
@@ -429,10 +437,9 @@ impl NativeClient {
             let headers = String::from_utf8_lossy(&state.buf[..end]);
             // Case-insensitive search for the accept key token.
             let expected = state.expected_accept.clone();
-            let matched = headers
-                .lines()
-                .any(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
-                    && l.contains(&expected));
+            let matched = headers.lines().any(|l| {
+                l.to_ascii_lowercase().starts_with("sec-websocket-accept:") && l.contains(&expected)
+            });
             state.buf.advance(end);
             if !matched {
                 // Fail handshake future
@@ -597,11 +604,12 @@ impl NativeClient {
         };
 
         let plen = payload.len();
-        let header_len = 2 + match plen {
-            0..=125 => 0,
-            126..=65535 => 2,
-            _ => 8,
-        } + 4; // 4-byte mask
+        let header_len =
+            2 + match plen {
+                0..=125 => 0,
+                126..=65535 => 2,
+                _ => 8,
+            } + 4; // 4-byte mask
         let total = header_len + plen;
 
         let mut mask_key = [0u8; 4];
@@ -807,12 +815,10 @@ impl NativeClient {
                 let lower = line.to_ascii_lowercase();
                 if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
                     matched = true;
-                } else if let Some(rest) = line
-                    .splitn(2, ':')
-                    .nth(1)
-                    .filter(|_| lower.starts_with("sec-websocket-protocol:"))
-                {
-                    subprotocol = Some(rest.trim().to_string());
+                } else if lower.starts_with("sec-websocket-protocol:") {
+                    if let Some((_, rest)) = line.split_once(':') {
+                        subprotocol = Some(rest.trim().to_string());
+                    }
                 }
             }
             state.buf.advance(end);
@@ -863,9 +869,8 @@ impl NativeClient {
                     if payload.len() >= 2 {
                         state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
                         if payload.len() > 2 {
-                            state.close_reason = Some(
-                                String::from_utf8_lossy(&payload[2..]).into_owned(),
-                            );
+                            state.close_reason =
+                                Some(String::from_utf8_lossy(&payload[2..]).into_owned());
                         }
                     }
                     state.closed = true;
@@ -883,7 +888,9 @@ impl NativeClient {
                     let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
                     if let Some(t) = transport {
                         let frame = encode_control_frame(0xA, &payload);
-                        let _ = t.bind(py).call_method1("write", (PyBytes::new(py, &frame),));
+                        let _ = t
+                            .bind(py)
+                            .call_method1("write", (PyBytes::new(py, &frame),));
                     }
                 }
                 0xA => {
@@ -926,7 +933,6 @@ impl NativeClient {
         }
     }
 }
-
 
 /// Connect to a ws:// or wss:// URI and return a NativeClient once the handshake completes.
 ///
@@ -1041,14 +1047,14 @@ fn connect<'py>(
 }
 
 fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
-    let (scheme, rest, default_port): (&str, &str, u16) = if let Some(r) = uri.strip_prefix("wss://")
-    {
-        ("wss", r, 443)
-    } else if let Some(r) = uri.strip_prefix("ws://") {
-        ("ws", r, 80)
-    } else {
-        return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
-    };
+    let (scheme, rest, default_port): (&str, &str, u16) =
+        if let Some(r) = uri.strip_prefix("wss://") {
+            ("wss", r, 443)
+        } else if let Some(r) = uri.strip_prefix("ws://") {
+            ("ws", r, 80)
+        } else {
+            return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
+        };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -1092,7 +1098,12 @@ async def _connect_helper(create_conn_coro, req_bytes, handshake_fut, client, co
         return await _asyncio.wait_for(_do(), timeout=connect_timeout)
     return await _do()
 "#;
-    let module = PyModule::from_code(py, std::ffi::CString::new(code)?.as_c_str(), c"helper.py", c"helper")?;
+    let module = PyModule::from_code(
+        py,
+        std::ffi::CString::new(code)?.as_c_str(),
+        c"helper.py",
+        c"helper",
+    )?;
     let helper = module.getattr("_connect_helper")?;
     let _ = CACHE.set(helper.clone().unbind());
     Ok(helper)

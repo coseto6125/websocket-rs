@@ -958,8 +958,9 @@ pub fn connect<'py>(
         "warn",
         (
             "websocket_rs.async_client.connect is deprecated: use \
-             websocket_rs.connect (or websocket_rs.native_client.connect) — \
-             2-16x faster, same async interface. async_client will be removed in 2.0.",
+             websocket_rs.connect (or websocket_rs.native_client.connect) \
+             for the asyncio.Protocol-native implementation. \
+             async_client will be removed in 2.0.",
             cat,
         ),
     )?;

@@ -13,9 +13,8 @@ Official async entry point:
 
 This thin re-export maps to :mod:`websocket_rs.native_client` which runs
 directly on the asyncio event loop (no tokio bridge, no cross-thread
-wakeup) and uses a Rust frame codec with AVX2-vectorised masking. In our
-benchmarks it beats picows by 23–69 % on pipelined throughput against
-neutral third-party servers.
+wakeup) and uses a Rust frame codec with AVX2-vectorised masking and
+zero-copy recv via a buffer-protocol ``WSMessage``.
 
 The legacy :mod:`websocket_rs.async_client` remains available for
 drop-in compatibility with older code but emits DeprecationWarning; it
