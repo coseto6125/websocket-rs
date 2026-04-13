@@ -92,6 +92,8 @@ dev = [
     "ruff>=0.1.0",
     "websocket",
     "uvloop>=0.22.1; sys_platform != 'win32'",
-    "rloop>=0.2.0",
-    "granian>=2.7.3",
+    # rloop + granian are optional benchmark-only deps; Windows wheels aren't
+    # published and the native crates use Unix-only fd primitives.
+    "rloop>=0.2.0; sys_platform == 'linux'",
+    "granian>=2.7.3; sys_platform != 'win32'",
 ]
