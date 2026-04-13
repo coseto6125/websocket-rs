@@ -21,8 +21,32 @@ name = "ws_echo_server"
 path = "benches/ws_echo_server.rs"
 required-features = ["echo-server-bin"]
 
+[[bin]]
+name = "ws_echo_fastws"
+path = "benches/ws_echo_fastws.rs"
+required-features = ["echo-server-bin"]
+
 [features]
-echo-server-bin = []
+echo-server-bin = ["dep:fastwebsockets", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+
+[dependencies.fastwebsockets]
+version = "0.10"
+features = ["upgrade"]
+optional = true
+
+[dependencies.hyper]
+version = "1"
+features = ["server", "http1"]
+optional = true
+
+[dependencies.hyper-util]
+version = "0.1"
+features = ["tokio"]
+optional = true
+
+[dependencies.http-body-util]
+version = "0.1"
+optional = true
 
 [dependencies]
 pyo3 = { version = "0.27.1", features = ["extension-module", "abi3-py312"] }
