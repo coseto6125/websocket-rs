@@ -186,6 +186,12 @@ struct State {
     /// `Vec::with_capacity()` allocation in the hot pipelined loop. Mirrors
     /// picows' `_write_buffer` MemoryBuffer.
     send_buf: Vec<u8>,
+    /// Reusable receive buffer exposed to uvloop via the BufferedProtocol
+    /// `get_buffer` / `buffer_updated` pair. uvloop writes kernel data here
+    /// directly, skipping the per-recv `bytes` object allocation that the
+    /// plain `data_received` path incurs. Sized to one large frame; grows on
+    /// demand if a single recv would overrun. Mirrors picows' `_read_buffer`.
+    recv_buf: Vec<u8>,
     /// Frames buffered while paused; drained on resume_writing.
     write_queue: VecDeque<Py<PyBytes>>,
     /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
@@ -679,6 +685,64 @@ impl NativeClient {
         s.transport_get_buf_size = get_buf_size;
         s.raw_fd = fd;
         Ok(())
+    }
+
+    /// asyncio BufferedProtocol: return a writable buffer for uvloop to recv
+    /// kernel data into directly (skips the per-recv `bytes` allocation that
+    /// the plain `data_received(bytes)` path incurs). uvloop ignores the
+    /// `_size_hint` (always passes 65536); we expose at least 64 KB so a full
+    /// large frame fits without resize.
+    fn get_buffer<'py>(&self, py: Python<'py>, _size_hint: isize) -> PyResult<Bound<'py, PyAny>> {
+        let mut st = self.state.borrow_mut();
+        const WANT: usize = 65536;
+        if st.recv_buf.capacity() < WANT {
+            let extra = WANT - st.recv_buf.capacity();
+            st.recv_buf.reserve(extra);
+        }
+        let cap = st.recv_buf.capacity();
+        // SAFETY: we are about to hand the entire capacity to uvloop as a
+        // writable region. The bytes between len() and capacity() are
+        // uninitialized; setting len = capacity is sound because we never
+        // *read* this region until `buffer_updated(nbytes)` tells us how many
+        // bytes uvloop wrote (i.e. initialized) — and even then we only
+        // expose the first `nbytes`.
+        unsafe {
+            st.recv_buf.set_len(cap);
+        }
+        let ptr = st.recv_buf.as_mut_ptr();
+        drop(st);
+        unsafe {
+            let mv = pyo3::ffi::PyMemoryView_FromMemory(
+                ptr as *mut std::ffi::c_char,
+                cap as pyo3::ffi::Py_ssize_t,
+                pyo3::ffi::PyBUF_WRITE,
+            );
+            if mv.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            Ok(Bound::from_owned_ptr(py, mv))
+        }
+    }
+
+    /// asyncio BufferedProtocol: uvloop wrote `nbytes` into the buffer we
+    /// returned from `get_buffer`. Parse those bytes through the same
+    /// pipeline `data_received` uses (handshake, fragments, deflate, etc.).
+    fn buffer_updated(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+        // SAFETY: take a raw pointer + len snapshot of `recv_buf` while
+        // holding only an immutable borrow, then drop the borrow before
+        // calling `data_received_inner` (which needs `borrow_mut()`). The
+        // pointer remains valid because `data_received_inner` only mutates
+        // `state.buf` / `state.backlog` etc — it does not touch `recv_buf`,
+        // so no realloc occurs and the slice stays live.
+        let (ptr, len) = {
+            let st = self.state.borrow();
+            debug_assert!(nbytes <= st.recv_buf.capacity());
+            (st.recv_buf.as_ptr(), nbytes.min(st.recv_buf.capacity()))
+        };
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let result = self.data_received_inner(py, slice);
+        self.flush_pending_callbacks(py)?;
+        result
     }
 
     fn data_received<'py>(&self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<()> {
@@ -1483,6 +1547,7 @@ fn connect<'py>(
             buf_known_empty: false,
             mask_pool: Vec::with_capacity(256),
             send_buf: Vec::with_capacity(65536 + 14),
+            recv_buf: Vec::with_capacity(65536 + 14),
             write_queue: VecDeque::new(),
             loop_ref: None,
             transport_write: None,
