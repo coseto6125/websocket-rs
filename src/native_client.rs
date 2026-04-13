@@ -17,8 +17,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use base64::Engine;
+use bytes::{Buf, Bytes, BytesMut};
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
@@ -86,12 +87,12 @@ fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
 
 struct State {
     transport: Option<Py<PyAny>>,
-    buf: Vec<u8>,
+    buf: BytesMut,
     handshake_done: bool,
     handshake_fut: Option<Py<PyAny>>,
     expected_accept: String,
     pending_recv: VecDeque<Py<PyAny>>,
-    backlog: VecDeque<Py<PyBytes>>,
+    backlog: VecDeque<Py<WSMessage>>,
     closed: bool,
     /// asyncio transport has passed its high-water mark — hold off on writes.
     paused: bool,
@@ -103,6 +104,131 @@ struct State {
     recv_ba: Option<Py<PyByteArray>>,
     /// Byte offset in recv_ba where asyncio will write the next chunk.
     recv_ba_write_pos: usize,
+}
+
+/// Zero-copy view over a received WebSocket frame payload.
+///
+/// Holds an Arc-shared slice into the underlying parse buffer — constructing
+/// one is O(1) regardless of payload size. Exposes the Python buffer protocol
+/// so ``memoryview(msg)``, ``struct.unpack_from``, ``msg[:N]`` slicing, and
+/// ``bytes(msg)`` all work as expected. ``bytes(msg)`` is the only path that
+/// materialises a copy.
+#[pyclass(name = "WSMessage", module = "websocket_rs.native_client", frozen)]
+pub struct WSMessage {
+    data: Bytes,
+}
+
+#[pymethods]
+impl WSMessage {
+    fn __len__(&self) -> usize {
+        self.data.len()
+    }
+
+    fn __bytes__<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.data)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("WSMessage(len={})", self.data.len())
+    }
+
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        key: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        if let Ok(idx) = key.extract::<isize>() {
+            let n = self.data.len() as isize;
+            let i = if idx < 0 { idx + n } else { idx };
+            if i < 0 || i >= n {
+                return Err(PyIndexError::new_err("WSMessage index out of range"));
+            }
+            return Ok(self.data[i as usize].into_pyobject(py)?.into_any());
+        }
+        if let Ok(slice) = key.cast::<PySlice>() {
+            let indices = slice.indices(self.data.len() as isize)?;
+            let (start, stop, step) = (indices.start, indices.stop, indices.step);
+            if step == 1 {
+                let (s, e) = (start.max(0) as usize, stop.max(0) as usize);
+                let e = e.min(self.data.len());
+                return Ok(PyBytes::new(py, &self.data[s..e]).into_any());
+            }
+            // Non-contiguous slice — materialise.
+            let mut out = Vec::new();
+            if step > 0 {
+                let mut i = start;
+                while i < stop {
+                    out.push(self.data[i as usize]);
+                    i += step;
+                }
+            } else {
+                let mut i = start;
+                while i > stop {
+                    out.push(self.data[i as usize]);
+                    i += step;
+                }
+            }
+            return Ok(PyBytes::new(py, &out).into_any());
+        }
+        Err(PyTypeError::new_err(
+            "WSMessage indices must be int or slice",
+        ))
+    }
+
+    fn __eq__(&self, other: Bound<'_, PyAny>) -> PyResult<bool> {
+        // bytes / bytearray / memoryview all compare as buffer
+        if let Ok(pb) = other.cast::<PyBytes>() {
+            return Ok(pb.as_bytes() == self.data.as_ref());
+        }
+        if let Ok(other_ws) = other.extract::<PyRef<WSMessage>>() {
+            return Ok(other_ws.data == self.data);
+        }
+        // Fallback: try buffer protocol
+        if let Ok(buf) = pyo3::buffer::PyBuffer::<u8>::get(&other) {
+            if let Some(slice) = buf.as_slice(other.py()) {
+                let as_u8: Vec<u8> = slice.iter().map(|c| c.get()).collect();
+                return Ok(as_u8 == self.data.as_ref());
+            }
+        }
+        Ok(false)
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.data.as_ref().hash(&mut h);
+        h.finish()
+    }
+
+    // ---- Python buffer protocol ----
+
+    /// Expose the underlying Bytes as a read-only Python buffer. Zero-copy.
+    #[allow(clippy::missing_safety_doc)]
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let bytes = &slf.data;
+        let ret = pyo3::ffi::PyBuffer_FillInfo(
+            view,
+            slf.as_ptr(),
+            bytes.as_ptr() as *mut std::os::raw::c_void,
+            bytes.len() as pyo3::ffi::Py_ssize_t,
+            1, // readonly
+            flags,
+        );
+        if ret == -1 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::missing_safety_doc)]
+    unsafe fn __releasebuffer__(_slf: PyRef<'_, Self>, _view: *mut pyo3::ffi::Py_buffer) {
+        // PyBuffer_FillInfo does not allocate; nothing to free.
+    }
 }
 
 /// WebSocket client running as an asyncio.Protocol implementation in Rust.
@@ -162,8 +288,12 @@ impl NativeClient {
                 let slice = &data[off + hdr..off + total];
                 match opcode {
                     0x1 | 0x2 => {
-                        let result = PyBytes::new(py, slice).unbind();
-                        Self::deliver_pybytes(py, &mut state, result)?;
+                        // One memcpy into a fresh Bytes (no shared-buffer split available
+                        // since we don't own `data`), zero-copy from there to the Python
+                        // layer via WSMessage's buffer protocol.
+                        let payload = Bytes::copy_from_slice(slice);
+                        let msg = Py::new(py, WSMessage { data: payload })?;
+                        Self::deliver_message(py, &mut state, msg)?;
                     }
                     0x8 => {
                         state.closed = true;
@@ -178,7 +308,6 @@ impl NativeClient {
                 }
                 off += total;
             }
-            // Whatever couldn't be parsed as a complete frame stays for next callback.
             if off < data.len() {
                 state.buf.extend_from_slice(&data[off..]);
             }
@@ -199,7 +328,7 @@ impl NativeClient {
                 .lines()
                 .any(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
                     && l.contains(&expected));
-            state.buf.drain(..end);
+            state.buf.advance(end);
             if !matched {
                 // Fail handshake future
                 if let Some(fut) = state.handshake_fut.take() {
@@ -475,7 +604,7 @@ impl NativeClient {
                 l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
                     && l.contains(&expected)
             });
-            state.buf.drain(..end);
+            state.buf.advance(end);
             if !matched {
                 if let Some(fut) = state.handshake_fut.take() {
                     let fut_b = fut.bind(py);
@@ -507,12 +636,16 @@ impl NativeClient {
             let total = hdr + plen;
             match opcode {
                 0x1 | 0x2 => {
-                    let result = PyBytes::new(py, &state.buf[hdr..total]).unbind();
-                    state.buf.drain(..total);
-                    Self::deliver_pybytes(py, &mut state, result)?;
+                    // Zero-copy: advance past header, then split_to() hands us an
+                    // Arc-backed Bytes for the payload range. No memcpy at all —
+                    // the PyBytes alloc that used to cost one per frame is gone.
+                    state.buf.advance(hdr);
+                    let payload = state.buf.split_to(plen).freeze();
+                    let msg = Py::new(py, WSMessage { data: payload })?;
+                    Self::deliver_message(py, &mut state, msg)?;
                 }
                 0x8 => {
-                    state.buf.drain(..total);
+                    state.buf.advance(total);
                     state.closed = true;
                     Self::fail_all_pending(py, &mut state, "Connection closed by peer");
                     if let Some(t) = state.transport.as_ref() {
@@ -522,21 +655,21 @@ impl NativeClient {
                     break;
                 }
                 _ => {
-                    state.buf.drain(..total);
+                    state.buf.advance(total);
                 }
             }
         }
         Ok(())
     }
 
-    fn deliver_pybytes(py: Python<'_>, state: &mut State, payload: Py<PyBytes>) -> PyResult<()> {
+    fn deliver_message(py: Python<'_>, state: &mut State, msg: Py<WSMessage>) -> PyResult<()> {
         if let Some(fut) = state.pending_recv.pop_front() {
             let fb = fut.bind(py);
             if !fb.call_method0("done")?.extract::<bool>().unwrap_or(false) {
-                fb.call_method1("set_result", (payload,))?;
+                fb.call_method1("set_result", (msg,))?;
             }
         } else {
-            state.backlog.push_back(payload);
+            state.backlog.push_back(msg);
         }
         Ok(())
     }
@@ -581,7 +714,7 @@ fn connect<'py>(
     let client = NativeClient {
         state: Arc::new(Mutex::new(State {
             transport: None,
-            buf: Vec::with_capacity(4096),
+            buf: BytesMut::with_capacity(16384),
             handshake_done: false,
             handshake_fut: None,
             expected_accept: String::new(),
