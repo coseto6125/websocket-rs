@@ -92,4 +92,6 @@ dev = [
     "ruff>=0.1.0",
     "websocket",
     "uvloop>=0.22.1; sys_platform != 'win32'",
+    "rloop>=0.2.0",
+    "granian>=2.7.3",
 ]

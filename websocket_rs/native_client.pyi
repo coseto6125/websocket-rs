@@ -4,11 +4,13 @@ Runs on the asyncio event loop thread — no tokio runtime, no cross-thread
 wakeup. Frame codec in Rust with AVX2-vectorised masking. Targets parity with
 or better than picows while remaining a pure Python-facing API.
 
-Limitations in this MVP:
-- ws:// plain TCP only (wss:// / SOCKS5 land in follow-up commits)
+Limitations:
+- SOCKS5 proxy not yet supported (TLS wss:// works via asyncio ssl plumbing)
 - Binary and Text frames only; no ping/pong, no fragments, no permessage-deflate
 - No custom headers / subprotocol / receive_timeout
 """
+
+import ssl as _ssl
 
 class NativeClient:
     """WebSocket client integrated directly with asyncio.Protocol.
@@ -35,6 +37,15 @@ class NativeClient:
         """True iff the handshake completed and the transport is still live."""
         ...
 
-async def connect(uri: str) -> NativeClient:
-    """Connect to ``uri`` (must be ``ws://...``) and complete the handshake."""
+async def connect(
+    uri: str,
+    *,
+    ssl_context: _ssl.SSLContext | None = None,
+) -> NativeClient:
+    """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
+
+    For ``wss://`` URIs a default ``ssl.create_default_context()`` is used
+    unless ``ssl_context`` is supplied. TLS is handled by the asyncio
+    transport, so the protocol sees decrypted frame bytes.
+    """
     ...

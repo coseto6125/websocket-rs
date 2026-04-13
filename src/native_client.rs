@@ -373,10 +373,20 @@ fn create_loop_future(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     loop_.call_method0("create_future")
 }
 
-/// Connect to a ws:// URI and return a NativeClient once the WebSocket handshake completes.
+/// Connect to a ws:// or wss:// URI and return a NativeClient once the handshake completes.
+///
+/// TLS is delegated to asyncio — we pass an ``ssl.SSLContext`` through to
+/// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
+/// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-fn connect<'py>(py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
-    let (host, port, path) = parse_ws_uri(&uri)?;
+#[pyo3(signature = (uri, *, ssl_context=None))]
+fn connect<'py>(
+    py: Python<'py>,
+    uri: String,
+    ssl_context: Option<Py<PyAny>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let (scheme, host, port, path) = parse_ws_uri(&uri)?;
+    let is_tls = scheme == "wss";
     let client = NativeClient {
         state: Arc::new(Mutex::new(State {
             transport: None,
@@ -415,9 +425,30 @@ fn connect<'py>(py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
         )?
     };
 
-    // loop.create_connection(protocol_factory, host, port) -> coro
-    let create_conn_coro =
-        loop_.call_method1("create_connection", (protocol_factory, host.clone(), port))?;
+    // Resolve SSL context if wss:// (user-supplied overrides default).
+    let ssl_arg: Py<PyAny> = if is_tls {
+        match ssl_context {
+            Some(ctx) => ctx,
+            None => py
+                .import("ssl")?
+                .call_method0("create_default_context")?
+                .unbind(),
+        }
+    } else {
+        py.None()
+    };
+
+    // loop.create_connection(protocol_factory, host, port, ssl=..., server_hostname=...) -> coro
+    let kwargs = pyo3::types::PyDict::new(py);
+    if is_tls {
+        kwargs.set_item("ssl", ssl_arg)?;
+        kwargs.set_item("server_hostname", host.clone())?;
+    }
+    let create_conn_coro = loop_.call_method(
+        "create_connection",
+        (protocol_factory, host.clone(), port),
+        Some(&kwargs),
+    )?;
 
     // Chain: await create_connection, then transport.write(request), then await handshake_fut, then return client
     // We implement this by wrapping in an async Python function crafted from asyncio.
@@ -426,10 +457,15 @@ fn connect<'py>(py: Python<'py>, uri: String) -> PyResult<Bound<'py, PyAny>> {
     helper.call1((create_conn_coro, req_bytes, handshake_fut, client_obj))
 }
 
-fn parse_ws_uri(uri: &str) -> PyResult<(String, u16, String)> {
-    let rest = uri
-        .strip_prefix("ws://")
-        .ok_or_else(|| PyValueError::new_err("Only ws:// supported in MVP"))?;
+fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
+    let (scheme, rest, default_port): (&str, &str, u16) = if let Some(r) = uri.strip_prefix("wss://")
+    {
+        ("wss", r, 443)
+    } else if let Some(r) = uri.strip_prefix("ws://") {
+        ("ws", r, 80)
+    } else {
+        return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -441,9 +477,9 @@ fn parse_ws_uri(uri: &str) -> PyResult<(String, u16, String)> {
                 .parse()
                 .map_err(|_| PyValueError::new_err("Invalid port"))?,
         ),
-        None => (authority.to_string(), 80u16),
+        None => (authority.to_string(), default_port),
     };
-    Ok((host, port, path.to_string()))
+    Ok((scheme, host, port, path.to_string()))
 }
 
 /// Cached Python helper that orchestrates create_connection -> send handshake -> await accept -> return client.
