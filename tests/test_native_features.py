@@ -234,6 +234,44 @@ def test_fragmented_message_assembled():
     t.join(timeout=2)
 
 
+def test_socks5_proxy_tunnelled_handshake(server):
+    """Connect to the echo server THROUGH a minimal in-proc SOCKS5 proxy."""
+    import socket as _s
+    import threading
+
+    from tests.bench_socks5_handshake import _serve_socks5  # reuse the no-auth proxy
+
+    proxy_port = 19060
+    ready = threading.Event()
+    threading.Thread(target=_serve_socks5, args=(proxy_port, ready), daemon=True).start()
+    ready.wait(timeout=2)
+
+    async def run():
+        ws = await connect(
+            f"ws://127.0.0.1:{PORT}",
+            proxy=f"socks5://127.0.0.1:{proxy_port}",
+            connect_timeout=3.0,
+        )
+        ws.send(b"via-proxy")
+        resp = await ws.recv()
+        assert bytes(resp) == b"via-proxy"
+        ws.close()
+
+    asyncio.run(run())
+
+
+def test_socks5_proxy_invalid_scheme_rejected():
+    async def run():
+        with pytest.raises(ValueError):
+            await connect(
+                "ws://127.0.0.1:1",
+                proxy="http://127.0.0.1:9999",
+                connect_timeout=1.0,
+            )
+
+    asyncio.run(run())
+
+
 def test_connect_timeout_on_unreachable():
     # TEST-NET-1: 192.0.2.x guaranteed unroutable per RFC 5737.
     async def run():

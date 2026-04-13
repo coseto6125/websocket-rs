@@ -5,8 +5,8 @@ wakeup. Frame codec in Rust with AVX2-vectorised masking. Targets parity with
 or better than picows while remaining a pure Python-facing API.
 
 Still missing vs the legacy ``async_client``:
-- SOCKS5 proxy
-- permessage-deflate compression
+- permessage-deflate compression (RFC 7692; most production stacks turn it
+  off for latency reasons, so low priority)
 """
 
 from __future__ import annotations
@@ -90,6 +90,7 @@ async def connect(
     ssl_context: _ssl.SSLContext | None = None,
     connect_timeout: float | None = None,
     receive_timeout: float | None = None,
+    proxy: str | None = None,
 ) -> NativeClient:
     """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
 
@@ -105,5 +106,9 @@ async def connect(
     - ``receive_timeout`` wraps every ``recv()`` / ``async for`` step in
       ``asyncio.wait_for``; the backlog fast-path is not wrapped so
       already-queued messages return immediately.
+    - ``proxy`` accepts ``socks5://[user:password@]host:port``. Handshake
+      runs in ``loop.run_in_executor`` so the event loop stays responsive;
+      once the tunnel is up all traffic goes through the native
+      zero-copy hot path. ``picows`` does not support proxies.
     """
     ...
