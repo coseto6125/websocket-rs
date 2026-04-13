@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
+use flate2::read::DeflateDecoder;
+use flate2::{Compress, Compression, FlushCompress};
+use std::io::Read as _;
 use parking_lot::Mutex;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
@@ -58,13 +61,14 @@ const MIN_HDR: usize = 2;
 
 /// Parse a single server frame header (no mask — server->client frames are never masked).
 /// Returns (fin, opcode, payload_len, header_size) or None if not enough data.
-fn parse_header(buf: &[u8]) -> Option<(bool, u8, usize, usize)> {
+fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
     if buf.len() < MIN_HDR {
         return None;
     }
     let b0 = buf[0];
     let b1 = buf[1];
     let fin = (b0 & 0x80) != 0;
+    let rsv1 = (b0 & 0x40) != 0;
     let opcode = b0 & 0x0F;
     let plen_short = b1 & 0x7F;
     let (plen, hdr) = match plen_short {
@@ -86,7 +90,7 @@ fn parse_header(buf: &[u8]) -> Option<(bool, u8, usize, usize)> {
         _ => unreachable!(),
     };
     // Server must NOT mask; we don't enforce here (picows/tungstenite both accept).
-    Some((fin, opcode, plen, hdr))
+    Some((fin, rsv1, opcode, plen, hdr))
 }
 
 struct State {
@@ -123,7 +127,21 @@ struct State {
     /// until FIN=1 arrives. First frame's opcode is stashed here.
     fragment_buf: Option<BytesMut>,
     fragment_opcode: u8,
+    /// True when the current fragmented message used RSV1 (compressed) in the
+    /// first frame — per RFC 7692 the flag is set only on the first frame.
+    fragment_rsv1: bool,
+    /// permessage-deflate context, lazily initialised after negotiation.
+    deflate: Option<DeflateCtx>,
 }
+
+/// permessage-deflate per-connection state. We always negotiate
+/// client_no_context_takeover / server_no_context_takeover so streaming state
+/// never persists across messages — the DEFLATE allocators get reset after
+/// each message, trading a few % compression ratio for simpler, race-free code.
+/// Marker struct — presence of Option<DeflateCtx>::Some means permessage-deflate
+/// is negotiated. No per-connection state: Compress/Decompress are instantiated
+/// fresh per message (no_context_takeover semantics either way).
+struct DeflateCtx;
 
 /// Pre-completed awaitable. Yields the stored result via StopIteration on first
 /// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
@@ -313,6 +331,7 @@ fn build_handshake(
     path: &str,
     headers: &[(String, String)],
     subprotocols: &[String],
+    compression: bool,
 ) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
@@ -335,6 +354,14 @@ fn build_handshake(
         req.push_str(&subprotocols.join(", "));
         req.push_str("\r\n");
     }
+    if compression {
+        // no_context_takeover on both sides keeps decompressor state per-message,
+        // matching the DeflateCtx::reset calls in process_buffered_frames.
+        req.push_str(
+            "Sec-WebSocket-Extensions: permessage-deflate; \
+             client_no_context_takeover; server_no_context_takeover\r\n",
+        );
+    }
     // Skip the handful of headers we already manage ourselves; case-insensitive match.
     const RESERVED: &[&str] = &[
         "host",
@@ -355,6 +382,34 @@ fn build_handshake(
     }
     req.push_str("\r\n");
     (req.into_bytes(), expected)
+}
+
+/// Decompress a permessage-deflate payload. Per RFC 7692 §7.2.2 the client MUST
+/// append 00 00 FF FF before feeding to a raw-DEFLATE decoder.
+///
+/// Uses a fresh Decompress per call — matches server_no_context_takeover and
+/// sidesteps a real miniz_oxide bug where `reset(false)` leaves residual
+/// internal state that corrupts subsequent decompression of large inputs.
+fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>> {
+    if state.deflate.is_none() {
+        return Err(PyRuntimeError::new_err(
+            "received compressed frame but permessage-deflate is not enabled",
+        ));
+    }
+    let mut with_marker = Vec::with_capacity(compressed.len() + 4);
+    with_marker.extend_from_slice(compressed);
+    with_marker.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+
+    // `read::DeflateDecoder` wraps a reader and treats the stream as raw
+    // DEFLATE. read_to_end handles the grow-retry dance that decompress_vec
+    // needs to be hand-coded for. Consistently decodes regardless of the
+    // compressed/uncompressed size ratio.
+    let mut decoder = DeflateDecoder::new(with_marker.as_slice());
+    let mut out = Vec::with_capacity(compressed.len() * 4 + 128);
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| PyRuntimeError::new_err(format!("deflate decode error: {e}")))?;
+    Ok(out)
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
@@ -396,13 +451,14 @@ impl NativeClient {
             && state.fragment_buf.is_none()
         {
             let mut off = 0usize;
-            while let Some((fin, opcode, plen, hdr)) = parse_header(&data[off..]) {
+            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
                 if data.len() - off < hdr + plen {
                     break;
                 }
-                // Fragmented frames (fin=false, or opcode=0x0 continuation) need
-                // accumulation — fall through to the slow path.
-                if !fin || opcode == 0x0 {
+                // Fragmented frames (fin=false, or opcode=0x0 continuation) and
+                // compressed frames (rsv1=true) need buffered handling — bail
+                // to the slow path where the DeflateCtx lives.
+                if !fin || opcode == 0x0 || rsv1 {
                     break;
                 }
                 let total = hdr + plen;
@@ -588,7 +644,7 @@ impl NativeClient {
     /// Encode a single binary frame and write it directly to the transport.
     /// Zero-copy: the encoded frame is materialised straight into Python memory.
     fn send(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -600,16 +656,63 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
-        drop(state);
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
-        let (payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
+        let (raw_payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
             (pb.as_bytes(), 0x2)
         } else if let Ok(s) = message.cast::<PyString>() {
             (s.to_str()?.as_bytes(), 0x1)
         } else {
             return Err(PyValueError::new_err("message must be str or bytes"));
         };
+
+        // permessage-deflate: if negotiated, compress via a fresh DeflateEncoder
+        // (no_context_takeover means we'd reset state after every message anyway
+        // — starting fresh is simpler than stateful Compress::reset). Sync-flush
+        // produces a stream ending in 00 00 FF FF which we then strip per
+        // RFC 7692 §7.2.1. RSV1 gets set in the frame header below.
+        // permessage-deflate compression via raw Compress. A fresh instance
+        // each message matches client_no_context_takeover semantics and sidesteps
+        // the reset() pitfalls in miniz_oxide. We reserve enough output capacity
+        // up front so compress_vec finishes in a single call.
+        let compressed = state.deflate.is_some();
+        let deflate_buf: Vec<u8> = if compressed {
+            let mut comp = Compress::new(Compression::default(), false);
+            // Worst case: small overhead on random data; highly compressible
+            // data is much smaller. +64 covers header + sync marker + slack.
+            let mut out: Vec<u8> = Vec::with_capacity(raw_payload.len() + 64);
+            // Drive compression until all input is consumed AND the Sync marker
+            // has been emitted. With ample output capacity this loop finishes
+            // in one or two iterations.
+            let mut cursor = 0usize;
+            loop {
+                let need = if cursor < raw_payload.len() { 128 } else { 32 };
+                if out.capacity() - out.len() < need {
+                    out.reserve(raw_payload.len().max(1024));
+                }
+                let in_before = comp.total_in();
+                comp.compress_vec(&raw_payload[cursor..], &mut out, FlushCompress::Sync)
+                    .map_err(|e| PyRuntimeError::new_err(format!("deflate error: {e}")))?;
+                cursor += (comp.total_in() - in_before) as usize;
+                if cursor >= raw_payload.len() && out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+                    break;
+                }
+                if cursor >= raw_payload.len()
+                    && (comp.total_out() - in_before) == 0
+                {
+                    // Defensive: no progress after input exhausted.
+                    break;
+                }
+            }
+            if out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+                out.truncate(out.len() - 4);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        let payload: &[u8] = if compressed { &deflate_buf } else { raw_payload };
+        drop(state);
 
         let plen = payload.len();
         let header_len = 2 + match plen {
@@ -624,7 +727,8 @@ impl NativeClient {
 
         // Allocate PyBytes and fill directly — one memcpy total.
         let out = PyBytes::new_with(py, total, |buf| {
-            buf[0] = 0x80 | opcode; // FIN=1
+            // FIN=1; set RSV1 (0x40) when the payload is deflated.
+            buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
             let mut pos = 2;
             if plen <= 125 {
                 buf[1] = 0x80 | plen as u8;
@@ -830,6 +934,7 @@ impl NativeClient {
             let expected = state.expected_accept.clone();
             let mut matched = false;
             let mut subprotocol: Option<String> = None;
+            let mut deflate_accepted = false;
             for line in headers_str.lines() {
                 let lower = line.to_ascii_lowercase();
                 if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
@@ -840,10 +945,18 @@ impl NativeClient {
                     .filter(|_| lower.starts_with("sec-websocket-protocol:"))
                 {
                     subprotocol = Some(rest.trim().to_string());
+                } else if lower.starts_with("sec-websocket-extensions:")
+                    && lower.contains("permessage-deflate")
+                {
+                    deflate_accepted = true;
                 }
             }
             state.buf.advance(end);
             state.subprotocol = subprotocol;
+            // Server didn't echo permessage-deflate → disable our compressor.
+            if !deflate_accepted {
+                state.deflate = None;
+            }
             if !matched {
                 if let Some(fut) = state.handshake_fut.take() {
                     let fut_b = fut.bind(py);
@@ -866,7 +979,7 @@ impl NativeClient {
         }
 
         loop {
-            let Some((fin, opcode, plen, hdr)) = parse_header(&state.buf) else {
+            let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) else {
                 break;
             };
             if state.buf.len() < hdr + plen {
@@ -876,25 +989,40 @@ impl NativeClient {
             match opcode {
                 0x1 | 0x2 => {
                     // Data frame (text / binary). FIN=1 and no pending fragment =
-                    // complete message, zero-copy. Otherwise start accumulating.
+                    // complete message. Otherwise start accumulating.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen).freeze();
+                    let is_compressed = rsv1;
                     if fin && state.fragment_buf.is_none() {
-                        let msg = Py::new(py, WSMessage { data: payload })?;
+                        let final_payload = if is_compressed {
+                            match decompress_message(&mut state, &payload) {
+                                Ok(p) => Bytes::from(p),
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            payload
+                        };
+                        let msg = Py::new(py, WSMessage { data: final_payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     } else {
-                        // Start (or replace, if a protocol error — lenient) a fragment
-                        // collector seeded with this first frame's payload.
+                        // Fragmented message: remember whether RSV1 was on the
+                        // first frame; continuation frames don't carry it.
                         let mut acc = BytesMut::with_capacity(plen);
                         acc.extend_from_slice(&payload);
                         state.fragment_buf = Some(acc);
                         state.fragment_opcode = opcode;
+                        state.fragment_rsv1 = is_compressed;
                         if fin {
-                            // Degenerate FIN=1 on first data frame with an existing
-                            // fragment_buf — deliver what we have.
-                            let done = state.fragment_buf.take().unwrap().freeze();
+                            let raw = state.fragment_buf.take().unwrap().freeze();
+                            let compressed_flag = state.fragment_rsv1;
                             state.fragment_opcode = 0;
-                            let msg = Py::new(py, WSMessage { data: done })?;
+                            state.fragment_rsv1 = false;
+                            let out = if compressed_flag {
+                                Bytes::from(decompress_message(&mut state, &raw)?)
+                            } else {
+                                raw
+                            };
+                            let msg = Py::new(py, WSMessage { data: out })?;
                             Self::deliver_message(py, &mut state, msg)?;
                         }
                     }
@@ -908,9 +1036,16 @@ impl NativeClient {
                     }
                     if fin {
                         if let Some(acc) = state.fragment_buf.take() {
-                            let done = acc.freeze();
+                            let compressed_flag = state.fragment_rsv1;
                             state.fragment_opcode = 0;
-                            let msg = Py::new(py, WSMessage { data: done })?;
+                            state.fragment_rsv1 = false;
+                            let raw = acc.freeze();
+                            let out = if compressed_flag {
+                                Bytes::from(decompress_message(&mut state, &raw)?)
+                            } else {
+                                raw
+                            };
+                            let msg = Py::new(py, WSMessage { data: out })?;
                             Self::deliver_message(py, &mut state, msg)?;
                         }
                     }
@@ -993,7 +1128,7 @@ impl NativeClient {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None, compression=false))]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
@@ -1003,6 +1138,7 @@ fn connect<'py>(
     connect_timeout: Option<f64>,
     receive_timeout: Option<f64>,
     proxy: Option<String>,
+    compression: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
@@ -1027,6 +1163,8 @@ fn connect<'py>(
             receive_timeout,
             fragment_buf: None,
             fragment_opcode: 0,
+            fragment_rsv1: false,
+            deflate: if compression { Some(DeflateCtx) } else { None },
         })),
     };
     let state_arc = client.state.clone();
@@ -1035,8 +1173,14 @@ fn connect<'py>(
     // Build handshake bytes + expected accept
     let headers_vec = headers.unwrap_or_default();
     let subprotocols_vec = subprotocols.unwrap_or_default();
-    let (req_bytes, expected) =
-        build_handshake(&host, port, &path, &headers_vec, &subprotocols_vec);
+    let (req_bytes, expected) = build_handshake(
+        &host,
+        port,
+        &path,
+        &headers_vec,
+        &subprotocols_vec,
+        compression,
+    );
     state_arc.lock().expected_accept = expected;
 
     // Create the handshake future and park it

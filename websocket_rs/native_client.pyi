@@ -4,9 +4,8 @@ Runs on the asyncio event loop thread — no tokio runtime, no cross-thread
 wakeup. Frame codec in Rust with AVX2-vectorised masking. Targets parity with
 or better than picows while remaining a pure Python-facing API.
 
-Still missing vs the legacy ``async_client``:
-- permessage-deflate compression (RFC 7692; most production stacks turn it
-  off for latency reasons, so low priority)
+All API-parity items vs the legacy ``async_client`` are implemented; the
+legacy module is deprecated and will be removed in 2.0.
 """
 
 from __future__ import annotations
@@ -91,6 +90,7 @@ async def connect(
     connect_timeout: float | None = None,
     receive_timeout: float | None = None,
     proxy: str | None = None,
+    compression: bool = False,
 ) -> NativeClient:
     """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
 
@@ -110,5 +110,11 @@ async def connect(
       runs in ``loop.run_in_executor`` so the event loop stays responsive;
       once the tunnel is up all traffic goes through the native
       zero-copy hot path. ``picows`` does not support proxies.
+    - ``compression=True`` negotiates the ``permessage-deflate`` extension
+      (RFC 7692) with ``server_no_context_takeover`` +
+      ``client_no_context_takeover`` for bounded per-message memory. If the
+      server doesn't echo the extension header the client silently falls
+      back to sending uncompressed frames. ``picows`` exposes the RSV1 bit
+      but does not compress or decompress for you.
     """
     ...

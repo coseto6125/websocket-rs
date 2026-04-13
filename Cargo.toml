@@ -65,6 +65,7 @@ tokio-native-tls = "0.3.1"
 sha1 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+flate2 = "1"
 
 [lints.rust]
 non_local_definitions = "allow"

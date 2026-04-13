@@ -189,7 +189,7 @@ def test_fragmented_message_assembled():
     def tiny_server():
         srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
         srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 8888))
+        srv.bind(("127.0.0.1", 8818))
         srv.listen(1)
         evt.set()
         conn, _ = srv.accept()
@@ -224,7 +224,7 @@ def test_fragmented_message_assembled():
     evt.wait(timeout=2)
 
     async def run():
-        ws = await connect("ws://127.0.0.1:8888")
+        ws = await connect("ws://127.0.0.1:8818")
         ws.send(b"go")
         msg = await asyncio.wait_for(ws.recv(), timeout=2)
         assert bytes(msg) == b"helloworld", f"got {bytes(msg)!r}"
@@ -270,6 +270,121 @@ def test_socks5_proxy_invalid_scheme_rejected():
             )
 
     asyncio.run(run())
+
+
+def _compressed_echo_server(port, ready):
+    import asyncio as _a
+
+    import uvloop as _u
+    import websockets as _ws
+    from websockets.extensions.permessage_deflate import ServerPerMessageDeflateFactory
+
+    _u.install()
+
+    async def echo(ws):
+        async for msg in ws:
+            await ws.send(msg)
+
+    async def main():
+        async with _ws.serve(
+            echo,
+            "127.0.0.1",
+            port,
+            extensions=[
+                ServerPerMessageDeflateFactory(
+                    server_no_context_takeover=True,
+                    client_no_context_takeover=True,
+                )
+            ],
+        ):
+            ready.set()
+            await _a.Future()
+
+    _a.run(main())
+
+
+def _plain_echo_server(port, ready):
+    import asyncio as _a
+
+    import uvloop as _u
+    import websockets as _ws
+
+    _u.install()
+
+    async def echo(ws):
+        async for msg in ws:
+            await ws.send(msg)
+
+    async def main():
+        async with _ws.serve(echo, "127.0.0.1", port, extensions=[]):
+            ready.set()
+            await _a.Future()
+
+    _a.run(main())
+
+
+def test_permessage_deflate_round_trip():
+    """Run a compressed echo server and verify round-trip across size classes."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    PORT_C = 8900
+    p = ctx.Process(target=_compressed_echo_server, args=(PORT_C, ready), daemon=True)
+    p.start()
+    ready.wait(timeout=5)
+    time.sleep(0.3)
+
+    async def run():
+        import os as _os
+
+        ws = await connect(f"ws://127.0.0.1:{PORT_C}", compression=True)
+        # Size sweep, including the 4KB boundary that initially tripped up miniz_oxide.
+        for size in (10, 1000, 4096, 4097, 5000, 10000, 100000):
+            msg = b"A" * size
+            ws.send(msg)
+            resp = await asyncio.wait_for(ws.recv(), timeout=5)
+            assert bytes(resp) == msg, f"A*{size}: got {len(bytes(resp))}B"
+        # Random (incompressible) input
+        rnd = _os.urandom(8192)
+        ws.send(rnd)
+        resp = await asyncio.wait_for(ws.recv(), timeout=5)
+        assert bytes(resp) == rnd
+        # UTF-8 text round-trip
+        tmsg = "Hello πρωτόκολλο " * 200
+        ws.send(tmsg)
+        resp = await asyncio.wait_for(ws.recv(), timeout=5)
+        assert bytes(resp).decode() == tmsg
+        ws.close()
+
+    asyncio.run(run())
+    p.terminate()
+    p.join(timeout=2)
+
+
+def test_permessage_deflate_graceful_fallback():
+    """Server without deflate support: client should fall back to uncompressed transparently."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    ready = ctx.Event()
+    PORT_C = 8901
+    p = ctx.Process(target=_plain_echo_server, args=(PORT_C, ready), daemon=True)
+    p.start()
+    ready.wait(timeout=5)
+    time.sleep(0.3)
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{PORT_C}", compression=True)
+        msg = b"B" * 2000
+        ws.send(msg)
+        resp = await asyncio.wait_for(ws.recv(), timeout=5)
+        assert bytes(resp) == msg
+        ws.close()
+
+    asyncio.run(run())
+    p.terminate()
+    p.join(timeout=2)
 
 
 def test_connect_timeout_on_unreachable():
