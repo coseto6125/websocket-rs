@@ -301,6 +301,10 @@ struct PyBytesOwner {
     len: usize,
 }
 
+// SAFETY: `Py<PyBytes>` is itself Send+Sync per pyo3's contract (refcount ops
+// take the GIL). PyBytes is immutable in CPython so the buffer pointer and
+// length are stable for the lifetime of the held reference. The Bytes owner
+// keeps that reference alive, so no thread can observe a freed pointer.
 unsafe impl Send for PyBytesOwner {}
 unsafe impl Sync for PyBytesOwner {}
 
@@ -310,6 +314,11 @@ impl AsRef<[u8]> for PyBytesOwner {
     }
 }
 
+/// Build a zero-copy `Bytes` over `data[start..end]`, keeping `pb` alive as the
+/// owner so the slice remains valid.
+///
+/// Caller must ensure `start <= end <= data.len()` and that `data` actually
+/// points into `pb`'s buffer (not a derived/temporary slice).
 fn pybytes_zero_copy_slice<'py>(
     _py: Python<'py>,
     pb: &Bound<'py, PyBytes>,
@@ -317,6 +326,8 @@ fn pybytes_zero_copy_slice<'py>(
     start: usize,
     end: usize,
 ) -> Bytes {
+    debug_assert!(start <= end, "start ({start}) > end ({end})");
+    debug_assert!(end <= data.len(), "end ({end}) > data.len ({})", data.len());
     let ptr = unsafe { data.as_ptr().add(start) };
     let len = end - start;
     let owner = PyBytesOwner {
@@ -679,6 +690,14 @@ impl NativeClient {
             self.data_received_inner_pybytes(py, pb, bytes)
         } else {
             let buf = pyo3::buffer::PyBuffer::<u8>::get(data)?;
+            // Reject non-contiguous or multi-dimensional buffers — treating
+            // them as flat slices via from_raw_parts would mis-read strided
+            // numpy views and similar layouts.
+            if !buf.is_c_contiguous() || buf.dimensions() != 1 {
+                return Err(PyTypeError::new_err(
+                    "data_received expected a 1-D C-contiguous buffer",
+                ));
+            }
             let slice: &[u8] =
                 unsafe { std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count()) };
             self.data_received_inner(py, slice)

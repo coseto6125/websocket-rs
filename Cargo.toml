@@ -79,3 +79,8 @@ panic = "abort"
 incremental = false
 debug = false
 strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false

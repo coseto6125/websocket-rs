@@ -11,10 +11,9 @@ legacy module is deprecated and will be removed in 2.0.
 from __future__ import annotations
 
 import ssl as _ssl
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from types import TracebackType
 from typing import Self
-
 
 class WSMessage:
     """Zero-copy view over a received WebSocket frame payload.
@@ -30,7 +29,6 @@ class WSMessage:
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> int: ...
     def __repr__(self) -> str: ...
-
 
 class NativeClient:
     """WebSocket client integrated directly with asyncio.Protocol.
@@ -70,7 +68,6 @@ class NativeClient:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None: ...
-
     @property
     def is_open(self) -> bool: ...
     @property
@@ -79,7 +76,6 @@ class NativeClient:
     def close_code(self) -> int | None: ...
     @property
     def close_reason(self) -> str | None: ...
-
 
 async def connect(
     uri: str,
@@ -91,6 +87,7 @@ async def connect(
     receive_timeout: float | None = None,
     proxy: str | None = None,
     compression: bool = False,
+    on_message: Callable[[WSMessage], None] | None = None,
 ) -> NativeClient:
     """Connect to ``uri`` (``ws://`` or ``wss://``) and complete the handshake.
 
@@ -116,5 +113,12 @@ async def connect(
       server doesn't echo the extension header the client silently falls
       back to sending uncompressed frames. ``picows`` exposes the RSV1 bit
       but does not compress or decompress for you.
+    - ``on_message`` switches delivery to a synchronous callback invoked
+      from the asyncio Protocol ``data_received`` path. When set, messages
+      are NOT queued for :meth:`NativeClient.recv` — the callback receives
+      each :class:`WSMessage` directly and must be fast (no awaits). This
+      bypasses the future/task machinery and cuts p99 tail latency for
+      high-throughput pipelined workloads at the cost of a less idiomatic
+      API. For typical async/await usage, leave this as ``None``.
     """
     ...
