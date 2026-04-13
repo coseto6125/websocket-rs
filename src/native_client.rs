@@ -19,7 +19,9 @@ use std::sync::Arc;
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use parking_lot::Mutex;
-use pyo3::exceptions::{PyConnectionError, PyIndexError, PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyConnectionError, PyIndexError, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
@@ -104,6 +106,57 @@ struct State {
     recv_ba: Option<Py<PyByteArray>>,
     /// Byte offset in recv_ba where asyncio will write the next chunk.
     recv_ba_write_pos: usize,
+    /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
+    /// lookups on every recv() slow-path.
+    loop_ref: Option<Py<PyAny>>,
+}
+
+/// Pre-completed awaitable. Yields the stored result via StopIteration on first
+/// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
+/// is already available in the backlog — saves one create_future + one set_result
+/// per call.
+#[pyclass(name = "_ReadyMessage", module = "websocket_rs.native_client", unsendable)]
+struct ReadyMessage {
+    result: Option<PyResult<Py<PyAny>>>,
+}
+
+#[pymethods]
+impl ReadyMessage {
+    fn __await__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __iter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    fn __next__(&mut self, _py: Python<'_>) -> PyResult<()> {
+        match self.result.take() {
+            Some(Ok(val)) => Err(PyStopIteration::new_err((val,))),
+            Some(Err(e)) => Err(e),
+            None => Err(PyStopIteration::new_err(())),
+        }
+    }
+}
+
+fn ready_ok<'py>(py: Python<'py>, val: Py<PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let rm = Bound::new(
+        py,
+        ReadyMessage {
+            result: Some(Ok(val)),
+        },
+    )?;
+    Ok(rm.into_any())
+}
+
+fn ready_err<'py>(py: Python<'py>, err: PyErr) -> PyResult<Bound<'py, PyAny>> {
+    let rm = Bound::new(
+        py,
+        ReadyMessage {
+            result: Some(Err(err)),
+        },
+    )?;
+    Ok(rm.into_any())
 }
 
 /// Zero-copy view over a received WebSocket frame payload.
@@ -540,23 +593,30 @@ impl NativeClient {
     /// Returns an asyncio.Future that completes with the next received frame payload.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut state = self.state.lock();
+        // Fast path: message already in backlog — bypass asyncio.Future entirely.
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
-            let fut = create_loop_future(py)?;
-            fut.call_method1("set_result", (payload,))?;
-            return Ok(fut);
+            return ready_ok(py, payload.into_any());
         }
+        // Closed path: same — ReadyMessage carrying an exception short-circuits
+        // awaits without a Future alloc.
         if state.closed {
             drop(state);
-            let fut = create_loop_future(py)?;
-            fut.call_method1(
-                "set_exception",
-                (PyConnectionError::new_err("Connection closed"),),
-            )?;
-            return Ok(fut);
+            return ready_err(py, PyConnectionError::new_err("Connection closed"));
         }
-        let fut = create_loop_future(py)?;
-        state.pending_recv.push_back(fut.clone().unbind());
+        // Slow path: message not yet arrived. Use asyncio.Future so data_received
+        // can complete it across the callback boundary.
+        let loop_ref = state
+            .loop_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
+            .clone_ref(py);
+        drop(state);
+        let fut = loop_ref.bind(py).call_method0("create_future")?;
+        self.state
+            .lock()
+            .pending_recv
+            .push_back(fut.clone().unbind());
         Ok(fut)
     }
 
@@ -725,6 +785,7 @@ fn connect<'py>(
             write_queue: VecDeque::new(),
             recv_ba: None,
             recv_ba_write_pos: 0,
+            loop_ref: None,
         })),
     };
     let state_arc = client.state.clone();
@@ -738,7 +799,11 @@ fn connect<'py>(
     let asyncio = py.import("asyncio")?;
     let loop_ = asyncio.call_method0("get_running_loop")?;
     let handshake_fut = loop_.call_method0("create_future")?;
-    state_arc.lock().handshake_fut = Some(handshake_fut.clone().unbind());
+    {
+        let mut st = state_arc.lock();
+        st.handshake_fut = Some(handshake_fut.clone().unbind());
+        st.loop_ref = Some(loop_.clone().unbind());
+    }
 
     // Launch the low-level create_connection + post-connection handshake send as a task
     let protocol_factory = {
