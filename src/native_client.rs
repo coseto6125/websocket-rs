@@ -488,6 +488,7 @@ fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>>
 /// bytes actually written or -1 on any error. The caller handles partial
 /// writes / errors by falling back to asyncio's transport.write.
 #[cfg(unix)]
+#[allow(dead_code)]
 fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
     // MSG_NOSIGNAL is Linux-specific; macOS achieves the same via SO_NOSIGPIPE
     // on the socket (asyncio already sets that when creating the transport on
@@ -508,6 +509,49 @@ fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
 #[cfg(not(unix))]
 fn native_send(_fd: i32, _buf: &[u8]) -> isize {
     -1 // Windows: fall back to transport.write
+}
+
+/// Scatter-gather variant of `native_send`. Sends `header` followed by
+/// `payload` in one syscall via `sendmsg(2)`, avoiding the merge-into-one-buffer
+/// memcpy that the simple `send` path requires. Returns total bytes written
+/// across both iovecs, or -1 on error / EAGAIN.
+#[cfg(unix)]
+fn native_sendmsg(fd: std::os::unix::io::RawFd, header: &[u8], payload: &[u8]) -> isize {
+    let flags: libc::c_int = {
+        #[cfg(target_os = "linux")]
+        {
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            libc::MSG_DONTWAIT
+        }
+    };
+    let iov = [
+        libc::iovec {
+            iov_base: header.as_ptr() as *mut _,
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: payload.as_ptr() as *mut _,
+            iov_len: payload.len(),
+        },
+    ];
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_ptr() as *mut _,
+        msg_iovlen: 2,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    unsafe { libc::sendmsg(fd, &msg, flags) }
+}
+
+#[cfg(not(unix))]
+fn native_sendmsg(_fd: i32, _header: &[u8], _payload: &[u8]) -> isize {
+    -1
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
@@ -752,52 +796,41 @@ impl NativeClient {
                 126..=65535 => 2,
                 _ => 8,
             } + 4; // 4-byte mask
-        let total = header_len + plen;
 
         let mut mask_key = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut mask_key);
 
-        // Allocate PyBytes and fill directly — one memcpy total.
-        let out = PyBytes::new_with(py, total, |buf| {
-            // FIN=1; set RSV1 (0x40) when the payload is deflated.
-            buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
-            let mut pos = 2;
-            if plen <= 125 {
-                buf[1] = 0x80 | plen as u8;
-            } else if plen <= 65535 {
-                buf[1] = 0x80 | 126;
-                buf[2..4].copy_from_slice(&(plen as u16).to_be_bytes());
-                pos = 4;
-            } else {
-                buf[1] = 0x80 | 127;
-                buf[2..10].copy_from_slice(&(plen as u64).to_be_bytes());
-                pos = 10;
-            }
-            buf[pos..pos + 4].copy_from_slice(&mask_key);
-            pos += 4;
-            buf[pos..pos + plen].copy_from_slice(payload);
-            apply_mask(&mut buf[pos..pos + plen], mask_key);
-            Ok(())
-        })?;
+        // Encode header onto the stack (max 14 bytes: 2 + 8 length + 4 mask).
+        let mut header_buf = [0u8; 14];
+        header_buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
+        let mut pos = 2;
+        if plen <= 125 {
+            header_buf[1] = 0x80 | plen as u8;
+        } else if plen <= 65535 {
+            header_buf[1] = 0x80 | 126;
+            header_buf[2..4].copy_from_slice(&(plen as u16).to_be_bytes());
+            pos = 4;
+        } else {
+            header_buf[1] = 0x80 | 127;
+            header_buf[2..10].copy_from_slice(&(plen as u64).to_be_bytes());
+            pos = 10;
+        }
+        header_buf[pos..pos + 4].copy_from_slice(&mask_key);
+        let header = &header_buf[..pos + 4];
+        debug_assert_eq!(header.len(), header_len);
 
-        // If the transport has paused us, buffer the encoded frame until resume_writing.
-        // Re-lock briefly to check the flag and push if needed.
-        {
-            let mut state = self.state.borrow_mut();
-            if state.paused {
-                state.write_queue.push_back(out.unbind());
-                return Ok(());
-            }
+        // Pause check is cheap; do it once before deciding fast vs slow path.
+        if self.state.borrow().paused {
+            // Slow path: build merged PyBytes and queue it for resume_writing.
+            let out = self.build_merged_frame(py, header, payload, mask_key)?;
+            self.state.borrow_mut().write_queue.push_back(out.unbind());
+            return Ok(());
         }
 
-        // Native-send fast path: if the transport is plain TCP (raw_fd known)
-        // AND asyncio's internal write buffer is empty, send straight into the
-        // kernel via libc::send(). On localhost this almost always returns the
-        // full frame in one call, so we skip asyncio's transport bookkeeping
-        // entirely. Partial writes / errors fall back to transport.write so
-        // asyncio still handles backpressure and error plumbing.
-        //
-        // Mirrors picows' `_try_native_write_then_transport_write` strategy.
+        // Native sendmsg fast path: when transport is plain TCP and asyncio's
+        // internal buffer is empty, we go straight to the kernel with a 2-iovec
+        // sendmsg(). The mask still has to be applied to a writable copy of the
+        // payload, but we skip allocating and filling a merged PyBytes.
         if let Some(fd) = raw_fd {
             let drained = match get_buf_size {
                 Some(ref m) => m
@@ -809,23 +842,57 @@ impl NativeClient {
                 None => false,
             };
             if drained {
-                let bytes = out.as_bytes();
-                let written = native_send(fd, bytes);
-                if written == bytes.len() as isize {
+                // Mask payload into a fresh Vec (source PyBytes/PyString is read-only).
+                let mut masked: Vec<u8> = Vec::with_capacity(plen);
+                masked.extend_from_slice(payload);
+                apply_mask(&mut masked, mask_key);
+                let total = header.len() + plen;
+                let written = native_sendmsg(fd, header, &masked);
+                if written == total as isize {
                     return Ok(());
                 }
                 if written > 0 {
-                    // Hand the remainder to asyncio so ordering is preserved.
-                    let tail = PyBytes::new(py, &bytes[written as usize..]);
+                    // Partial: hand remainder to asyncio so ordering is preserved.
+                    let n = written as usize;
+                    let remaining = total - n;
+                    let tail = PyBytes::new_with(py, remaining, |buf| {
+                        if n < header.len() {
+                            let h_left = header.len() - n;
+                            buf[..h_left].copy_from_slice(&header[n..]);
+                            buf[h_left..].copy_from_slice(&masked);
+                        } else {
+                            buf.copy_from_slice(&masked[n - header.len()..]);
+                        }
+                        Ok(())
+                    })?;
                     write.bind(py).call1((tail,))?;
                     return Ok(());
                 }
-                // written <= 0 (EAGAIN or hard error): fall through to
-                // transport.write(full) so asyncio reports the error normally.
+                // EAGAIN / error: fall through to slow path so asyncio reports it.
             }
         }
+        let out = self.build_merged_frame(py, header, payload, mask_key)?;
         write.bind(py).call1((out,))?;
         Ok(())
+    }
+
+    /// Build a single PyBytes containing header + masked payload — used on the
+    /// slow path (paused transport, no raw fd, or sendmsg fallback).
+    fn build_merged_frame<'py>(
+        &self,
+        py: Python<'py>,
+        header: &[u8],
+        payload: &[u8],
+        mask_key: [u8; 4],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let total = header.len() + payload.len();
+        PyBytes::new_with(py, total, |buf| {
+            buf[..header.len()].copy_from_slice(header);
+            let p = &mut buf[header.len()..];
+            p.copy_from_slice(payload);
+            apply_mask(p, mask_key);
+            Ok(())
+        })
     }
 
     /// Returns an asyncio.Future that completes with the next received frame payload.
