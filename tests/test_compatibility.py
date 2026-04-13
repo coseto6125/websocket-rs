@@ -10,9 +10,10 @@ import time
 # Set stdout encoding to utf-8 for Windows compatibility
 sys.stdout.reconfigure(encoding="utf-8")
 
+import websockets
+
 import websocket_rs.async_client
 import websocket_rs.sync.client
-import websockets
 
 sync_connect = websocket_rs.sync.client.connect
 async_connect = websocket_rs.async_client.connect

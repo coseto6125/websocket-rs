@@ -19,7 +19,6 @@ import signal
 import statistics
 import struct
 import subprocess
-import sys
 import time
 
 import uvloop
@@ -47,10 +46,16 @@ def start_rust_server(bin_name: str, port: int) -> subprocess.Popen:
     path = f"target/release/{bin_name}"
     if not os.path.exists(path):
         raise RuntimeError(f"{path} not built")
+    import shutil
+
     # Pin server to core 0 (client process pins itself to core 1 below) — same
-    # CCD on Ryzen 9950X for L3 sharing while avoiding contention.
+    # CCD on Ryzen 9950X for L3 sharing while avoiding contention. Falls back
+    # to no-pinning if `taskset` isn't available (macOS/Windows/minimal CI).
+    cmd = [path, str(port)]
+    if shutil.which("taskset"):
+        cmd = ["taskset", "-c", "0", *cmd]
     p = subprocess.Popen(
-        ["taskset", "-c", "0", path, str(port)],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -118,6 +123,53 @@ def start_picows_server(port: int):
 
 def parse_mid(resp):
     return struct.unpack_from("=I", resp, 0)[0]
+
+
+async def native_cb_pipelined(uri, size, n):
+    """Native client using on_message callback — picows-style architecture.
+
+    Same as native_pipelined but delivers messages via a sync callback
+    instead of awaiting futures. Exists to isolate architectural (await vs
+    callback) cost from implementation cost when comparing against picows.
+    """
+    base = b"a" * size
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    send_times = {}
+    rtts = []
+    st = {"ws": None, "sent": 0, "received": 0, "in_warmup": True, "w_done": 0}
+
+    def on_msg(msg):
+        if st["in_warmup"]:
+            st["w_done"] += 1
+            if st["w_done"] >= WARMUP:
+                st["in_warmup"] = False
+                _fill()
+            return
+        t_recv = time.perf_counter()
+        mid = struct.unpack_from("=I", memoryview(msg))[0]
+        rtts.append((t_recv - send_times[mid]) * 1000)
+        st["received"] += 1
+        if st["received"] >= n:
+            if not done.done():
+                done.set_result(None)
+            return
+        _fill()
+
+    def _fill():
+        ws = st["ws"]
+        while st["sent"] < n and (st["sent"] - st["received"]) < WINDOW:
+            send_times[st["sent"]] = time.perf_counter()
+            ws.send(struct.pack("=I", st["sent"]) + base)
+            st["sent"] += 1
+
+    ws = await native_connect(uri, on_message=on_msg)
+    st["ws"] = ws
+    for _ in range(WARMUP):
+        ws.send(struct.pack("=I", 9999) + b"w")
+    await done
+    ws.close()
+    return statistics.mean(rtts), statistics.median(rtts), statistics.quantiles(rtts, n=100)[98]
 
 
 async def native_rr(uri, size, n):
@@ -246,25 +298,30 @@ async def picows_pipelined(uri, size, n):
 async def run_against(server_label: str, port: int):
     uri = f"ws://127.0.0.1:{port}"
     print(f"\n=== Server: {server_label} ===")
-    print(f"{'size':>6} {'mode':>12} {'native':>22} {'picows':>22}")
-    print(f"{'':6} {'':12} {'mean/p50/p99 ms':>22} {'mean/p50/p99 ms':>22}")
-    print("-" * 70)
+    print(f"{'size':>6} {'mode':>12} {'native(await)':>22} {'native(on_message)':>22} {'picows':>22}")
+    print(f"{'':6} {'':12} {'mean/p50/p99 ms':>22} {'mean/p50/p99 ms':>22} {'mean/p50/p99 ms':>22}")
+    print("-" * 94)
     for size in (512, 4096, 16384, 65536):
         for mode in ("RR", "pipelined"):
             fn_n = native_rr if mode == "RR" else native_pipelined
             fn_p = picows_rr if mode == "RR" else picows_pipelined
             n_m, n_p50, n_p99 = await fn_n(uri, size, N)
+            # Callback mode only meaningful for pipelined (RR would still await anyway).
+            if mode == "pipelined":
+                c_m, c_p50, c_p99 = await native_cb_pipelined(uri, size, N)
+            else:
+                c_m = c_p50 = c_p99 = float("nan")
             if PICOWS:
                 p_m, p_p50, p_p99 = await fn_p(uri, size, N)
             else:
                 p_m = p_p50 = p_p99 = float("nan")
-            winner = "native" if n_m < p_m else "picows"
-            delta = abs(n_m - p_m) / max(n_m, p_m) * 100
+            best = min((n_m, "await"), (c_m, "cb") if mode == "pipelined" else (float("inf"), ""), (p_m, "picows"))
             print(
                 f"{size:>6}B {mode:>12} "
                 f"{n_m:6.3f}/{n_p50:5.3f}/{n_p99:5.3f}     "
+                f"{c_m:6.3f}/{c_p50:5.3f}/{c_p99:5.3f}     "
                 f"{p_m:6.3f}/{p_p50:5.3f}/{p_p99:5.3f}   "
-                f"← {winner} −{delta:.0f}%"
+                f"← {best[1]}"
             )
 
 

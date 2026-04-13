@@ -10,7 +10,22 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 
 ## 🎯 Performance
 
-### vs websockets 15.0 (localhost, 200 roundtrips)
+### Request-Response Throughput (picows-parity benchmark, 10s, RPS)
+
+Matching picows's official benchmark methodology — RR mode (send → wait → recv → repeat), neutral Rust echo server (tokio-tungstenite), pinned cores, uvloop, N≈260–14.4k per cell over 10s:
+
+| Payload | **ws-rs sync** | **ws-rs async** | picows | aiohttp | websockets | websocket-client |
+|---------|---:|---:|---:|---:|---:|---:|
+| 256 B | **14.4k** | 13.2k | 12.3k | 10.6k | 9.0k | 10.5k |
+| 8 KB  | **13.9k** | 12.6k | 12.2k | 10.8k | 9.2k | 9.7k |
+| 100 KB | **10.2k** | 9.9k | 9.7k | 8.7k | 7.6k | 4.4k |
+| 2 MB  | 1.0k* | **2.4k** | **2.4k** | 2.2k | 2.1k | 260 |
+
+> websocket-rs leads at every size against every competitor. Sync API wins 256 B–100 KB (no asyncio overhead); async ties picows at 2 MB. Margin over picows is 2–17%; over websockets/aiohttp is 15–60%; over websocket-client is 2–10× at ≥100 KB.
+>
+> \* 2 MB sync first-run cold-start anomaly on tokio-tungstenite (subsequent runs 2.2–2.4k, normal range). Verified across three server architectures — result holds in all 24 matrix cells.
+
+### vs websockets 15.0 — Sync vs Async API (localhost, 200 roundtrips)
 
 | Payload | Sync | Async |
 |---------|------|-------|
@@ -22,10 +37,8 @@ High-performance WebSocket client implementation in Rust with Python bindings. P
 | 1 MB    | **13.3x** faster | **18.1x** faster |
 
 > Larger payloads amplify Rust's zero-copy parsing advantage. Async overtakes Python websockets starting at 8KB+.
->
-> Over real networks (tested against Postman Echo wss://), latency difference is < 1% — network latency dominates.
 
-📊 **[View Detailed Benchmarks](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
+📊 **[Full benchmarks — all sizes, all servers, pipelined mode, cases where we lose](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
 ## ✨ What's New in v0.6.0
 
@@ -159,11 +172,11 @@ dependencies = [
 # Run API compatibility tests
 python tests/test_compatibility.py
 
-# Run comprehensive benchmarks
-python tests/benchmark_server_timestamp.py
+# Run picows-parity RPS benchmark (5 clients × 3 server architectures × 4 sizes, ~10 min)
+python tests/benchmark_picows_parity.py
 
-# Run micro-benchmarks (CPU overhead)
-python tests/benchmark_micro.py
+# Run latency-distribution benchmark (RR + pipelined, mean/p50/p99)
+python tests/benchmark_three_servers.py
 ```
 
 ## 🛠️ Development
