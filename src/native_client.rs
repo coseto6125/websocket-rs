@@ -33,6 +33,14 @@ use std::io::Read as _;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+// WebSocket opcodes per RFC 6455 §5.2.
+const OP_CONTINUATION: u8 = 0x0;
+const OP_TEXT: u8 = 0x1;
+const OP_BINARY: u8 = 0x2;
+const OP_CLOSE: u8 = 0x8;
+const OP_PING: u8 = 0x9;
+const OP_PONG: u8 = 0xA;
+
 /// Apply a 4-byte XOR mask to every byte of `buf`. Dispatches at runtime to
 /// AVX-512 (64-byte stride) when the CPU supports it; otherwise falls back to
 /// the scalar u32 loop which rustc auto-vectorises to AVX2 (32-byte stride)
@@ -546,7 +554,6 @@ fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>>
 /// bytes actually written or -1 on any error. The caller handles partial
 /// writes / errors by falling back to asyncio's transport.write.
 #[cfg(unix)]
-#[allow(dead_code)]
 fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
     // MSG_NOSIGNAL is Linux-specific; macOS achieves the same via SO_NOSIGPIPE
     // on the socket (asyncio already sets that when creating the transport on
@@ -570,11 +577,10 @@ fn native_send(_fd: i32, _buf: &[u8]) -> isize {
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
-fn encode_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+fn encode_control_frame(state: &mut State, opcode: u8, payload: &[u8]) -> Vec<u8> {
     let plen = payload.len().min(125);
+    let mask = next_mask_key(state);
     let mut out = Vec::with_capacity(2 + 4 + plen);
-    let mut mask = [0u8; 4];
-    rand::rng().fill(&mut mask);
     out.push(0x80 | opcode);
     out.push(0x80 | plen as u8);
     out.extend_from_slice(&mask);
@@ -582,6 +588,18 @@ fn encode_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let start = out.len() - plen;
     apply_mask(&mut out[start..], mask);
     out
+}
+
+/// Pull a 4-byte WebSocket mask key from the per-connection pool, refilling
+/// in batches of 256 to amortise the rand call.
+#[inline]
+fn next_mask_key(state: &mut State) -> [u8; 4] {
+    if state.mask_pool.is_empty() {
+        let mut buf = [0u32; 256];
+        rand::rng().fill(&mut buf[..]);
+        state.mask_pool.extend_from_slice(&buf);
+    }
+    state.mask_pool.pop().unwrap().to_ne_bytes()
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -683,12 +701,12 @@ impl NativeClient {
                 if data.len() - off < hdr + plen {
                     break;
                 }
-                if !fin || opcode == 0x0 || rsv1 {
+                if !fin || opcode == OP_CONTINUATION || rsv1 {
                     break;
                 }
                 let total = hdr + plen;
                 match opcode {
-                    0x1 | 0x2 => {
+                    OP_TEXT | OP_BINARY => {
                         // Zero-copy: wrap PyBytes as a Bytes owner — no memcpy
                         // of the payload bytes. PyBytes is immutable so the
                         // pointer is stable for as long as the refcount is
@@ -697,7 +715,7 @@ impl NativeClient {
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     }
-                    0x8 => {
+                    OP_CLOSE => {
                         state.closed = true;
                         Self::fail_all_pending(py, &mut state, "Connection closed by peer");
                         if let Some(t) = state.transport.as_ref() {
@@ -738,18 +756,18 @@ impl NativeClient {
                 // Fragmented frames (fin=false, or opcode=0x0 continuation) and
                 // compressed frames (rsv1=true) need buffered handling — bail
                 // to the slow path where the DeflateCtx lives.
-                if !fin || opcode == 0x0 || rsv1 {
+                if !fin || opcode == OP_CONTINUATION || rsv1 {
                     break;
                 }
                 let total = hdr + plen;
                 let slice = &data[off + hdr..off + total];
                 match opcode {
-                    0x1 | 0x2 => {
+                    OP_TEXT | OP_BINARY => {
                         let payload = Bytes::copy_from_slice(slice);
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     }
-                    0x8 => {
+                    OP_CLOSE => {
                         state.closed = true;
                         Self::fail_all_pending(py, &mut state, "Connection closed by peer");
                         if let Some(t) = state.transport.as_ref() {
@@ -803,14 +821,6 @@ impl NativeClient {
             cb.bind(py).call1((msg,))?;
         }
     }
-
-    // NOTE: BufferedProtocol (get_buffer / buffer_updated) was intentionally
-    // removed — per-callback memoryview slicing + PyByteArray resize turn out
-    // to cost more than asyncio's internal bytes-object construction for
-    // data_received. picows explicitly abandoned the same path after their
-    // own benchmarking (see picows.pyx §"buffered protocol is actually
-    // slower"). data_received below has a fast parse-from-slice path that
-    // avoids the intermediate copy for the common case.
 
     /// Called by asyncio transport when its send buffer crosses the high-water mark.
     /// We stop draining into the transport; subsequent send() calls buffer internally.
@@ -939,15 +949,7 @@ impl NativeClient {
                 _ => 8,
             } + 4; // 4-byte mask
 
-        // Pull a pre-generated mask key from the pool — already holding st.
-        let mask_key: [u8; 4] = {
-            if st.mask_pool.is_empty() {
-                let mut buf = [0u32; 256];
-                rand::rng().fill(&mut buf[..]);
-                st.mask_pool.extend(buf.iter().copied());
-            }
-            st.mask_pool.pop().unwrap().to_ne_bytes()
-        };
+        let mask_key = next_mask_key(&mut st);
 
         // Encode header onto the stack (max 14 bytes: 2 + 8 length + 4 mask).
         let mut header_buf = [0u8; 14];
@@ -1077,7 +1079,7 @@ impl NativeClient {
 
     #[getter]
     fn is_open(&self) -> bool {
-        let s = self.state.borrow_mut();
+        let s = self.state.borrow();
         s.handshake_done && !s.closed && s.transport.is_some()
     }
 
@@ -1136,17 +1138,17 @@ impl NativeClient {
 
     #[getter]
     fn subprotocol(&self) -> Option<String> {
-        self.state.borrow_mut().subprotocol.clone()
+        self.state.borrow().subprotocol.clone()
     }
 
     #[getter]
     fn close_code(&self) -> Option<u16> {
-        self.state.borrow_mut().close_code
+        self.state.borrow().close_code
     }
 
     #[getter]
     fn close_reason(&self) -> Option<String> {
-        self.state.borrow_mut().close_reason.clone()
+        self.state.borrow().close_reason.clone()
     }
 
     /// Send a ping frame. Payload must be ≤125 bytes (control-frame limit).
@@ -1158,7 +1160,7 @@ impl NativeClient {
                 "ping payload exceeds 125 bytes (WS control-frame limit)",
             ));
         }
-        let state = self.state.borrow_mut();
+        let mut state = self.state.borrow_mut();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -1167,8 +1169,8 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
+        let frame = encode_control_frame(&mut state, OP_PING, &payload);
         drop(state);
-        let frame = encode_control_frame(0x9, &payload);
         transport
             .bind(py)
             .call_method1("write", (PyBytes::new(py, &frame),))?;
@@ -1276,7 +1278,7 @@ impl NativeClient {
             }
             let total = hdr + plen;
             match opcode {
-                0x1 | 0x2 => {
+                OP_TEXT | OP_BINARY => {
                     // Data frame (text / binary). FIN=1 and no pending fragment =
                     // complete message. Otherwise start accumulating.
                     state.buf.advance(hdr);
@@ -1344,7 +1346,7 @@ impl NativeClient {
                         }
                     }
                 }
-                0x8 => {
+                OP_CLOSE => {
                     // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen);
@@ -1363,19 +1365,19 @@ impl NativeClient {
                     }
                     break;
                 }
-                0x9 => {
+                OP_PING => {
                     // Ping: echo payload back as a Pong frame (RFC 6455 §5.5.2).
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen).freeze();
                     let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
                     if let Some(t) = transport {
-                        let frame = encode_control_frame(0xA, &payload);
+                        let frame = encode_control_frame(&mut state, OP_PONG, &payload);
                         let _ = t
                             .bind(py)
                             .call_method1("write", (PyBytes::new(py, &frame),));
                     }
                 }
-                0xA => {
+                OP_PONG => {
                     // Pong — silently consumed; could dispatch to a ping-waiter in future.
                     state.buf.advance(total);
                 }
@@ -1446,8 +1448,6 @@ fn connect<'py>(
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
     let client = NativeClient {
-        // Arc<RefCell> by design: pyclass(unsendable) ensures single-thread
-        // access; PyCFunction closures share state with the client.
         #[allow(clippy::arc_with_non_send_sync)]
         state: Arc::new(RefCell::new(State {
             transport: None,

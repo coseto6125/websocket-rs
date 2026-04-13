@@ -18,12 +18,12 @@ crate-type = ["cdylib"]
 
 [[bin]]
 name = "ws_echo_server"
-path = "benches/ws_echo_server.rs"
+path = "src/bin/ws_echo_server.rs"
 required-features = ["echo-server-bin"]
 
 [[bin]]
 name = "ws_echo_fastws"
-path = "benches/ws_echo_fastws.rs"
+path = "src/bin/ws_echo_fastws.rs"
 required-features = ["echo-server-bin"]
 
 [features]
