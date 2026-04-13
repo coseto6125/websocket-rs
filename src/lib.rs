@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod async_client;
+mod native_client;
 mod sync_client;
 
 // Constants
@@ -19,6 +20,9 @@ fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Register async_client module
     async_client::register_async_client(py, m)?;
+
+    // Register native_client module (asyncio.Protocol-based)
+    native_client::register_native_client(py, m)?;
 
     // Expose version
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

@@ -950,6 +950,20 @@ pub fn connect<'py>(
     proxy: Option<String>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // Emit a one-shot deprecation notice — the legacy tokio-backed async client
+    // is 2-16x slower than the native asyncio.Protocol one in websocket_rs.connect.
+    let warnings = py.import("warnings")?;
+    let cat = py.import("builtins")?.getattr("DeprecationWarning")?;
+    warnings.call_method1(
+        "warn",
+        (
+            "websocket_rs.async_client.connect is deprecated: use \
+             websocket_rs.connect (or websocket_rs.native_client.connect) \
+             for the asyncio.Protocol-native implementation. \
+             async_client will be removed in 2.0.",
+            cat,
+        ),
+    )?;
     let ws = AsyncClientConnection::new(uri, headers, proxy, None, None, None)?;
     let ws_cell = Py::new(py, ws)?;
     AsyncClientConnection::__aenter__(ws_cell, py)

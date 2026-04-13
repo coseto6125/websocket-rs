@@ -11,6 +11,7 @@ import time
 sys.stdout.reconfigure(encoding="utf-8")
 
 import websocket_rs.async_client
+import websocket_rs.native_client
 import websocket_rs.sync.client
 import websockets
 import websockets.sync.client
@@ -58,6 +59,21 @@ async def bench_async(label: str, connect_fn, iters: int, msg):
         elapsed = time.perf_counter() - t0
     finally:
         await ws.close()
+    print(f"  {label:22} {fmt(iters, elapsed)}")
+
+
+async def bench_native(label: str, iters: int, msg):
+    """native_client has sync send (no await) and returns WSMessage — own benchmark path."""
+    ws = await websocket_rs.native_client.connect(URI)
+    for _ in range(WARMUP):
+        ws.send(msg)
+        await ws.recv()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        ws.send(msg)
+        await ws.recv()
+    elapsed = time.perf_counter() - t0
+    ws.close()
     print(f"  {label:22} {fmt(iters, elapsed)}")
 
 
@@ -117,11 +133,13 @@ async def main():
         print()
 
         print(f"[Async] Small text (32B) x {ITERS}")
-        await bench_async("websocket-rs", websocket_rs.async_client.connect, ITERS, small)
+        await bench_async("ws-rs (legacy tokio)", websocket_rs.async_client.connect, ITERS, small)
+        await bench_native("ws-rs native (asyncio)", ITERS, small.encode())
         print()
 
         print(f"[Async] Large binary (16KB) x {ITERS}")
-        await bench_async("websocket-rs", websocket_rs.async_client.connect, ITERS, large_bin)
+        await bench_async("ws-rs (legacy tokio)", websocket_rs.async_client.connect, ITERS, large_bin)
+        await bench_native("ws-rs native (asyncio)", ITERS, large_bin)
         print()
 
         print(f"[Async] Ping burst x {ITERS * 4}")
