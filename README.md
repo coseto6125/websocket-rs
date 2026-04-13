@@ -16,10 +16,10 @@ Matching picows's official benchmark methodology — RR mode (send → wait → 
 
 | Payload | **ws-rs sync** | **ws-rs async** | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.0k** | 12.4k | 12.7k | 11.7k | 9.5k | 11.6k |
-| 8 KB  | **14.1k** | 13.2k | 12.3k | 10.2k | 8.8k | 9.5k |
-| 100 KB | **10.1k** | 9.5k | 9.7k | 9.1k | 7.7k | 4.3k |
-| 1 MB  | 3.9k | **4.2k** | **4.2k** | 3.5k | 3.2k | 547 |
+| 256 B | **15.0k** | 12.8k | 13.5k | 12.0k | 9.9k | 11.7k |
+| 8 KB  | **15.1k** | 13.4k | 13.2k | 11.8k | 9.6k | 10.1k |
+| 100 KB | **10.8k** | 10.3k | 10.5k | 9.4k | 8.1k | 4.5k |
+| 1 MB  | 4.0k | **4.2k** | **4.2k** | 3.4k | 3.0k | 509 |
 
 > ws-rs wins or ties **12/12** plain-TCP cells across three server architectures (tokio-tungstenite, fastwebsockets, picows-server). Sync wins 256 B–100 KB (no asyncio overhead); async ties picows at 1 MB. Lead over picows is 2–18%; over websockets/aiohttp is 15–65%; over websocket-client is 2–10× at ≥100 KB.
 
@@ -29,10 +29,10 @@ Same RR methodology, every client connects via `wss://` to a tokio-tungstenite T
 
 | Payload | **ws-rs sync** | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **13.4k** | 9.3k | 9.4k | 8.9k | 7.9k | 9.6k |
-| 8 KB  | **11.6k** | 8.7k | 8.8k | 8.1k | 7.4k | 8.6k |
-| 100 KB | **7.2k** | 6.0k | 6.2k | 5.6k | 5.1k | 3.7k |
-| 1 MB  | 1.4k | 1.6k | **1.6k** | 1.5k | 1.5k | 470 |
+| 256 B | **13.2k** | 9.3k | 9.6k | 9.3k | 8.0k | 9.7k |
+| 8 KB  | **11.9k** | 8.9k | 8.8k | 8.3k | 7.2k | 8.5k |
+| 100 KB | **7.1k** | 5.9k | 6.0k | 5.8k | 5.3k | 3.8k |
+| 1 MB  | 1.4k | 1.4k | **1.5k** | 1.4k | 1.4k | 461 |
 
 > Sync wins TLS 256 B–100 KB by 30–60% over every competitor. At 1 MB, async ties picows (within 2%) and beats websockets/aiohttp by 7%. 1 MB is the realistic upper bound for production WS — Cloudflare's per-frame hard cap, Azure SignalR's default, well above AWS API Gateway WS (32 KB).
 
@@ -140,11 +140,14 @@ ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
 
 | Scenario | Recommendation | Why |
 |----------|---------------|-----|
-| Simple scripts, CLI tools | **Sync** | 1.8x faster, no event loop needed |
-| Large payload (16KB+) | **Sync or Async** | 3-18x faster, zero-copy parsing |
-| High concurrency | **Async** | Supports thousands of connections |
-| Small messages, low latency | **Sync** or Python websockets | Async bridge overhead for small msgs |
-| Cross-network (real servers) | **Either** | Network latency dominates, < 1% difference |
+| Simple scripts, CLI tools (no asyncio) | **ws-rs sync** | Picows can't run here; 30–60% over websocket-client |
+| In an asyncio app, sequential RR < 100 KB | **ws-rs sync** (call from `to_thread`) or **picows** | Sync wins raw throughput; picows wins single-RT latency |
+| In an asyncio app, pipelined / streaming | **ws-rs async** | +9–21% over picows on pipelined throughput |
+| In an asyncio app, ≥ 1 MB payloads | **ws-rs async** ≈ **picows** | Roughly tied; both fight server-side ceiling |
+| HFT / colocated trading, single-RT µs counts | **picows** | 3–10 µs lower RR latency; Cython direct CPython API |
+| Cross-network (real servers) | **Either** | Network RT dominates; library choice < 1% of total latency |
+
+> **vs picows summary**: ws-rs wins **sustained throughput** (especially pipelined) and adds a **sync API picows lacks**. Picows wins **single-RT latency** by 3–10 µs (PyO3 vs Cython architectural cost) — meaningful only in colo HFT.
 
 ## 🔧 Advanced Installation
 

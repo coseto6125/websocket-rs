@@ -11,7 +11,6 @@ import os
 import signal
 import ssl
 import subprocess
-import sys
 import time
 
 import uvloop
@@ -267,7 +266,7 @@ async def main():
     try:
         await asyncio.sleep(0.3)
         enabled = [(name, fn) for name, ok, fn in CLIENTS if ok and fn is not None]
-        print(f"=== Server: tokio-tungstenite (TLS, rustls) ===")
+        print("=== Server: tokio-tungstenite (TLS, rustls) ===")
         header = f"{'size':>8} " + " ".join(f"{name:>11}" for name, _ in enabled)
         print(header)
         print("-" * len(header))

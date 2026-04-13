@@ -25,10 +25,18 @@ import uvloop
 
 uvloop.install()
 
-from websocket_rs.native_client import connect as native_connect
+from websocket_rs.native_client import connect as native_connect  # noqa: E402
 
 try:
-    from picows import WSCloseCode, WSFrame, WSListener, WSMsgType, WSTransport, ws_connect, ws_create_server
+    from picows import (  # noqa: F401 — WSCloseCode/WSTransport/ws_create_server used inside _picows_echo_proc
+        WSCloseCode,
+        WSFrame,
+        WSListener,
+        WSMsgType,
+        WSTransport,
+        ws_connect,
+        ws_create_server,
+    )
 
     PICOWS = True
 except ImportError:
@@ -343,7 +351,7 @@ async def main():
     ]
     procs = []
     try:
-        for label, kind, bin_name, port in servers:
+        for _label, kind, bin_name, port in servers:
             if kind == "rust":
                 procs.append(start_rust_server(bin_name, port))
             else:

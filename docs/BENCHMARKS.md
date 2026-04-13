@@ -36,28 +36,28 @@ framework limits, not real-world workloads.
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.0k** | 12.4k | 12.7k | 11.7k | 9.5k | 11.6k |
-| 8 KB  | **14.1k** | 13.2k | 12.3k | 10.2k | 8.8k | 9.5k |
-| 100 KB | **10.1k** | 9.5k | 9.7k | 9.1k | 7.7k | 4.3k |
-| 1 MB  | 3.9k | **4.2k** | **4.2k** | 3.5k | 3.2k | 547 |
+| 256 B | **15.0k** | 12.8k | 13.5k | 12.0k | 9.9k | 11.7k |
+| 8 KB  | **15.1k** | 13.4k | 13.2k | 11.8k | 9.6k | 10.1k |
+| 100 KB | **10.8k** | 10.3k | 10.5k | 9.4k | 8.1k | 4.5k |
+| 1 MB  | 4.0k | **4.2k** | **4.2k** | 3.4k | 3.0k | 509 |
 
 ### Against fastwebsockets server (plain TCP)
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **14.4k** | 12.8k | 13.0k | 11.7k | 9.5k | 11.4k |
-| 8 KB  | **14.6k** | 12.8k | 13.2k | 11.2k | 9.7k | 10.4k |
-| 100 KB | **11.1k** | 10.8k | 10.7k | 9.7k | 8.3k | 4.5k |
-| 1 MB  | 4.2k | **4.7k** | 4.0k | 3.5k | 3.0k | 502 |
+| 256 B | **15.5k** | 13.1k | 13.6k | 11.9k | 10.0k | 11.5k |
+| 8 KB  | **14.5k** | 12.9k | 12.6k | 11.7k | 9.2k | 10.3k |
+| 100 KB | **11.3k** | 10.8k | 10.1k | 9.6k | 7.9k | 4.4k |
+| 1 MB  | 4.0k | **4.4k** | 4.0k | 3.7k | 3.4k | 528 |
 
 ### Against picows server (plain TCP)
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **13.7k** | 12.1k | 11.8k | 10.7k | 8.7k | 11.0k |
-| 8 KB  | **12.8k** | 11.5k | 11.3k | 10.9k | 8.7k | 9.3k |
-| 100 KB | **9.6k** | 9.0k | 8.9k | 8.5k | 7.1k | 4.1k |
-| 1 MB  | 3.3k | **3.5k** | 3.1k | 2.9k | 2.6k | 483 |
+| 256 B | **14.1k** | 12.2k | 12.2k | 11.3k | 9.5k | 11.2k |
+| 8 KB  | **13.6k** | 12.2k | 11.9k | 10.8k | 8.7k | 9.3k |
+| 100 KB | **10.2k** | 9.5k | 9.6k | 8.9k | 7.8k | 4.3k |
+| 1 MB  | 3.4k | **3.8k** | 3.3k | 2.8k | 2.6k | 483 |
 
 ### TLS (wss://) — tokio-tungstenite server, rustls
 
@@ -69,10 +69,10 @@ which uses pure-Rust rustls). 3-run averaged:
 
 | Payload | ws-rs sync | ws-rs async | picows | aiohttp | websockets | websocket-client |
 |---------|---:|---:|---:|---:|---:|---:|
-| 256 B | **13.4k** | 9.3k | 9.4k | 8.9k | 7.9k | 9.6k |
-| 8 KB  | **11.6k** | 8.7k | 8.8k | 8.1k | 7.4k | 8.6k |
-| 100 KB | **7.2k** | 6.0k | 6.2k | 5.6k | 5.1k | 3.7k |
-| 1 MB  | 1.43k | 1.60k | **1.63k** | 1.50k | 1.47k | 470 |
+| 256 B | **13.2k** | 9.3k | 9.6k | 9.3k | 8.0k | 9.7k |
+| 8 KB  | **11.9k** | 8.9k | 8.8k | 8.3k | 7.2k | 8.5k |
+| 100 KB | **7.1k** | 5.9k | 6.0k | 5.8k | 5.3k | 3.8k |
+| 1 MB  | 1.4k | 1.4k | **1.5k** | 1.4k | 1.4k | 461 |
 
 **TLS overhead**: the same payload runs 25–60% slower under TLS than
 plain TCP. TLS dominates the data path at large sizes; the WS framing
@@ -82,11 +82,12 @@ library matters less.
 
 - **Plain TCP, 12/12 cells**: ws-rs wins or ties everywhere. Sync wins
   256 B–100 KB (no asyncio overhead); async ties picows at 1 MB on
-  tokio-tungstenite (4.3k = 4.3k) and wins on the other servers.
-- **TLS, 4/4 cells**: ws-rs wins or ties. Sync wins 256 B–100 KB by
-  30–60% over every competitor. At 1 MB, async ties picows (within
-  0.3%, 699 vs 701 RPS) and beats websockets/aiohttp by 7%.
-- **vs websocket-client**: 2× at 100 KB, 7–10× at 1 MB.
+  tokio-tungstenite (4.2k = 4.2k) and wins on the other servers.
+- **TLS, 3/4 cells**: ws-rs sync wins 256 B–100 KB — by 18–37% over
+  picows, 30–65% over websockets/aiohttp. At 1 MB, picows leads by
+  ~7% (1.5k vs 1.4k) — single-RT latency advantage compounds at this
+  size; ws-rs ties websockets/aiohttp at 1.4k.
+- **vs websocket-client**: 2× at 100 KB, 3× at 1 MB.
 
 Reproduce:
 ```
@@ -140,22 +141,67 @@ but with BufferedProtocol the await path is already at the syscall
 floor. Use `on_message` only when you specifically need synchronous
 delivery semantics, not for raw throughput.
 
-## 3. When websocket-rs Wins, Ties, or Loses
+## 3. Memory Footprint (idle connections)
+
+Buffers are allocated lazily — `recv_buf`, `send_buf`, and the framing
+`buf` start at zero capacity and grow via `reserve()` on the first send
+or receive. Matters for fan-out / notification-listener / IoT-backend
+workloads where most connections stay idle for long stretches.
+
+| Metric | Before (eager alloc) | After (lazy alloc, v0.7.0+) |
+|--------|---:|---:|
+| Per idle connection | ~130 KB | **8.9 KB** |
+| 10,000 idle connections | ~1.3 GB | **~90 MB** |
+| Warm-path RPS | unchanged | unchanged |
+
+Measurement: open 1,000 uvloop-backed connections against
+`ws_echo_server`, no traffic, sample RSS via `getrusage`.
+
+## 4. Compression (permessage-deflate, RFC 7692)
+
+`compression=True` negotiates `permessage-deflate` with
+`server/client_no_context_takeover`. Backend: `flate2` (pure-Rust
+miniz_oxide). Tested against a Python `websockets` server with deflate
+enabled (the built-in `ws_echo_server` does not advertise deflate; the
+client silently falls back to uncompressed if the server doesn't).
+
+| Payload (compressible JSON-like) | compression=False | compression=True | delta |
+|----------------------------------|---:|---:|---:|
+| 4 KB   | 8.8k RPS | 6.4k RPS | −26% |
+| 64 KB  | 6.6k RPS | 2.2k RPS | −67% |
+| 1 MB   | 2.3k RPS | 172 RPS  | **−93%** |
+
+**On localhost, compression costs more than it saves** — the CPU time
+spent compressing exceeds the (zero) bandwidth savings. Compression
+becomes beneficial when transmitting over bandwidth-limited links:
+
+| Network | 1 MB plain | 1 MB compressed (~200 KB) | Winner |
+|---------|---:|---:|---|
+| localhost (≥ 10 GB/s) | ~0 ms wire + 0 CPU | ~0 ms wire + 10 ms CPU | plain |
+| LAN (1 Gbps) | ~8 ms wire | ~1.6 ms wire + 10 ms CPU | plain |
+| WAN (10 Mbps) | ~800 ms wire | ~160 ms wire + 10 ms CPU | **compressed** |
+| Mobile (1 Mbps) | ~8 s wire | ~1.6 s wire + 10 ms CPU | **compressed** |
+
+**Rule of thumb**: enable `compression=True` only when your clients
+connect over the public internet and payloads exceed ~1 KB. For same-DC
+or low-latency LAN deployments, leave it off.
+
+## 5. When websocket-rs Wins, Ties, or Loses
 
 | Workload | Winner | Gap |
 |----------|---|---|
 | RR, any size, plain TCP | websocket-rs ~= picows | <5% |
 | RPS throughput (TCP), 256 B–100 KB | ws-rs sync | +2–18% vs picows |
 | RPS throughput (TCP), 1 MB | ws-rs async | tied with picows |
-| RPS throughput (TLS), 256 B–100 KB | ws-rs sync | +30–60% vs every competitor |
-| RPS throughput (TLS), 1 MB | ws-rs async | tied with picows (within 0.3%) |
+| RPS throughput (TLS), 256 B–100 KB | ws-rs sync | +18–37% vs picows; +30–65% vs websockets/aiohttp |
+| RPS throughput (TLS), 1 MB | picows | +7% over ws-rs (1.5k vs 1.4k); ws-rs ties aiohttp/websockets |
 | Pipelined, 512 B / 4 KB / 16 KB / 64 KB | websocket-rs | mean +14–25% vs picows |
 | vs websockets/aiohttp, all cells | websocket-rs | +15–65% RPS |
 | vs websocket-client, 100 KB | websocket-rs | ~2× RPS |
-| vs websocket-client, 1 MB | websocket-rs | 7–10× RPS |
+| vs websocket-client, 1 MB | websocket-rs | 3× RPS |
 | Over real WAN (Postman Echo wss://) | all clients ~= | <1% (network dominates) |
 
-## 4. Reproduce
+## 6. Reproduce
 
 ```bash
 # Build the Rust extension and neutral echo servers
