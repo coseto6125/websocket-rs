@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
+use flate2::read::DeflateDecoder;
+use flate2::{Compress, Compression, FlushCompress};
 use parking_lot::Mutex;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
@@ -27,6 +29,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use std::io::Read as _;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -57,13 +60,15 @@ fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
 const MIN_HDR: usize = 2;
 
 /// Parse a single server frame header (no mask — server->client frames are never masked).
-/// Returns (opcode, payload_len, header_size) or None if not enough data.
-fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
+/// Returns (fin, opcode, payload_len, header_size) or None if not enough data.
+fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
     if buf.len() < MIN_HDR {
         return None;
     }
     let b0 = buf[0];
     let b1 = buf[1];
+    let fin = (b0 & 0x80) != 0;
+    let rsv1 = (b0 & 0x40) != 0;
     let opcode = b0 & 0x0F;
     let plen_short = b1 & 0x7F;
     let (plen, hdr) = match plen_short {
@@ -85,7 +90,7 @@ fn parse_header(buf: &[u8]) -> Option<(u8, usize, usize)> {
         _ => unreachable!(),
     };
     // Server must NOT mask; we don't enforce (most server libs accept anyway).
-    Some((opcode, plen, hdr))
+    Some((fin, rsv1, opcode, plen, hdr))
 }
 
 struct State {
@@ -115,7 +120,28 @@ struct State {
     /// Close-frame fields (populated after receiving a CLOSE opcode).
     close_code: Option<u16>,
     close_reason: Option<String>,
+    /// Optional per-recv timeout (seconds). Applied via asyncio.wait_for wrapper
+    /// only when the slow path would block — backlog fast-path skips it.
+    receive_timeout: Option<f64>,
+    /// Fragmented-message reassembly: accumulates continuation frame payloads
+    /// until FIN=1 arrives. First frame's opcode is stashed here.
+    fragment_buf: Option<BytesMut>,
+    fragment_opcode: u8,
+    /// True when the current fragmented message used RSV1 (compressed) in the
+    /// first frame — per RFC 7692 the flag is set only on the first frame.
+    fragment_rsv1: bool,
+    /// permessage-deflate context, lazily initialised after negotiation.
+    deflate: Option<DeflateCtx>,
 }
+
+/// permessage-deflate per-connection state. We always negotiate
+/// client_no_context_takeover / server_no_context_takeover so streaming state
+/// never persists across messages — the DEFLATE allocators get reset after
+/// each message, trading a few % compression ratio for simpler, race-free code.
+/// Marker struct — presence of Option<DeflateCtx>::Some means permessage-deflate
+/// is negotiated. No per-connection state: Compress/Decompress are instantiated
+/// fresh per message (no_context_takeover semantics either way).
+struct DeflateCtx;
 
 /// Pre-completed awaitable. Yields the stored result via StopIteration on first
 /// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
@@ -313,6 +339,7 @@ fn build_handshake(
     path: &str,
     headers: &[(String, String)],
     subprotocols: &[String],
+    compression: bool,
 ) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
@@ -335,6 +362,14 @@ fn build_handshake(
         req.push_str(&subprotocols.join(", "));
         req.push_str("\r\n");
     }
+    if compression {
+        // no_context_takeover on both sides keeps decompressor state per-message,
+        // matching the DeflateCtx::reset calls in process_buffered_frames.
+        req.push_str(
+            "Sec-WebSocket-Extensions: permessage-deflate; \
+             client_no_context_takeover; server_no_context_takeover\r\n",
+        );
+    }
     // Skip the handful of headers we already manage ourselves; case-insensitive match.
     const RESERVED: &[&str] = &[
         "host",
@@ -355,6 +390,34 @@ fn build_handshake(
     }
     req.push_str("\r\n");
     (req.into_bytes(), expected)
+}
+
+/// Decompress a permessage-deflate payload. Per RFC 7692 §7.2.2 the client MUST
+/// append 00 00 FF FF before feeding to a raw-DEFLATE decoder.
+///
+/// Uses a fresh Decompress per call — matches server_no_context_takeover and
+/// sidesteps a real miniz_oxide bug where `reset(false)` leaves residual
+/// internal state that corrupts subsequent decompression of large inputs.
+fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>> {
+    if state.deflate.is_none() {
+        return Err(PyRuntimeError::new_err(
+            "received compressed frame but permessage-deflate is not enabled",
+        ));
+    }
+    let mut with_marker = Vec::with_capacity(compressed.len() + 4);
+    with_marker.extend_from_slice(compressed);
+    with_marker.extend_from_slice(&[0x00, 0x00, 0xFF, 0xFF]);
+
+    // `read::DeflateDecoder` wraps a reader and treats the stream as raw
+    // DEFLATE. read_to_end handles the grow-retry dance that decompress_vec
+    // needs to be hand-coded for. Consistently decodes regardless of the
+    // compressed/uncompressed size ratio.
+    let mut decoder = DeflateDecoder::new(with_marker.as_slice());
+    let mut out = Vec::with_capacity(compressed.len() * 4 + 128);
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| PyRuntimeError::new_err(format!("deflate decode error: {e}")))?;
+    Ok(out)
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
@@ -391,19 +454,22 @@ impl NativeClient {
         // parse frames straight out of `data` and only copy the tail (if any) back into
         // buf. Servers that deliver one frame per write hit this path and save a
         // memcpy per callback.
-        if state.handshake_done && state.buf.is_empty() {
+        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
             let mut off = 0usize;
-            while let Some((opcode, plen, hdr)) = parse_header(&data[off..]) {
+            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
                 if data.len() - off < hdr + plen {
+                    break;
+                }
+                // Fragmented frames (fin=false, or opcode=0x0 continuation) and
+                // compressed frames (rsv1=true) need buffered handling — bail
+                // to the slow path where the DeflateCtx lives.
+                if !fin || opcode == 0x0 || rsv1 {
                     break;
                 }
                 let total = hdr + plen;
                 let slice = &data[off + hdr..off + total];
                 match opcode {
                     0x1 | 0x2 => {
-                        // One memcpy into a fresh Bytes (no shared-buffer split available
-                        // since we don't own `data`), zero-copy from there to the Python
-                        // layer via WSMessage's buffer protocol.
                         let payload = Bytes::copy_from_slice(slice);
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
@@ -423,6 +489,8 @@ impl NativeClient {
             }
             if off < data.len() {
                 state.buf.extend_from_slice(&data[off..]);
+                drop(state);
+                return self.process_buffered_frames(py);
             }
             return Ok(());
         }
@@ -592,16 +660,65 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
-        drop(state);
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
-        let (payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
+        let (raw_payload, opcode): (&[u8], u8) = if let Ok(pb) = message.cast::<PyBytes>() {
             (pb.as_bytes(), 0x2)
         } else if let Ok(s) = message.cast::<PyString>() {
             (s.to_str()?.as_bytes(), 0x1)
         } else {
             return Err(PyValueError::new_err("message must be str or bytes"));
         };
+
+        // permessage-deflate: if negotiated, compress via a fresh DeflateEncoder
+        // (no_context_takeover means we'd reset state after every message anyway
+        // — starting fresh is simpler than stateful Compress::reset). Sync-flush
+        // produces a stream ending in 00 00 FF FF which we then strip per
+        // RFC 7692 §7.2.1. RSV1 gets set in the frame header below.
+        // permessage-deflate compression via raw Compress. A fresh instance
+        // each message matches client_no_context_takeover semantics and sidesteps
+        // the reset() pitfalls in miniz_oxide. We reserve enough output capacity
+        // up front so compress_vec finishes in a single call.
+        let compressed = state.deflate.is_some();
+        let deflate_buf: Vec<u8> = if compressed {
+            let mut comp = Compress::new(Compression::default(), false);
+            // Worst case: small overhead on random data; highly compressible
+            // data is much smaller. +64 covers header + sync marker + slack.
+            let mut out: Vec<u8> = Vec::with_capacity(raw_payload.len() + 64);
+            // Drive compression until all input is consumed AND the Sync marker
+            // has been emitted. With ample output capacity this loop finishes
+            // in one or two iterations.
+            let mut cursor = 0usize;
+            loop {
+                let need = if cursor < raw_payload.len() { 128 } else { 32 };
+                if out.capacity() - out.len() < need {
+                    out.reserve(raw_payload.len().max(1024));
+                }
+                let in_before = comp.total_in();
+                comp.compress_vec(&raw_payload[cursor..], &mut out, FlushCompress::Sync)
+                    .map_err(|e| PyRuntimeError::new_err(format!("deflate error: {e}")))?;
+                cursor += (comp.total_in() - in_before) as usize;
+                if cursor >= raw_payload.len() && out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+                    break;
+                }
+                if cursor >= raw_payload.len() && (comp.total_out() - in_before) == 0 {
+                    // Defensive: no progress after input exhausted.
+                    break;
+                }
+            }
+            if out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
+                out.truncate(out.len() - 4);
+            }
+            out
+        } else {
+            Vec::new()
+        };
+        let payload: &[u8] = if compressed {
+            &deflate_buf
+        } else {
+            raw_payload
+        };
+        drop(state);
 
         let plen = payload.len();
         let header_len =
@@ -617,7 +734,8 @@ impl NativeClient {
 
         // Allocate PyBytes and fill directly — one memcpy total.
         let out = PyBytes::new_with(py, total, |buf| {
-            buf[0] = 0x80 | opcode; // FIN=1
+            // FIN=1; set RSV1 (0x40) when the payload is deflated.
+            buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
             let mut pos = 2;
             if plen <= 125 {
                 buf[1] = 0x80 | plen as u8;
@@ -671,12 +789,19 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let timeout = state.receive_timeout;
         drop(state);
         let fut = loop_ref.bind(py).call_method0("create_future")?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
+        // If a per-recv timeout is set, wrap in asyncio.wait_for so recv() raises
+        // TimeoutError after `receive_timeout` seconds.
+        if let Some(t) = timeout {
+            let asyncio = py.import("asyncio")?;
+            return asyncio.call_method1("wait_for", (fut, t));
+        }
         Ok(fut)
     }
 
@@ -708,12 +833,17 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
+        let timeout = state.receive_timeout;
         drop(state);
         let fut = loop_ref.bind(py).call_method0("create_future")?;
         self.state
             .lock()
             .pending_recv
             .push_back(fut.clone().unbind());
+        if let Some(t) = timeout {
+            let asyncio = py.import("asyncio")?;
+            return asyncio.call_method1("wait_for", (fut, t));
+        }
         Ok(fut)
     }
 
@@ -811,6 +941,7 @@ impl NativeClient {
             let expected = state.expected_accept.clone();
             let mut matched = false;
             let mut subprotocol: Option<String> = None;
+            let mut deflate_accepted = false;
             for line in headers_str.lines() {
                 let lower = line.to_ascii_lowercase();
                 if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
@@ -819,10 +950,18 @@ impl NativeClient {
                     if let Some((_, rest)) = line.split_once(':') {
                         subprotocol = Some(rest.trim().to_string());
                     }
+                } else if lower.starts_with("sec-websocket-extensions:")
+                    && lower.contains("permessage-deflate")
+                {
+                    deflate_accepted = true;
                 }
             }
             state.buf.advance(end);
             state.subprotocol = subprotocol;
+            // Server didn't echo permessage-deflate → disable our compressor.
+            if !deflate_accepted {
+                state.deflate = None;
+            }
             if !matched {
                 if let Some(fut) = state.handshake_fut.take() {
                     let fut_b = fut.bind(py);
@@ -845,7 +984,7 @@ impl NativeClient {
         }
 
         loop {
-            let Some((opcode, plen, hdr)) = parse_header(&state.buf) else {
+            let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) else {
                 break;
             };
             if state.buf.len() < hdr + plen {
@@ -854,13 +993,72 @@ impl NativeClient {
             let total = hdr + plen;
             match opcode {
                 0x1 | 0x2 => {
-                    // Zero-copy: advance past header, then split_to() hands us an
-                    // Arc-backed Bytes for the payload range. No memcpy at all —
-                    // the PyBytes alloc that used to cost one per frame is gone.
+                    // Data frame (text / binary). FIN=1 and no pending fragment =
+                    // complete message. Otherwise start accumulating.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen).freeze();
-                    let msg = Py::new(py, WSMessage { data: payload })?;
-                    Self::deliver_message(py, &mut state, msg)?;
+                    let is_compressed = rsv1;
+                    if fin && state.fragment_buf.is_none() {
+                        let final_payload = if is_compressed {
+                            match decompress_message(&mut state, &payload) {
+                                Ok(p) => Bytes::from(p),
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            payload
+                        };
+                        let msg = Py::new(
+                            py,
+                            WSMessage {
+                                data: final_payload,
+                            },
+                        )?;
+                        Self::deliver_message(py, &mut state, msg)?;
+                    } else {
+                        // Fragmented message: remember whether RSV1 was on the
+                        // first frame; continuation frames don't carry it.
+                        let mut acc = BytesMut::with_capacity(plen);
+                        acc.extend_from_slice(&payload);
+                        state.fragment_buf = Some(acc);
+                        state.fragment_opcode = opcode;
+                        state.fragment_rsv1 = is_compressed;
+                        if fin {
+                            let raw = state.fragment_buf.take().unwrap().freeze();
+                            let compressed_flag = state.fragment_rsv1;
+                            state.fragment_opcode = 0;
+                            state.fragment_rsv1 = false;
+                            let out = if compressed_flag {
+                                Bytes::from(decompress_message(&mut state, &raw)?)
+                            } else {
+                                raw
+                            };
+                            let msg = Py::new(py, WSMessage { data: out })?;
+                            Self::deliver_message(py, &mut state, msg)?;
+                        }
+                    }
+                }
+                0x0 => {
+                    // Continuation frame — append to fragment_buf; deliver on FIN.
+                    state.buf.advance(hdr);
+                    let payload = state.buf.split_to(plen);
+                    if let Some(acc) = state.fragment_buf.as_mut() {
+                        acc.extend_from_slice(&payload);
+                    }
+                    if fin {
+                        if let Some(acc) = state.fragment_buf.take() {
+                            let compressed_flag = state.fragment_rsv1;
+                            state.fragment_opcode = 0;
+                            state.fragment_rsv1 = false;
+                            let raw = acc.freeze();
+                            let out = if compressed_flag {
+                                Bytes::from(decompress_message(&mut state, &raw)?)
+                            } else {
+                                raw
+                            };
+                            let msg = Py::new(py, WSMessage { data: out })?;
+                            Self::deliver_message(py, &mut state, msg)?;
+                        }
+                    }
                 }
                 0x8 => {
                     // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
@@ -940,7 +1138,8 @@ impl NativeClient {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None, compression=false))]
+#[allow(clippy::too_many_arguments)]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
@@ -948,6 +1147,9 @@ fn connect<'py>(
     subprotocols: Option<Vec<String>>,
     ssl_context: Option<Py<PyAny>>,
     connect_timeout: Option<f64>,
+    receive_timeout: Option<f64>,
+    proxy: Option<String>,
+    compression: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
@@ -969,6 +1171,11 @@ fn connect<'py>(
             subprotocol: None,
             close_code: None,
             close_reason: None,
+            receive_timeout,
+            fragment_buf: None,
+            fragment_opcode: 0,
+            fragment_rsv1: false,
+            deflate: if compression { Some(DeflateCtx) } else { None },
         })),
     };
     let state_arc = client.state.clone();
@@ -977,8 +1184,14 @@ fn connect<'py>(
     // Build handshake bytes + expected accept
     let headers_vec = headers.unwrap_or_default();
     let subprotocols_vec = subprotocols.unwrap_or_default();
-    let (req_bytes, expected) =
-        build_handshake(&host, port, &path, &headers_vec, &subprotocols_vec);
+    let (req_bytes, expected) = build_handshake(
+        &host,
+        port,
+        &path,
+        &headers_vec,
+        &subprotocols_vec,
+        compression,
+    );
     state_arc.lock().expected_accept = expected;
 
     // Create the handshake future and park it
@@ -1017,28 +1230,27 @@ fn connect<'py>(
         py.None()
     };
 
-    // loop.create_connection(protocol_factory, host, port, ssl=..., server_hostname=...) -> coro
-    let kwargs = pyo3::types::PyDict::new(py);
-    if is_tls {
-        kwargs.set_item("ssl", ssl_arg)?;
-        kwargs.set_item("server_hostname", host.clone())?;
-    }
-    let create_conn_coro = loop_.call_method(
-        "create_connection",
-        (protocol_factory, host.clone(), port),
-        Some(&kwargs),
-    )?;
-
-    // Chain: await create_connection, then transport.write(request), then await handshake_fut, then return client
-    // We implement this by wrapping in an async Python function crafted from asyncio.
-    // Simplest: schedule a Python helper that we build inline via an async def compiled once.
+    // If a proxy is configured, SOCKS5 negotiation happens Python-side inside
+    // run_in_executor (see _connect_helper). Otherwise create_connection takes
+    // host/port directly.
     let helper = get_connect_helper(py)?;
     let timeout_obj = match connect_timeout {
         Some(t) => t.into_pyobject(py)?.into_any(),
         None => py.None().into_bound(py),
     };
+    let proxy_obj = match proxy {
+        Some(p) => p.into_pyobject(py)?.into_any().unbind(),
+        None => py.None(),
+    };
+    let ssl_obj: Py<PyAny> = if is_tls { ssl_arg } else { py.None() };
     helper.call1((
-        create_conn_coro,
+        loop_,
+        protocol_factory,
+        host.clone(),
+        port,
+        is_tls,
+        ssl_obj,
+        proxy_obj,
         req_bytes,
         handshake_fut,
         client_obj,
@@ -1080,17 +1292,97 @@ fn get_connect_helper(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     }
     let code = r#"
 import asyncio as _asyncio
+import socket as _socket
 
-async def _connect_helper(create_conn_coro, req_bytes, handshake_fut, client, connect_timeout):
+
+def _socks5_connect_blocking(proxy_host, proxy_port, user, password, target_host, target_port):
+    """Blocking SOCKS5 CONNECT. Designed to run inside loop.run_in_executor so it
+    never blocks the asyncio event loop. Returns a connected, non-blocking socket
+    tunnelled through the proxy to (target_host, target_port)."""
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        s.connect((proxy_host, proxy_port))
+        s.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        methods = b"\x00" if not user else b"\x00\x02"
+        s.sendall(b"\x05" + bytes([len(methods)]) + methods)
+        reply = s.recv(2)
+        if len(reply) < 2 or reply[0] != 0x05:
+            raise ConnectionError("SOCKS5 proxy rejected greeting")
+        method = reply[1]
+        if method == 0x02:
+            if not user:
+                raise ConnectionError("SOCKS5 proxy requires auth but none supplied")
+            ub, pb = user.encode(), password.encode()
+            s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
+            ar = s.recv(2)
+            if len(ar) < 2 or ar[1] != 0x00:
+                raise ConnectionError("SOCKS5 auth failed")
+        elif method != 0x00:
+            raise ConnectionError(f"SOCKS5 proxy selected unsupported method {method}")
+        host_b = target_host.encode("idna")
+        req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + int(target_port).to_bytes(2, "big")
+        s.sendall(req)
+        hdr = s.recv(4)
+        if len(hdr) < 4 or hdr[1] != 0x00:
+            raise ConnectionError(f"SOCKS5 CONNECT failed: status={hdr[1] if len(hdr) >= 2 else '?'}")
+        atyp = hdr[3]
+        if atyp == 0x01:
+            s.recv(4)
+        elif atyp == 0x03:
+            nlen = s.recv(1)[0]
+            s.recv(nlen)
+        elif atyp == 0x04:
+            s.recv(16)
+        else:
+            raise ConnectionError(f"SOCKS5 returned unsupported ATYP {atyp}")
+        s.recv(2)
+        s.setblocking(False)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def _parse_proxy_uri(proxy):
+    # socks5://[user:password@]host:port
+    from urllib.parse import urlsplit, unquote
+    parts = urlsplit(proxy)
+    if parts.scheme not in ("socks5", "socks5h"):
+        raise ValueError(f"Only socks5:// proxies are supported (got {parts.scheme})")
+    user = unquote(parts.username) if parts.username else None
+    password = unquote(parts.password) if parts.password else ""
+    if not parts.hostname or not parts.port:
+        raise ValueError("SOCKS5 proxy URI must include host and port")
+    return parts.hostname, parts.port, user, password
+
+
+async def _connect_helper(loop, protocol_factory, host, port, is_tls, ssl_ctx,
+                          proxy, req_bytes, handshake_fut, client, connect_timeout):
     async def _do():
-        transport, _proto = await create_conn_coro
-        try:
-            sock = transport.get_extra_info("socket")
-            if sock is not None:
-                import socket as _s
-                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
-        except Exception:
-            pass
+        kwargs = {}
+        if is_tls:
+            kwargs["ssl"] = ssl_ctx
+            kwargs["server_hostname"] = host
+        if proxy:
+            proxy_host, proxy_port, user, password = _parse_proxy_uri(proxy)
+            sock = await loop.run_in_executor(
+                None, _socks5_connect_blocking,
+                proxy_host, proxy_port, user, password, host, port,
+            )
+            # Hand the already-connected socket to asyncio. TLS (if any) runs
+            # on top of it; asyncio will perform the TLS handshake itself.
+            kwargs["sock"] = sock
+            transport, _proto = await loop.create_connection(protocol_factory, **kwargs)
+        else:
+            transport, _proto = await loop.create_connection(
+                protocol_factory, host, port, **kwargs
+            )
+            try:
+                s = transport.get_extra_info("socket")
+                if s is not None:
+                    s.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
         transport.write(bytes(req_bytes))
         await handshake_fut
         return client
