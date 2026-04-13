@@ -181,9 +181,9 @@ impl SyncClientConnection {
 
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
-            Message::Text(s.to_str()?.to_owned())
+            Message::Text(s.to_str()?.into())
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
-            Message::Binary(bytes)
+            Message::Binary(bytes.into())
         } else {
             return Err(PyRuntimeError::new_err("Message must be string or bytes"));
         };
@@ -223,8 +223,8 @@ impl SyncClientConnection {
                 })?;
 
                 match msg {
-                    Message::Text(text) => return Ok(RecvResult::Text(text)),
-                    Message::Binary(data) => return Ok(RecvResult::Binary(data)),
+                    Message::Text(text) => return Ok(RecvResult::Text(text.to_string())),
+                    Message::Binary(data) => return Ok(RecvResult::Binary(data.to_vec())),
                     Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(frame) => {
                         if let Some(f) = frame {
@@ -274,7 +274,7 @@ impl SyncClientConnection {
                 .ws
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
-            ws.send(Message::Ping(data))
+            ws.send(Message::Ping(data.into()))
                 .map_err(|e| PyRuntimeError::new_err(format!("Ping failed: {}", e)))
         })
     }
@@ -286,7 +286,7 @@ impl SyncClientConnection {
                 .ws
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
-            ws.send(Message::Pong(data))
+            ws.send(Message::Pong(data.into()))
                 .map_err(|e| PyRuntimeError::new_err(format!("Pong failed: {}", e)))
         })
     }
