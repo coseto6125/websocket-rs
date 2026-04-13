@@ -109,6 +109,11 @@ struct State {
     /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
     /// lookups on every recv() slow-path.
     loop_ref: Option<Py<PyAny>>,
+    /// Negotiated subprotocol (Sec-WebSocket-Protocol response value), if any.
+    subprotocol: Option<String>,
+    /// Close-frame fields (populated after receiving a CLOSE opcode).
+    close_code: Option<u16>,
+    close_reason: Option<String>,
 }
 
 /// Pre-completed awaitable. Yields the stored result via StopIteration on first
@@ -293,7 +298,13 @@ pub struct NativeClient {
     state: Arc<Mutex<State>>,
 }
 
-fn build_handshake(host: &str, port: u16, path: &str) -> (Vec<u8>, String) {
+fn build_handshake(
+    host: &str,
+    port: u16,
+    path: &str,
+    headers: &[(String, String)],
+    subprotocols: &[String],
+) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
@@ -301,15 +312,55 @@ fn build_handshake(host: &str, port: u16, path: &str) -> (Vec<u8>, String) {
     let mut hasher = Sha1::new();
     hasher.update(accept_src.as_bytes());
     let expected = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
-    let req = format!(
+
+    let mut req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host}:{port}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\n\
-         Sec-WebSocket-Version: 13\r\n\r\n"
+         Sec-WebSocket-Version: 13\r\n"
     );
+    if !subprotocols.is_empty() {
+        req.push_str("Sec-WebSocket-Protocol: ");
+        req.push_str(&subprotocols.join(", "));
+        req.push_str("\r\n");
+    }
+    // Skip the handful of headers we already manage ourselves; case-insensitive match.
+    const RESERVED: &[&str] = &[
+        "host",
+        "upgrade",
+        "connection",
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+    ];
+    for (k, v) in headers {
+        if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        req.push_str(k);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
+    }
+    req.push_str("\r\n");
     (req.into_bytes(), expected)
+}
+
+/// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
+fn encode_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+    let plen = payload.len().min(125);
+    let mut out = Vec::with_capacity(2 + 4 + plen);
+    let mut mask = [0u8; 4];
+    rand::thread_rng().fill_bytes(&mut mask);
+    out.push(0x80 | opcode);
+    out.push(0x80 | plen as u8);
+    out.extend_from_slice(&mask);
+    out.extend_from_slice(&payload[..plen]);
+    let start = out.len() - plen;
+    apply_mask(&mut out[start..], mask);
+    out
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -626,6 +677,47 @@ impl NativeClient {
         s.handshake_done && !s.closed && s.transport.is_some()
     }
 
+    #[getter]
+    fn subprotocol(&self) -> Option<String> {
+        self.state.lock().subprotocol.clone()
+    }
+
+    #[getter]
+    fn close_code(&self) -> Option<u16> {
+        self.state.lock().close_code
+    }
+
+    #[getter]
+    fn close_reason(&self) -> Option<String> {
+        self.state.lock().close_reason.clone()
+    }
+
+    /// Send a ping frame. Payload must be ≤125 bytes (control-frame limit).
+    #[pyo3(signature = (data=None))]
+    fn ping(&self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
+        let payload = data.unwrap_or_default();
+        if payload.len() > 125 {
+            return Err(PyValueError::new_err(
+                "ping payload exceeds 125 bytes (WS control-frame limit)",
+            ));
+        }
+        let state = self.state.lock();
+        if state.closed {
+            return Err(PyRuntimeError::new_err("WebSocket is closed"));
+        }
+        let transport = state
+            .transport
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
+            .clone_ref(py);
+        drop(state);
+        let frame = encode_control_frame(0x9, &payload);
+        transport
+            .bind(py)
+            .call_method1("write", (PyBytes::new(py, &frame),))?;
+        Ok(())
+    }
+
     fn close(&self, py: Python<'_>) -> PyResult<()> {
         let mut state = self.state.lock();
         if state.closed {
@@ -658,13 +750,24 @@ impl NativeClient {
             let Some(end) = find_header_end(&state.buf) else {
                 return Ok(());
             };
-            let headers = String::from_utf8_lossy(&state.buf[..end]);
+            let headers_str = String::from_utf8_lossy(&state.buf[..end]).to_string();
             let expected = state.expected_accept.clone();
-            let matched = headers.lines().any(|l| {
-                l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
-                    && l.contains(&expected)
-            });
+            let mut matched = false;
+            let mut subprotocol: Option<String> = None;
+            for line in headers_str.lines() {
+                let lower = line.to_ascii_lowercase();
+                if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
+                    matched = true;
+                } else if let Some(rest) = line
+                    .splitn(2, ':')
+                    .nth(1)
+                    .filter(|_| lower.starts_with("sec-websocket-protocol:"))
+                {
+                    subprotocol = Some(rest.trim().to_string());
+                }
+            }
             state.buf.advance(end);
+            state.subprotocol = subprotocol;
             if !matched {
                 if let Some(fut) = state.handshake_fut.take() {
                     let fut_b = fut.bind(py);
@@ -705,7 +808,17 @@ impl NativeClient {
                     Self::deliver_message(py, &mut state, msg)?;
                 }
                 0x8 => {
-                    state.buf.advance(total);
+                    // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
+                    state.buf.advance(hdr);
+                    let payload = state.buf.split_to(plen);
+                    if payload.len() >= 2 {
+                        state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
+                        if payload.len() > 2 {
+                            state.close_reason = Some(
+                                String::from_utf8_lossy(&payload[2..]).into_owned(),
+                            );
+                        }
+                    }
                     state.closed = true;
                     Self::fail_all_pending(py, &mut state, "Connection closed by peer");
                     if let Some(t) = state.transport.as_ref() {
@@ -713,6 +826,20 @@ impl NativeClient {
                         let _ = tb.call_method0("close");
                     }
                     break;
+                }
+                0x9 => {
+                    // Ping: echo payload back as a Pong frame (RFC 6455 §5.5.2).
+                    state.buf.advance(hdr);
+                    let payload = state.buf.split_to(plen).freeze();
+                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                    if let Some(t) = transport {
+                        let frame = encode_control_frame(0xA, &payload);
+                        let _ = t.bind(py).call_method1("write", (PyBytes::new(py, &frame),));
+                    }
+                }
+                0xA => {
+                    // Pong — silently consumed; could dispatch to a ping-waiter in future.
+                    state.buf.advance(total);
                 }
                 _ => {
                     state.buf.advance(total);
@@ -751,11 +878,6 @@ impl NativeClient {
     }
 }
 
-fn create_loop_future(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let asyncio = py.import("asyncio")?;
-    let loop_ = asyncio.call_method0("get_running_loop")?;
-    loop_.call_method0("create_future")
-}
 
 /// Connect to a ws:// or wss:// URI and return a NativeClient once the handshake completes.
 ///
@@ -763,10 +885,12 @@ fn create_loop_future(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, ssl_context=None))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None))]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
+    headers: Option<Vec<(String, String)>>,
+    subprotocols: Option<Vec<String>>,
     ssl_context: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
@@ -786,13 +910,19 @@ fn connect<'py>(
             recv_ba: None,
             recv_ba_write_pos: 0,
             loop_ref: None,
+            subprotocol: None,
+            close_code: None,
+            close_reason: None,
         })),
     };
     let state_arc = client.state.clone();
     let client_obj = Py::new(py, client)?;
 
     // Build handshake bytes + expected accept
-    let (req_bytes, expected) = build_handshake(&host, port, &path);
+    let headers_vec = headers.unwrap_or_default();
+    let subprotocols_vec = subprotocols.unwrap_or_default();
+    let (req_bytes, expected) =
+        build_handshake(&host, port, &path, &headers_vec, &subprotocols_vec);
     state_arc.lock().expected_accept = expected;
 
     // Create the handshake future and park it

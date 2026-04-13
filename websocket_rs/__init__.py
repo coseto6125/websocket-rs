@@ -14,10 +14,12 @@ from . import websocket_rs as _websocket_rs
 sys.modules["websocket_rs.sync"] = _websocket_rs.sync
 sys.modules["websocket_rs.sync.client"] = _websocket_rs.sync.client
 sys.modules["websocket_rs.async_client"] = _websocket_rs.async_client
+sys.modules["websocket_rs.native_client"] = _websocket_rs.native_client
 
 # Re-export for convenience
 sync = _websocket_rs.sync
 async_client = _websocket_rs.async_client
+native_client = _websocket_rs.native_client
 
 # Version
 __version__ = "0.6.0"
@@ -26,4 +28,5 @@ __version__ = "0.6.0"
 __all__ = [
     "sync",
     "async_client",
+    "native_client",
 ]
