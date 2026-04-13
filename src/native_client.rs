@@ -20,7 +20,6 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
-use parking_lot::Mutex;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
     PyTypeError, PyValueError,
@@ -29,6 +28,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use std::cell::RefCell;
 use std::io::Read as _;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -393,7 +393,7 @@ impl WSMessage {
     unsendable
 )]
 pub struct NativeClient {
-    state: Arc<Mutex<State>>,
+    state: Arc<RefCell<State>>,
 }
 
 fn build_handshake(
@@ -488,6 +488,7 @@ fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>>
 /// bytes actually written or -1 on any error. The caller handles partial
 /// writes / errors by falling back to asyncio's transport.write.
 #[cfg(unix)]
+#[allow(dead_code)]
 fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
     // MSG_NOSIGNAL is Linux-specific; macOS achieves the same via SO_NOSIGPIPE
     // on the socket (asyncio already sets that when creating the transport on
@@ -508,6 +509,49 @@ fn native_send(fd: std::os::unix::io::RawFd, buf: &[u8]) -> isize {
 #[cfg(not(unix))]
 fn native_send(_fd: i32, _buf: &[u8]) -> isize {
     -1 // Windows: fall back to transport.write
+}
+
+/// Scatter-gather variant of `native_send`. Sends `header` followed by
+/// `payload` in one syscall via `sendmsg(2)`, avoiding the merge-into-one-buffer
+/// memcpy that the simple `send` path requires. Returns total bytes written
+/// across both iovecs, or -1 on error / EAGAIN.
+#[cfg(unix)]
+fn native_sendmsg(fd: std::os::unix::io::RawFd, header: &[u8], payload: &[u8]) -> isize {
+    let flags: libc::c_int = {
+        #[cfg(target_os = "linux")]
+        {
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            libc::MSG_DONTWAIT
+        }
+    };
+    let iov = [
+        libc::iovec {
+            iov_base: header.as_ptr() as *mut _,
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: payload.as_ptr() as *mut _,
+            iov_len: payload.len(),
+        },
+    ];
+    let msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: iov.as_ptr() as *mut _,
+        msg_iovlen: 2,
+        msg_control: std::ptr::null_mut(),
+        msg_controllen: 0,
+        msg_flags: 0,
+    };
+    unsafe { libc::sendmsg(fd, &msg, flags) }
+}
+
+#[cfg(not(unix))]
+fn native_sendmsg(_fd: i32, _header: &[u8], _payload: &[u8]) -> isize {
+    -1
 }
 
 /// Encode a masked control frame (ping=0x9 / pong=0xA). Payload ≤125 bytes per RFC.
@@ -559,7 +603,7 @@ impl NativeClient {
             None
         };
 
-        let mut s = self.state.lock();
+        let mut s = self.state.borrow_mut();
         s.transport = Some(transport);
         s.transport_write = Some(write);
         s.transport_get_buf_size = get_buf_size;
@@ -568,7 +612,7 @@ impl NativeClient {
     }
 
     fn data_received(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
 
         // Fast path: if our internal buf is empty and the handshake is already done,
         // parse frames straight out of `data` and only copy the tail (if any) back into
@@ -634,13 +678,13 @@ impl NativeClient {
     /// Called by asyncio transport when its send buffer crosses the high-water mark.
     /// We stop draining into the transport; subsequent send() calls buffer internally.
     fn pause_writing(&self) {
-        self.state.lock().paused = true;
+        self.state.borrow_mut().paused = true;
     }
 
     /// Called when the transport drains below the low-water mark. Flush whatever we
     /// queued while paused, then clear the flag.
     fn resume_writing(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.paused = false;
         // Drain queued frames. Each one is a fully-encoded PyBytes.
         let transport = match state.transport.as_ref() {
@@ -657,7 +701,7 @@ impl NativeClient {
     }
 
     fn connection_lost(&self, py: Python<'_>, _exc: Py<PyAny>) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.closed = true;
         Self::fail_all_pending(py, &mut state, "Connection lost");
         state.transport = None;
@@ -668,7 +712,7 @@ impl NativeClient {
     /// Encode a single binary frame and write it directly to the transport.
     /// Zero-copy: the encoded frame is materialised straight into Python memory.
     fn send(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -752,52 +796,41 @@ impl NativeClient {
                 126..=65535 => 2,
                 _ => 8,
             } + 4; // 4-byte mask
-        let total = header_len + plen;
 
         let mut mask_key = [0u8; 4];
         rand::thread_rng().fill_bytes(&mut mask_key);
 
-        // Allocate PyBytes and fill directly — one memcpy total.
-        let out = PyBytes::new_with(py, total, |buf| {
-            // FIN=1; set RSV1 (0x40) when the payload is deflated.
-            buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
-            let mut pos = 2;
-            if plen <= 125 {
-                buf[1] = 0x80 | plen as u8;
-            } else if plen <= 65535 {
-                buf[1] = 0x80 | 126;
-                buf[2..4].copy_from_slice(&(plen as u16).to_be_bytes());
-                pos = 4;
-            } else {
-                buf[1] = 0x80 | 127;
-                buf[2..10].copy_from_slice(&(plen as u64).to_be_bytes());
-                pos = 10;
-            }
-            buf[pos..pos + 4].copy_from_slice(&mask_key);
-            pos += 4;
-            buf[pos..pos + plen].copy_from_slice(payload);
-            apply_mask(&mut buf[pos..pos + plen], mask_key);
-            Ok(())
-        })?;
+        // Encode header onto the stack (max 14 bytes: 2 + 8 length + 4 mask).
+        let mut header_buf = [0u8; 14];
+        header_buf[0] = 0x80 | opcode | if compressed { 0x40 } else { 0x00 };
+        let mut pos = 2;
+        if plen <= 125 {
+            header_buf[1] = 0x80 | plen as u8;
+        } else if plen <= 65535 {
+            header_buf[1] = 0x80 | 126;
+            header_buf[2..4].copy_from_slice(&(plen as u16).to_be_bytes());
+            pos = 4;
+        } else {
+            header_buf[1] = 0x80 | 127;
+            header_buf[2..10].copy_from_slice(&(plen as u64).to_be_bytes());
+            pos = 10;
+        }
+        header_buf[pos..pos + 4].copy_from_slice(&mask_key);
+        let header = &header_buf[..pos + 4];
+        debug_assert_eq!(header.len(), header_len);
 
-        // If the transport has paused us, buffer the encoded frame until resume_writing.
-        // Re-lock briefly to check the flag and push if needed.
-        {
-            let mut state = self.state.lock();
-            if state.paused {
-                state.write_queue.push_back(out.unbind());
-                return Ok(());
-            }
+        // Pause check is cheap; do it once before deciding fast vs slow path.
+        if self.state.borrow().paused {
+            // Slow path: build merged PyBytes and queue it for resume_writing.
+            let out = self.build_merged_frame(py, header, payload, mask_key)?;
+            self.state.borrow_mut().write_queue.push_back(out.unbind());
+            return Ok(());
         }
 
-        // Native-send fast path: if the transport is plain TCP (raw_fd known)
-        // AND asyncio's internal write buffer is empty, send straight into the
-        // kernel via libc::send(). On localhost this almost always returns the
-        // full frame in one call, so we skip asyncio's transport bookkeeping
-        // entirely. Partial writes / errors fall back to transport.write so
-        // asyncio still handles backpressure and error plumbing.
-        //
-        // Mirrors picows' `_try_native_write_then_transport_write` strategy.
+        // Native sendmsg fast path: when transport is plain TCP and asyncio's
+        // internal buffer is empty, we go straight to the kernel with a 2-iovec
+        // sendmsg(). The mask still has to be applied to a writable copy of the
+        // payload, but we skip allocating and filling a merged PyBytes.
         if let Some(fd) = raw_fd {
             let drained = match get_buf_size {
                 Some(ref m) => m
@@ -809,28 +842,62 @@ impl NativeClient {
                 None => false,
             };
             if drained {
-                let bytes = out.as_bytes();
-                let written = native_send(fd, bytes);
-                if written == bytes.len() as isize {
+                // Mask payload into a fresh Vec (source PyBytes/PyString is read-only).
+                let mut masked: Vec<u8> = Vec::with_capacity(plen);
+                masked.extend_from_slice(payload);
+                apply_mask(&mut masked, mask_key);
+                let total = header.len() + plen;
+                let written = native_sendmsg(fd, header, &masked);
+                if written == total as isize {
                     return Ok(());
                 }
                 if written > 0 {
-                    // Hand the remainder to asyncio so ordering is preserved.
-                    let tail = PyBytes::new(py, &bytes[written as usize..]);
+                    // Partial: hand remainder to asyncio so ordering is preserved.
+                    let n = written as usize;
+                    let remaining = total - n;
+                    let tail = PyBytes::new_with(py, remaining, |buf| {
+                        if n < header.len() {
+                            let h_left = header.len() - n;
+                            buf[..h_left].copy_from_slice(&header[n..]);
+                            buf[h_left..].copy_from_slice(&masked);
+                        } else {
+                            buf.copy_from_slice(&masked[n - header.len()..]);
+                        }
+                        Ok(())
+                    })?;
                     write.bind(py).call1((tail,))?;
                     return Ok(());
                 }
-                // written <= 0 (EAGAIN or hard error): fall through to
-                // transport.write(full) so asyncio reports the error normally.
+                // EAGAIN / error: fall through to slow path so asyncio reports it.
             }
         }
+        let out = self.build_merged_frame(py, header, payload, mask_key)?;
         write.bind(py).call1((out,))?;
         Ok(())
     }
 
+    /// Build a single PyBytes containing header + masked payload — used on the
+    /// slow path (paused transport, no raw fd, or sendmsg fallback).
+    fn build_merged_frame<'py>(
+        &self,
+        py: Python<'py>,
+        header: &[u8],
+        payload: &[u8],
+        mask_key: [u8; 4],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let total = header.len() + payload.len();
+        PyBytes::new_with(py, total, |buf| {
+            buf[..header.len()].copy_from_slice(header);
+            let p = &mut buf[header.len()..];
+            p.copy_from_slice(payload);
+            apply_mask(p, mask_key);
+            Ok(())
+        })
+    }
+
     /// Returns an asyncio.Future that completes with the next received frame payload.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         // Fast path: message already in backlog — bypass asyncio.Future entirely.
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
@@ -853,7 +920,7 @@ impl NativeClient {
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
-            .lock()
+            .borrow_mut()
             .pending_recv
             .push_back(fut.clone().unbind());
         if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
@@ -864,7 +931,7 @@ impl NativeClient {
 
     #[getter]
     fn is_open(&self) -> bool {
-        let s = self.state.lock();
+        let s = self.state.borrow_mut();
         s.handshake_done && !s.closed && s.transport.is_some()
     }
 
@@ -876,7 +943,7 @@ impl NativeClient {
     /// Async iterator step. Returns the next WSMessage; raises StopAsyncIteration
     /// when the connection is closed (vs recv() which raises ConnectionError).
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if let Some(payload) = state.backlog.pop_front() {
             drop(state);
             return ready_ok(py, payload.into_any());
@@ -895,7 +962,7 @@ impl NativeClient {
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
-            .lock()
+            .borrow_mut()
             .pending_recv
             .push_back(fut.clone().unbind());
         if let (Some(t), Some(wait_for)) = (timeout, wait_for_cached) {
@@ -923,17 +990,17 @@ impl NativeClient {
 
     #[getter]
     fn subprotocol(&self) -> Option<String> {
-        self.state.lock().subprotocol.clone()
+        self.state.borrow_mut().subprotocol.clone()
     }
 
     #[getter]
     fn close_code(&self) -> Option<u16> {
-        self.state.lock().close_code
+        self.state.borrow_mut().close_code
     }
 
     #[getter]
     fn close_reason(&self) -> Option<String> {
-        self.state.lock().close_reason.clone()
+        self.state.borrow_mut().close_reason.clone()
     }
 
     /// Send a ping frame. Payload must be ≤125 bytes (control-frame limit).
@@ -945,7 +1012,7 @@ impl NativeClient {
                 "ping payload exceeds 125 bytes (WS control-frame limit)",
             ));
         }
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -963,7 +1030,7 @@ impl NativeClient {
     }
 
     fn close(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.closed {
             return Ok(());
         }
@@ -1001,7 +1068,7 @@ impl NativeClient {
     /// Parse and dispatch all complete frames currently sitting in state.buf.
     /// Also completes the HTTP/101 handshake on first invocation.
     fn process_buffered_frames(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
 
         if !state.handshake_done {
             let Some(end) = find_header_end(&state.buf) else {
@@ -1224,7 +1291,7 @@ fn connect<'py>(
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
     let client = NativeClient {
-        state: Arc::new(Mutex::new(State {
+        state: Arc::new(RefCell::new(State {
             transport: None,
             buf: BytesMut::with_capacity(16384),
             handshake_done: false,
@@ -1265,7 +1332,7 @@ fn connect<'py>(
         &subprotocols_vec,
         compression,
     );
-    state_arc.lock().expected_accept = expected;
+    state_arc.borrow_mut().expected_accept = expected;
 
     // Create the handshake future. Cache `loop.create_future` and
     // `asyncio.wait_for` bound methods so the recv/anext hot paths don't
@@ -1276,7 +1343,7 @@ fn connect<'py>(
     let wait_for = asyncio.getattr(pyo3::intern!(py, "wait_for"))?;
     let handshake_fut = create_future.call0()?;
     {
-        let mut st = state_arc.lock();
+        let mut st = state_arc.borrow_mut();
         st.handshake_fut = Some(handshake_fut.clone().unbind());
         st.loop_ref = Some(loop_.clone().unbind());
         st.create_future = Some(create_future.unbind());
