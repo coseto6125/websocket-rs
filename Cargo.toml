@@ -30,6 +30,9 @@ url = "2.5"
 tokio-socks = "0.5.2"
 native-tls = "0.2.18"
 tokio-native-tls = "0.3.1"
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
 
 [lints.rust]
 non_local_definitions = "allow"
