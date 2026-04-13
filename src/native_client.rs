@@ -610,6 +610,32 @@ impl NativeClient {
             None
         };
 
+        // Tune the socket: asyncio sets TCP_NODELAY by default, but TCP_QUICKACK
+        // must be set explicitly on Linux to disable delayed-ACK. Without it,
+        // pipelined throughput at medium frame sizes (8-32 KiB) is throttled by
+        // the 40 ms ACK delay timer. Mirrors picows' connection_made
+        // (picows.pyx:956-958).
+        #[cfg(target_os = "linux")]
+        if let Some(f) = fd {
+            unsafe {
+                let on: libc::c_int = 1;
+                libc::setsockopt(
+                    f,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NODELAY,
+                    &on as *const _ as *const _,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    f,
+                    libc::IPPROTO_TCP,
+                    libc::TCP_QUICKACK,
+                    &on as *const _ as *const _,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+
         let mut s = self.state.borrow_mut();
         s.transport = Some(transport);
         s.transport_write = Some(write);
