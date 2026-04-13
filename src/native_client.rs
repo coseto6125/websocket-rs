@@ -26,7 +26,7 @@ use pyo3::exceptions::{
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule, PySlice, PyString};
-use rand::RngCore;
+use rand::RngExt;
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use std::io::Read as _;
@@ -412,7 +412,7 @@ fn build_handshake(
     compression: bool,
 ) -> (Vec<u8>, String) {
     let mut key_bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut key_bytes);
+    rand::rng().fill(&mut key_bytes);
     let key = base64::engine::general_purpose::STANDARD.encode(key_bytes);
     let accept_src = format!("{}{}", key, MAGIC);
     let mut hasher = Sha1::new();
@@ -566,7 +566,7 @@ fn encode_control_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let plen = payload.len().min(125);
     let mut out = Vec::with_capacity(2 + 4 + plen);
     let mut mask = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut mask);
+    rand::rng().fill(&mut mask);
     out.push(0x80 | opcode);
     out.push(0x80 | plen as u8);
     out.extend_from_slice(&mask);
@@ -866,7 +866,7 @@ impl NativeClient {
             } + 4; // 4-byte mask
 
         let mut mask_key = [0u8; 4];
-        rand::thread_rng().fill_bytes(&mut mask_key);
+        rand::rng().fill(&mut mask_key);
 
         // Encode header onto the stack (max 14 bytes: 2 + 8 length + 4 mask).
         let mut header_buf = [0u8; 14];
