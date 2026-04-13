@@ -156,6 +156,13 @@ struct State {
     expected_accept: String,
     pending_recv: VecDeque<Py<PyAny>>,
     backlog: VecDeque<Py<WSMessage>>,
+    /// Optional synchronous callback invoked after data_received finishes
+    /// parsing — bypasses the Future/await round-trip. Frames are buffered in
+    /// `pending_callback_msgs` during parse and dispatched after the parse
+    /// loop releases its borrow on State (user callbacks may re-enter via
+    /// `ws.send()` etc).
+    on_message: Option<Py<PyAny>>,
+    pending_callback_msgs: VecDeque<Py<WSMessage>>,
     closed: bool,
     /// asyncio transport has passed its high-water mark — hold off on writes.
     paused: bool,
@@ -612,6 +619,15 @@ impl NativeClient {
     }
 
     fn data_received(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        let result = self.data_received_inner(py, data);
+        // Dispatch any messages buffered for the callback API. Done after the
+        // borrow above is released so user callbacks can safely re-enter
+        // (ws.send, ws.close, etc.) without tripping RefCell.
+        self.flush_pending_callbacks(py)?;
+        result
+    }
+
+    fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
         let mut state = self.state.borrow_mut();
 
         // Fast path: if our internal buf is empty and the handshake is already done,
@@ -665,6 +681,32 @@ impl NativeClient {
         state.buf.extend_from_slice(data);
         drop(state);
         self.process_buffered_frames(py)
+    }
+
+    /// Drain pending_callback_msgs and invoke the user callback for each.
+    /// Must be called with no outstanding borrow on State.
+    fn flush_pending_callbacks(&self, py: Python<'_>) -> PyResult<()> {
+        loop {
+            // Pop one message at a time; the user callback may push new frames
+            // (e.g. by triggering re-entrant data_received) — unlikely on
+            // single-thread asyncio but cheap to handle.
+            let (cb, msg) = {
+                let mut st = self.state.borrow_mut();
+                if st.pending_callback_msgs.is_empty() {
+                    return Ok(());
+                }
+                let msg = match st.pending_callback_msgs.pop_front() {
+                    Some(m) => m,
+                    None => return Ok(()),
+                };
+                let cb = match st.on_message.as_ref() {
+                    Some(c) => c.clone_ref(py),
+                    None => return Ok(()),
+                };
+                (cb, msg)
+            };
+            cb.bind(py).call1((msg,))?;
+        }
     }
 
     // NOTE: BufferedProtocol (get_buffer / buffer_updated) was intentionally
@@ -1042,6 +1084,7 @@ impl NativeClient {
         let transport = state.transport.take();
         state.transport_write = None;
         state.loop_ref = None;
+        state.on_message = None;
         state.create_future = None;
         state.wait_for = None;
         let write_queue = std::mem::take(&mut state.write_queue);
@@ -1241,6 +1284,13 @@ impl NativeClient {
     }
 
     fn deliver_message(py: Python<'_>, state: &mut State, msg: Py<WSMessage>) -> PyResult<()> {
+        // Callback-style fast path: defer invocation until after the parse
+        // loop has released its borrow on State. The user callback may call
+        // back into us (e.g. ws.send(...)), which would re-enter borrow_mut().
+        if state.on_message.is_some() {
+            state.pending_callback_msgs.push_back(msg);
+            return Ok(());
+        }
         if let Some(fut) = state.pending_recv.pop_front() {
             let fb = fut.bind(py);
             if !fb.call_method0("done")?.extract::<bool>().unwrap_or(false) {
@@ -1275,7 +1325,7 @@ impl NativeClient {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None, compression=false))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None, compression=false, on_message=None))]
 #[allow(clippy::too_many_arguments)]
 fn connect<'py>(
     py: Python<'py>,
@@ -1287,6 +1337,7 @@ fn connect<'py>(
     receive_timeout: Option<f64>,
     proxy: Option<String>,
     compression: bool,
+    on_message: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
@@ -1299,6 +1350,8 @@ fn connect<'py>(
             expected_accept: String::new(),
             pending_recv: VecDeque::new(),
             backlog: VecDeque::new(),
+            on_message,
+            pending_callback_msgs: VecDeque::new(),
             closed: false,
             paused: false,
             write_queue: VecDeque::new(),
