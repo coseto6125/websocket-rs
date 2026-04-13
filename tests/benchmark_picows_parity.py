@@ -59,6 +59,11 @@ except ImportError:
 
 
 PORT = 8833
+# 256 B / 8 KB / 100 KB / 1 MB — 1 MB is the realistic upper bound for
+# real WS traffic: matches Cloudflare's hard per-frame limit, Azure
+# SignalR's default, and well above AWS API Gateway WS (32 KB hard cap).
+# 2 MB single frames don't survive most production proxies, so testing
+# at that size only stresses framework limits, not real workloads.
 SIZES = (256, 8 * 1024, 100 * 1024, 1024 * 1024)
 DURATION = float(os.environ.get("DURATION", "10"))
 WARMUP = 50

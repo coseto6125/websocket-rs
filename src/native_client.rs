@@ -198,6 +198,12 @@ struct State {
     /// kernel writes append; `buffer_updated` advances `recv_pos`, parses
     /// complete frames in place, then compacts the leftover to offset 0.
     recv_pos: usize,
+    /// If the previous parse pass ended on a partial frame, holds the total
+    /// byte count needed before the next parse pass can yield anything.
+    /// Lets `buffer_updated` skip the parse loop entirely for chunks that
+    /// can't possibly produce a frame — relevant under TLS where a single
+    /// large WS frame is delivered as ~128 × 16 KB asyncio callbacks.
+    next_frame_needed: Option<usize>,
     /// Frames buffered while paused; drained on resume_writing.
     write_queue: VecDeque<Py<PyBytes>>,
     /// Cached reference to the asyncio loop — avoids `asyncio.get_running_loop()`
@@ -475,6 +481,7 @@ impl WSMessage {
 #[pyclass(
     name = "NativeClient",
     module = "websocket_rs.native_client",
+    subclass,
     unsendable
 )]
 pub struct NativeClient {
@@ -483,6 +490,39 @@ pub struct NativeClient {
     // the state. Send/Sync isn't required since unsendable enforces it via PyO3.
     #[allow(clippy::arc_with_non_send_sync)]
     state: Arc<RefCell<State>>,
+}
+
+/// Subclass of `NativeClient` that adds `get_buffer` / `buffer_updated`
+/// pymethods. asyncio's transport layer detects these and switches to the
+/// BufferedProtocol fast path (no per-recv `bytes` allocation).
+///
+/// We instantiate this for plain-TCP (`ws://`) connections where the
+/// BufferedProtocol path measurably wins (64 KB pipelined: +15% mean vs
+/// picows). For TLS (`wss://`) we instantiate the bare `NativeClient`
+/// instead — asyncio's SSLProtocol delivers ≤16 KB record-sized chunks
+/// and the per-callback PyMemoryView_FromMemory + RefCell churn becomes
+/// net-negative (measured: 2 MB TLS +12% with BufferedProtocol off).
+#[pyclass(
+    name = "NativeClientBuffered",
+    module = "websocket_rs.native_client",
+    extends = NativeClient,
+    unsendable
+)]
+pub struct NativeClientBuffered;
+
+#[pymethods]
+impl NativeClientBuffered {
+    fn get_buffer<'py>(
+        self_: PyRef<'_, Self>,
+        py: Python<'py>,
+        size_hint: isize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self_.as_super().get_buffer_impl(py, size_hint)
+    }
+
+    fn buffer_updated(self_: PyRef<'_, Self>, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+        self_.as_super().buffer_updated_impl(py, nbytes)
+    }
 }
 
 fn build_handshake(
@@ -693,81 +733,6 @@ impl NativeClient {
         Ok(())
     }
 
-    /// asyncio BufferedProtocol: return a writable buffer for uvloop to recv
-    /// kernel data into directly (skips the per-recv `bytes` allocation that
-    /// the plain `data_received(bytes)` path incurs). Returns the slice
-    /// `recv_buf[recv_pos..capacity]` so partial-frame leftover from the
-    /// previous call stays in place — no copy needed. uvloop ignores the
-    /// `_size_hint` (always passes 65536); we ensure at least 64 KB headroom
-    /// past `recv_pos` so a full large frame fits without realloc.
-    fn get_buffer<'py>(&self, py: Python<'py>, _size_hint: isize) -> PyResult<Bound<'py, PyAny>> {
-        let mut st = self.state.borrow_mut();
-        const HEADROOM: usize = 65536;
-        let need = st.recv_pos + HEADROOM;
-        if st.recv_buf.capacity() < need {
-            let extra = need - st.recv_buf.capacity();
-            st.recv_buf.reserve(extra);
-        }
-        let cap = st.recv_buf.capacity();
-        // SAFETY: we are about to hand the entire capacity past recv_pos to
-        // uvloop as a writable region. Bytes between len() and capacity() are
-        // uninitialized; setting len = capacity is sound because we never
-        // *read* the [recv_pos..] tail until `buffer_updated(nbytes)` tells
-        // us how many bytes uvloop wrote — and even then we only expose the
-        // first `nbytes` past `recv_pos`.
-        unsafe {
-            st.recv_buf.set_len(cap);
-        }
-        let recv_pos = st.recv_pos;
-        let ptr = unsafe { st.recv_buf.as_mut_ptr().add(recv_pos) };
-        let avail = cap - recv_pos;
-        drop(st);
-        unsafe {
-            let mv = pyo3::ffi::PyMemoryView_FromMemory(
-                ptr as *mut std::ffi::c_char,
-                avail as pyo3::ffi::Py_ssize_t,
-                pyo3::ffi::PyBUF_WRITE,
-            );
-            if mv.is_null() {
-                return Err(PyErr::fetch(py));
-            }
-            Ok(Bound::from_owned_ptr(py, mv))
-        }
-    }
-
-    /// asyncio BufferedProtocol: uvloop wrote `nbytes` into the slice we
-    /// returned from `get_buffer`. Parse all complete frames out of
-    /// `recv_buf[..recv_pos+nbytes]` in place, then compact any unparsed
-    /// trailing bytes (typically a partial frame at TCP boundary) to offset
-    /// 0. This avoids the `state.buf.extend_from_slice` copy the plain
-    /// `data_received` path does for the leftover.
-    fn buffer_updated(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
-        // Snapshot ptr + len while holding the borrow; drop before parsing
-        // (parser needs to take its own mut borrow per frame deliver).
-        let (ptr, total) = {
-            let mut st = self.state.borrow_mut();
-            st.recv_pos += nbytes;
-            (st.recv_buf.as_ptr(), st.recv_pos)
-        };
-        // SAFETY: recv_buf is not realloc'd during parsing — only state.buf,
-        // state.backlog, state.pending_callback_msgs are mutated. ptr stays
-        // valid for the slice's lifetime within this function.
-        let data = unsafe { std::slice::from_raw_parts(ptr, total) };
-        let consumed = self.parse_recv_data(py, data)?;
-        // Compact: move unparsed tail to the front so next get_buffer can
-        // append at recv_pos. For the typical case where consumed == total
-        // (full TCP packet was a complete frame batch), this is a no-op.
-        {
-            let mut st = self.state.borrow_mut();
-            let recv_pos = st.recv_pos;
-            if consumed > 0 && recv_pos > consumed {
-                st.recv_buf.copy_within(consumed..recv_pos, 0);
-            }
-            st.recv_pos = recv_pos.saturating_sub(consumed);
-        }
-        self.flush_pending_callbacks(py)
-    }
-
     /// Parse `data` (a window into `recv_buf`) in place. Returns the number
     /// of bytes consumed; the caller compacts the rest. The fast path
     /// (handshake done, no fragment in flight, no deflate state, no carry-
@@ -787,6 +752,11 @@ impl NativeClient {
         let mut off = 0usize;
         while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
             if data.len() - off < hdr + plen {
+                // Frame header parsed but payload incomplete. Record how
+                // many total bytes recv_pos must reach before parsing
+                // could yield this frame, so subsequent buffer_updated
+                // calls can short-circuit until then.
+                self.state.borrow_mut().next_frame_needed = Some(off + hdr + plen);
                 break;
             }
             if !fin || opcode == OP_CONTINUATION || rsv1 {
@@ -1372,6 +1342,76 @@ impl NativeClient {
 
 // Helpers (non-pymethod)
 impl NativeClient {
+    /// asyncio BufferedProtocol implementation. Lives on NativeClient so the
+    /// `NativeClientBuffered` subclass can forward to it. Returns a writable
+    /// `recv_buf[recv_pos..capacity]` slice via `PyMemoryView_FromMemory`;
+    /// uvloop fills it with kernel data, then calls `buffer_updated_impl`.
+    fn get_buffer_impl<'py>(
+        &self,
+        py: Python<'py>,
+        _size_hint: isize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut st = self.state.borrow_mut();
+        const HEADROOM: usize = 65536;
+        let need = st.recv_pos + HEADROOM;
+        if st.recv_buf.capacity() < need {
+            let extra = need - st.recv_buf.capacity();
+            st.recv_buf.reserve(extra);
+        }
+        let cap = st.recv_buf.capacity();
+        // SAFETY: bytes between len() and capacity() are uninitialized but
+        // we only ever *read* the first `nbytes` past `recv_pos` — and only
+        // after `buffer_updated_impl(nbytes)` confirms uvloop wrote them.
+        unsafe {
+            st.recv_buf.set_len(cap);
+        }
+        let recv_pos = st.recv_pos;
+        let ptr = unsafe { st.recv_buf.as_mut_ptr().add(recv_pos) };
+        let avail = cap - recv_pos;
+        drop(st);
+        unsafe {
+            let mv = pyo3::ffi::PyMemoryView_FromMemory(
+                ptr as *mut std::ffi::c_char,
+                avail as pyo3::ffi::Py_ssize_t,
+                pyo3::ffi::PyBUF_WRITE,
+            );
+            if mv.is_null() {
+                return Err(PyErr::fetch(py));
+            }
+            Ok(Bound::from_owned_ptr(py, mv))
+        }
+    }
+
+    fn buffer_updated_impl(&self, py: Python<'_>, nbytes: usize) -> PyResult<()> {
+        // Defer-parse gate: if the next frame still needs more bytes than
+        // recv_pos has, skip the parse pass entirely.
+        let (ptr, total) = {
+            let mut st = self.state.borrow_mut();
+            st.recv_pos += nbytes;
+            if let Some(needed) = st.next_frame_needed {
+                if st.recv_pos < needed {
+                    return Ok(());
+                }
+                st.next_frame_needed = None;
+            }
+            (st.recv_buf.as_ptr(), st.recv_pos)
+        };
+        // SAFETY: `recv_buf` is not realloc'd during parsing — only
+        // `state.buf` / `state.backlog` / `state.pending_callback_msgs` get
+        // mutated. Pointer stays valid for the slice's lifetime.
+        let data = unsafe { std::slice::from_raw_parts(ptr, total) };
+        let consumed = self.parse_recv_data(py, data)?;
+        {
+            let mut st = self.state.borrow_mut();
+            let recv_pos = st.recv_pos;
+            if consumed > 0 && recv_pos > consumed {
+                st.recv_buf.copy_within(consumed..recv_pos, 0);
+            }
+            st.recv_pos = recv_pos.saturating_sub(consumed);
+        }
+        self.flush_pending_callbacks(py)
+    }
+
     /// Parse and dispatch all complete frames currently sitting in state.buf.
     /// Also completes the HTTP/101 handshake on first invocation.
     fn process_buffered_frames(&self, py: Python<'_>) -> PyResult<()> {
@@ -1624,6 +1664,7 @@ fn connect<'py>(
             send_buf: Vec::with_capacity(65536 + 14),
             recv_buf: Vec::with_capacity(65536 + 14),
             recv_pos: 0,
+            next_frame_needed: None,
             write_queue: VecDeque::new(),
             loop_ref: None,
             transport_write: None,
@@ -1642,7 +1683,16 @@ fn connect<'py>(
         })),
     };
     let state_arc = client.state.clone();
-    let client_obj = Py::new(py, client)?;
+    // For ws:// (plain TCP) instantiate the BufferedProtocol-enabled
+    // subclass — asyncio detects `get_buffer` / `buffer_updated` and uses
+    // the zero-alloc kernel write path. For wss:// (TLS) instantiate the
+    // bare base class — the SSLProtocol's small-record callbacks make
+    // BufferedProtocol net-negative (see NativeClientBuffered docs).
+    let client_obj: Py<PyAny> = if is_tls {
+        Py::new(py, client)?.into_any()
+    } else {
+        Py::new(py, (NativeClientBuffered, client))?.into_any()
+    };
 
     // Build handshake bytes + expected accept
     let headers_vec = headers.unwrap_or_default();
@@ -1873,6 +1923,7 @@ async def _connect_helper(loop, protocol_factory, host, port, is_tls, ssl_ctx,
 pub fn register_native_client(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let m = PyModule::new(py, "native_client")?;
     m.add_class::<NativeClient>()?;
+    m.add_class::<NativeClientBuffered>()?;
     m.add_class::<WSMessage>()?;
     m.add_function(wrap_pyfunction!(connect, &m)?)?;
     parent.add_submodule(&m)?;
