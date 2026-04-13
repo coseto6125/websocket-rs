@@ -186,11 +186,12 @@ impl SyncClientConnection {
             // with Python's _ssl when both libraries co-exist in process).
             let ws_stream = if is_tls {
                 let config = build_rustls_client_config()?;
-                let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-                    .map_err(|e| PyConnectionError::new_err(format!("Invalid server name: {}", e)))?;
-                let conn = rustls::ClientConnection::new(config, server_name).map_err(|e| {
-                    PyConnectionError::new_err(format!("TLS init failed: {}", e))
-                })?;
+                let server_name =
+                    rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| {
+                        PyConnectionError::new_err(format!("Invalid server name: {}", e))
+                    })?;
+                let conn = rustls::ClientConnection::new(config, server_name)
+                    .map_err(|e| PyConnectionError::new_err(format!("TLS init failed: {}", e)))?;
                 let tls = rustls::StreamOwned::new(conn, tcp);
                 WsStream::Tls(Box::new(tls))
             } else {

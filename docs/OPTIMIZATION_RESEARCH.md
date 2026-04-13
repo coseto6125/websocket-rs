@@ -879,3 +879,92 @@ Actor Pattern + channel + ReadyFuture 是當前 PyO3 架構下的最優解。
 
 **推薦策略**: 接受 Async 的架構限制,發揮 Sync 的效能優勢。
 在跨機器場景下 Async 的 17% 差距被網路延遲掩蓋,實際體感無差異。
+
+---
+
+## v0.6.0 SIMD / target-cpu=native 調查（負面結果）
+
+### 起點：eywa 提示 AVX2 對 64KB pipelined p99 −25%
+
+來自 picows 觀察的提示：tungstenite 的 `apply_mask_fast32` 在 release build 下若加
+`target-feature=+avx2,+bmi2`，rustc 會把純 scalar u32 loop auto-vectorize 為
+AVX2 32-byte XOR，64KB pipelined p99 應改善 ~25%。
+
+### Phase 1：64KB plain TCP pipelined（5 iter × 3 mode）
+
+```bash
+make build                                          # baseline
+RUSTFLAGS='-C target-cpu=native' make build         # AVX2/AVX-512
+```
+
+對照 5-run aggregated mean / p50 / p99 (ms):
+
+| Mode | Baseline | AVX2 | Δ mean |
+|---|---|---|---|
+| native (await) | 0.956 / 0.916 / 1.666 | 0.957 / 0.914 / 1.682 | **0%** |
+| native_cb | 1.003 / 0.963 / 1.835 | 0.967 / 0.895 / 1.754 | -3.6%（雜訊內）|
+| picows（control，未 rebuild）| 1.052 / 1.020 / 1.653 | 1.131 / 1.084 / 1.789 | +7.5%（系統雜訊底）|
+
+**結論**：所有 ws-rs 變動在 ±7% 雜訊內 = 真實收益 **0%**。
+
+### Binary disasm 證據
+
+| Build | ymm (AVX2) | zmm (AVX-512) |
+|---|---|---|
+| Baseline | 4,116 | 20 |
+| AVX2 | 10,254 (+149%) | 6,402 (+320×) |
+
+`target-cpu=native` 確實生成了大量 SIMD 指令（含 AVX-512），但全在 cold path：
+sha1 / base64 / flate2 / rustls 的初始化或 fallback code，**不在 64KB pipelined 熱路徑**。
+
+### Phase 2：理論上仍熱的 SIMD path（compression / sync wss）
+
+懷疑 cold path 分類太粗 —— flate2 在 `compression=True` 時是 hot，rustls 在
+sync_client wss 時是 hot。再跑 5-iter × 2 path：
+
+| Path | Baseline | AVX2 | Δ |
+|---|---|---|---|
+| compression=True（flate2）| 50,322 RPS | 51,998 RPS | +3.3%（雜訊內）|
+| sync wss（rustls）| 18,509 RPS | 18,513 RPS | **+0.02%** |
+
+兩者實質 0 收益。
+
+### 為什麼 LLVM 已經餵飽
+
+ws-rs 的 release profile：
+```toml
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+```
+
+在 `lto=fat + codegen-units=1` 下，LLVM 對所有 hot loop 已主動 auto-vectorize
+到 AVX2 上限。`target-cpu=native` 只能把 **cold path** 也加上 SIMD —— 對 bench 0 影響。
+
+### 為什麼「應該熱」的 path 也沒收益
+
+- **rustls / TLS**：90% 時間在 AES-GCM，由 **AES-NI 硬體指令**（Westmere 2010）執行，
+  跟 AVX2/AVX-512 暫存器無關。AES-NI 在 baseline 就已啟用。
+- **flate2 / deflate**：核心是 hash table lookup + LZ77 match search，
+  控制流密集、SIMD 不親和。AVX2 只能加速少數 hash 步驟。
+- **WS frame masking**：64KB 是 **memory-bound 不是 compute-bound**，
+  AVX2 32-byte 寬已飽和 L1/L2 cache bandwidth，AVX-512 64-byte 沒有額外收益。
+
+### 拒絕的方案
+
+| 方案 | 拒絕理由 |
+|---|---|
+| Fork tungstenite 加 `multiversion` macro | 0 收益 vs 1 天 fork + 5 小時/年同步上游 |
+| Dual-wheel（generic + AVX2/v3）| 0 收益 vs CI 多 wheel 維護 |
+| Ship `target-cpu=native` 預設 wheel | 0 收益 + ARM/Intel 12 代+/AMD Zen 3- SIGILL |
+| `.cargo/config.toml` 加 native flag | 個人 dev 機 0-3% 收益，不值得 |
+
+### 結論
+
+**保持現有 release profile，不做任何 SIMD-related build flag 變更**。
+
+真要在這個方向追，唯一可能有效的場景是：
+- ChaCha20 為主的 TLS 連線（非 AES-GCM）
+- 特定壓縮密集 workload 且使用 zlib-ng C backend（會帶回 OpenSSL 風格 system dep）
+
+兩者都是 niche，不影響預設用戶。

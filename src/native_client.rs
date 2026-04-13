@@ -745,11 +745,7 @@ impl NativeClient {
     /// caller's compaction) must reach `N` before the next parse pass can
     /// complete that frame. Caller writes it onto State once, outside any
     /// per-frame borrow churn.
-    fn parse_recv_data(
-        &self,
-        py: Python<'_>,
-        data: &[u8],
-    ) -> PyResult<(usize, Option<usize>)> {
+    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<(usize, Option<usize>)> {
         let can_fast_path = {
             let st = self.state.borrow();
             st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()

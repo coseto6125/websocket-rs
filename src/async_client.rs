@@ -186,7 +186,9 @@ enum WsConnectResult {
     Proxy(
         Box<
             tokio_tungstenite::WebSocketStream<
-                tokio_rustls::client::TlsStream<tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>>,
+                tokio_rustls::client::TlsStream<
+                    tokio_socks::tcp::Socks5Stream<tokio::net::TcpStream>,
+                >,
             >,
         >,
     ),
@@ -739,9 +741,8 @@ impl AsyncClientConnection {
                         if target_url.scheme() == "wss" {
                             let config = crate::sync_client::build_rustls_client_config()
                                 .map_err(|e| format!("rustls config: {}", e))?;
-                            let server_name =
-                                rustls::pki_types::ServerName::try_from(host.clone())
-                                    .map_err(|e| format!("Invalid server name: {}", e))?;
+                            let server_name = rustls::pki_types::ServerName::try_from(host.clone())
+                                .map_err(|e| format!("Invalid server name: {}", e))?;
                             let cx = tokio_rustls::TlsConnector::from(config);
                             let tls_stream =
                                 cx.connect(server_name, socks_stream).await.map_err(|e| {

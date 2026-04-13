@@ -23,14 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cert_pem = std::fs::read("tests/certs/cert.pem")?;
     let key_pem = std::fs::read("tests/certs/key.pem")?;
 
-    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut cert_pem.as_slice()).collect::<Result<Vec<_>, _>>()?;
     if certs.is_empty() {
         return Err("no certs in cert.pem".into());
     }
 
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut key_pem.as_slice())?
-        .ok_or("no private key in key.pem")?;
+    let key: PrivateKeyDer =
+        rustls_pemfile::private_key(&mut key_pem.as_slice())?.ok_or("no private key in key.pem")?;
 
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
