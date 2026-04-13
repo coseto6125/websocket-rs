@@ -140,8 +140,46 @@ impl NativeClient {
     }
 
     fn data_received(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        // Fast path: append and process
         let mut state = self.state.lock();
+
+        // Fast path: if our internal buf is empty and the handshake is already done,
+        // parse frames straight out of `data` and only copy the tail (if any) back into
+        // buf. Servers like picows that deliver one frame per write hit this path and
+        // save a memcpy per callback.
+        if state.handshake_done && state.buf.is_empty() {
+            let mut off = 0usize;
+            while let Some((opcode, plen, hdr)) = parse_header(&data[off..]) {
+                if data.len() - off < hdr + plen {
+                    break;
+                }
+                let total = hdr + plen;
+                let slice = &data[off + hdr..off + total];
+                match opcode {
+                    0x1 | 0x2 => {
+                        let result = PyBytes::new(py, slice).unbind();
+                        Self::deliver_pybytes(py, &mut state, result)?;
+                    }
+                    0x8 => {
+                        state.closed = true;
+                        Self::fail_all_pending(py, &mut state, "Connection closed by peer");
+                        if let Some(t) = state.transport.as_ref() {
+                            let tb = t.bind(py);
+                            let _ = tb.call_method0("close");
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                off += total;
+            }
+            // Whatever couldn't be parsed as a complete frame stays for next callback.
+            if off < data.len() {
+                state.buf.extend_from_slice(&data[off..]);
+            }
+            return Ok(());
+        }
+
+        // Slow path: handshake in progress or buf already holds partial frame data.
         state.buf.extend_from_slice(data);
 
         if !state.handshake_done {
