@@ -20,7 +20,6 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
-use std::io::Read as _;
 use parking_lot::Mutex;
 use pyo3::exceptions::{
     PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
@@ -30,6 +29,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
 use rand::RngCore;
 use sha1::{Digest, Sha1};
+use std::io::Read as _;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -89,7 +89,7 @@ fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
         }
         _ => unreachable!(),
     };
-    // Server must NOT mask; we don't enforce here (picows/tungstenite both accept).
+    // Server must NOT mask; we don't enforce (most server libs accept anyway).
     Some((fin, rsv1, opcode, plen, hdr))
 }
 
@@ -147,7 +147,11 @@ struct DeflateCtx;
 /// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
 /// is already available in the backlog — saves one create_future + one set_result
 /// per call.
-#[pyclass(name = "_ReadyMessage", module = "websocket_rs.native_client", unsendable)]
+#[pyclass(
+    name = "_ReadyMessage",
+    module = "websocket_rs.native_client",
+    unsendable
+)]
 struct ReadyMessage {
     result: Option<PyResult<Py<PyAny>>>,
 }
@@ -320,7 +324,11 @@ impl WSMessage {
 ///
 /// Instances are produced by :func:`websocket_rs.native_client.connect` — direct
 /// construction via ``NativeClient()`` is unsupported.
-#[pyclass(name = "NativeClient", module = "websocket_rs.native_client", unsendable)]
+#[pyclass(
+    name = "NativeClient",
+    module = "websocket_rs.native_client",
+    unsendable
+)]
 pub struct NativeClient {
     state: Arc<Mutex<State>>,
 }
@@ -444,12 +452,9 @@ impl NativeClient {
 
         // Fast path: if our internal buf is empty and the handshake is already done,
         // parse frames straight out of `data` and only copy the tail (if any) back into
-        // buf. Servers like picows that deliver one frame per write hit this path and
-        // save a memcpy per callback.
-        if state.handshake_done
-            && state.buf.is_empty()
-            && state.fragment_buf.is_none()
-        {
+        // buf. Servers that deliver one frame per write hit this path and save a
+        // memcpy per callback.
+        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
             let mut off = 0usize;
             while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
                 if data.len() - off < hdr + plen {
@@ -500,10 +505,9 @@ impl NativeClient {
             let headers = String::from_utf8_lossy(&state.buf[..end]);
             // Case-insensitive search for the accept key token.
             let expected = state.expected_accept.clone();
-            let matched = headers
-                .lines()
-                .any(|l| l.to_ascii_lowercase().starts_with("sec-websocket-accept:")
-                    && l.contains(&expected));
+            let matched = headers.lines().any(|l| {
+                l.to_ascii_lowercase().starts_with("sec-websocket-accept:") && l.contains(&expected)
+            });
             state.buf.advance(end);
             if !matched {
                 // Fail handshake future
@@ -644,7 +648,7 @@ impl NativeClient {
     /// Encode a single binary frame and write it directly to the transport.
     /// Zero-copy: the encoded frame is materialised straight into Python memory.
     fn send(&self, py: Python<'_>, message: Bound<'_, PyAny>) -> PyResult<()> {
-        let mut state = self.state.lock();
+        let state = self.state.lock();
         if state.closed {
             return Err(PyRuntimeError::new_err("WebSocket is closed"));
         }
@@ -697,9 +701,7 @@ impl NativeClient {
                 if cursor >= raw_payload.len() && out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
                     break;
                 }
-                if cursor >= raw_payload.len()
-                    && (comp.total_out() - in_before) == 0
-                {
+                if cursor >= raw_payload.len() && (comp.total_out() - in_before) == 0 {
                     // Defensive: no progress after input exhausted.
                     break;
                 }
@@ -711,15 +713,20 @@ impl NativeClient {
         } else {
             Vec::new()
         };
-        let payload: &[u8] = if compressed { &deflate_buf } else { raw_payload };
+        let payload: &[u8] = if compressed {
+            &deflate_buf
+        } else {
+            raw_payload
+        };
         drop(state);
 
         let plen = payload.len();
-        let header_len = 2 + match plen {
-            0..=125 => 0,
-            126..=65535 => 2,
-            _ => 8,
-        } + 4; // 4-byte mask
+        let header_len =
+            2 + match plen {
+                0..=125 => 0,
+                126..=65535 => 2,
+                _ => 8,
+            } + 4; // 4-byte mask
         let total = header_len + plen;
 
         let mut mask_key = [0u8; 4];
@@ -939,12 +946,10 @@ impl NativeClient {
                 let lower = line.to_ascii_lowercase();
                 if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
                     matched = true;
-                } else if let Some(rest) = line
-                    .splitn(2, ':')
-                    .nth(1)
-                    .filter(|_| lower.starts_with("sec-websocket-protocol:"))
-                {
-                    subprotocol = Some(rest.trim().to_string());
+                } else if lower.starts_with("sec-websocket-protocol:") {
+                    if let Some((_, rest)) = line.split_once(':') {
+                        subprotocol = Some(rest.trim().to_string());
+                    }
                 } else if lower.starts_with("sec-websocket-extensions:")
                     && lower.contains("permessage-deflate")
                 {
@@ -1002,7 +1007,12 @@ impl NativeClient {
                         } else {
                             payload
                         };
-                        let msg = Py::new(py, WSMessage { data: final_payload })?;
+                        let msg = Py::new(
+                            py,
+                            WSMessage {
+                                data: final_payload,
+                            },
+                        )?;
                         Self::deliver_message(py, &mut state, msg)?;
                     } else {
                         // Fragmented message: remember whether RSV1 was on the
@@ -1057,9 +1067,8 @@ impl NativeClient {
                     if payload.len() >= 2 {
                         state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
                         if payload.len() > 2 {
-                            state.close_reason = Some(
-                                String::from_utf8_lossy(&payload[2..]).into_owned(),
-                            );
+                            state.close_reason =
+                                Some(String::from_utf8_lossy(&payload[2..]).into_owned());
                         }
                     }
                     state.closed = true;
@@ -1077,7 +1086,9 @@ impl NativeClient {
                     let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
                     if let Some(t) = transport {
                         let frame = encode_control_frame(0xA, &payload);
-                        let _ = t.bind(py).call_method1("write", (PyBytes::new(py, &frame),));
+                        let _ = t
+                            .bind(py)
+                            .call_method1("write", (PyBytes::new(py, &frame),));
                     }
                 }
                 0xA => {
@@ -1121,7 +1132,6 @@ impl NativeClient {
     }
 }
 
-
 /// Connect to a ws:// or wss:// URI and return a NativeClient once the handshake completes.
 ///
 /// TLS is delegated to asyncio — we pass an ``ssl.SSLContext`` through to
@@ -1129,6 +1139,7 @@ impl NativeClient {
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
 #[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None, receive_timeout=None, proxy=None, compression=false))]
+#[allow(clippy::too_many_arguments)]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
@@ -1248,14 +1259,14 @@ fn connect<'py>(
 }
 
 fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
-    let (scheme, rest, default_port): (&str, &str, u16) = if let Some(r) = uri.strip_prefix("wss://")
-    {
-        ("wss", r, 443)
-    } else if let Some(r) = uri.strip_prefix("ws://") {
-        ("ws", r, 80)
-    } else {
-        return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
-    };
+    let (scheme, rest, default_port): (&str, &str, u16) =
+        if let Some(r) = uri.strip_prefix("wss://") {
+            ("wss", r, 443)
+        } else if let Some(r) = uri.strip_prefix("ws://") {
+            ("ws", r, 80)
+        } else {
+            return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
+        };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -1379,7 +1390,12 @@ async def _connect_helper(loop, protocol_factory, host, port, is_tls, ssl_ctx,
         return await _asyncio.wait_for(_do(), timeout=connect_timeout)
     return await _do()
 "#;
-    let module = PyModule::from_code(py, std::ffi::CString::new(code)?.as_c_str(), c"helper.py", c"helper")?;
+    let module = PyModule::from_code(
+        py,
+        std::ffi::CString::new(code)?.as_c_str(),
+        c"helper.py",
+        c"helper",
+    )?;
     let helper = module.getattr("_connect_helper")?;
     let _ = CACHE.set(helper.clone().unbind());
     Ok(helper)
