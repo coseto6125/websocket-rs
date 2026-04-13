@@ -1,0 +1,10 @@
+# Enable AVX2 for auto-vectorization of hot paths (tungstenite frame masking).
+# AVX2 is available on Intel Haswell (2013+) and AMD Excavator (2015+).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+avx2,+bmi2"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+avx2,+bmi2"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-feature=+avx2,+bmi2"]
