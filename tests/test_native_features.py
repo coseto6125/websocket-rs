@@ -122,3 +122,48 @@ def test_ping_payload_too_large_rejected(server):
         ws.close()
 
     asyncio.run(run())
+
+
+def test_async_for_iteration(server):
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{PORT}")
+        for i in range(5):
+            ws.send(f"msg-{i}".encode())
+        received = []
+        n = 0
+        async for msg in ws:
+            received.append(bytes(msg))
+            n += 1
+            if n >= 5:
+                ws.close()
+                break
+        assert received == [b"msg-0", b"msg-1", b"msg-2", b"msg-3", b"msg-4"]
+
+    asyncio.run(run())
+
+
+def test_async_context_manager(server):
+    async def run():
+        async with await connect(f"ws://127.0.0.1:{PORT}") as ws:
+            ws.send(b"hi")
+            resp = await ws.recv()
+            assert bytes(resp) == b"hi"
+        # After context exit, ws.close() should have been invoked
+        assert not ws.is_open
+
+    asyncio.run(run())
+
+
+def test_connect_timeout_on_unreachable():
+    # TEST-NET-1: 192.0.2.x guaranteed unroutable per RFC 5737.
+    async def run():
+        t0 = time.perf_counter()
+        try:
+            await connect("ws://192.0.2.1:9999", connect_timeout=0.3)
+            raise AssertionError("expected timeout")
+        except (asyncio.TimeoutError, TimeoutError):
+            elapsed = time.perf_counter() - t0
+            # Should unblock well before the default OS connect timeout (~75s).
+            assert elapsed < 2.0, f"timeout didn't fire: {elapsed}s"
+
+    asyncio.run(run())

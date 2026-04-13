@@ -20,7 +20,8 @@ use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use parking_lot::Mutex;
 use pyo3::exceptions::{
-    PyConnectionError, PyIndexError, PyRuntimeError, PyStopIteration, PyTypeError, PyValueError,
+    PyConnectionError, PyIndexError, PyRuntimeError, PyStopAsyncIteration, PyStopIteration,
+    PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyModule, PySlice, PyString};
@@ -677,6 +678,54 @@ impl NativeClient {
         s.handshake_done && !s.closed && s.transport.is_some()
     }
 
+    // ---- Async iteration: `async for msg in ws` ----
+    fn __aiter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// Async iterator step. Returns the next WSMessage; raises StopAsyncIteration
+    /// when the connection is closed (vs recv() which raises ConnectionError).
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut state = self.state.lock();
+        if let Some(payload) = state.backlog.pop_front() {
+            drop(state);
+            return ready_ok(py, payload.into_any());
+        }
+        if state.closed {
+            drop(state);
+            return ready_err(py, PyStopAsyncIteration::new_err("Connection closed"));
+        }
+        let loop_ref = state
+            .loop_ref
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
+            .clone_ref(py);
+        drop(state);
+        let fut = loop_ref.bind(py).call_method0("create_future")?;
+        self.state
+            .lock()
+            .pending_recv
+            .push_back(fut.clone().unbind());
+        Ok(fut)
+    }
+
+    // ---- Async context manager: `async with connect(...) as ws:` ----
+    fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        ready_ok(py, slf.into_any())
+    }
+
+    #[pyo3(signature = (_exc_type=None, _exc_value=None, _traceback=None))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _exc_type: Option<Py<PyAny>>,
+        _exc_value: Option<Py<PyAny>>,
+        _traceback: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.close(py)?;
+        ready_ok(py, py.None())
+    }
+
     #[getter]
     fn subprotocol(&self) -> Option<String> {
         self.state.lock().subprotocol.clone()
@@ -885,13 +934,14 @@ impl NativeClient {
 /// ``loop.create_connection``, so the protocol sees decrypted bytes. If a
 /// custom context is needed (self-signed, client cert), pass it via ``ssl_context``.
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None))]
+#[pyo3(signature = (uri, *, headers=None, subprotocols=None, ssl_context=None, connect_timeout=None))]
 fn connect<'py>(
     py: Python<'py>,
     uri: String,
     headers: Option<Vec<(String, String)>>,
     subprotocols: Option<Vec<String>>,
     ssl_context: Option<Py<PyAny>>,
+    connect_timeout: Option<f64>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
@@ -977,7 +1027,17 @@ fn connect<'py>(
     // We implement this by wrapping in an async Python function crafted from asyncio.
     // Simplest: schedule a Python helper that we build inline via an async def compiled once.
     let helper = get_connect_helper(py)?;
-    helper.call1((create_conn_coro, req_bytes, handshake_fut, client_obj))
+    let timeout_obj = match connect_timeout {
+        Some(t) => t.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    helper.call1((
+        create_conn_coro,
+        req_bytes,
+        handshake_fut,
+        client_obj,
+        timeout_obj,
+    ))
 }
 
 fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
@@ -1013,18 +1073,24 @@ fn get_connect_helper(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         return Ok(h.bind(py).clone());
     }
     let code = r#"
-async def _connect_helper(create_conn_coro, req_bytes, handshake_fut, client):
-    transport, _proto = await create_conn_coro
-    try:
-        sock = transport.get_extra_info("socket")
-        if sock is not None:
-            import socket as _s
-            sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
-    except Exception:
-        pass
-    transport.write(bytes(req_bytes))
-    await handshake_fut
-    return client
+import asyncio as _asyncio
+
+async def _connect_helper(create_conn_coro, req_bytes, handshake_fut, client, connect_timeout):
+    async def _do():
+        transport, _proto = await create_conn_coro
+        try:
+            sock = transport.get_extra_info("socket")
+            if sock is not None:
+                import socket as _s
+                sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_NODELAY, 1)
+        except Exception:
+            pass
+        transport.write(bytes(req_bytes))
+        await handshake_fut
+        return client
+    if connect_timeout is not None:
+        return await _asyncio.wait_for(_do(), timeout=connect_timeout)
+    return await _do()
 "#;
     let module = PyModule::from_code(py, std::ffi::CString::new(code)?.as_c_str(), c"helper.py", c"helper")?;
     let helper = module.getattr("_connect_helper")?;
