@@ -42,7 +42,7 @@ connect = native_client.connect
 # Canonical message type (zero-copy buffer-protocol view).
 WSMessage = native_client.WSMessage
 
-__version__ = "0.6.0"
+__version__ = "0.7.1"
 
 __all__ = [
     "connect",
