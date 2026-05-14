@@ -5,15 +5,17 @@
 
 import asyncio
 import sys
+import threading
 import time
 
-# Set stdout encoding to utf-8 for Windows compatibility
-sys.stdout.reconfigure(encoding="utf-8")
-
+import pytest
 import websockets
 
 import websocket_rs.async_client
 import websocket_rs.sync.client
+
+# Set stdout encoding to utf-8 for Windows compatibility
+sys.stdout.reconfigure(encoding="utf-8")
 
 sync_connect = websocket_rs.sync.client.connect
 async_connect = websocket_rs.async_client.connect
@@ -26,6 +28,36 @@ async def start_echo_server():
 
     async with websockets.serve(echo, "localhost", 8765):
         await asyncio.Future()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def echo_server():
+    ready = threading.Event()
+    stop = threading.Event()
+    errors = []
+
+    async def run_server():
+        async def echo(websocket):
+            async for message in websocket:
+                await websocket.send(message)
+
+        try:
+            async with websockets.serve(echo, "localhost", 8765):
+                ready.set()
+                while not stop.is_set():
+                    await asyncio.sleep(0.05)
+        except Exception as exc:
+            errors.append(exc)
+            ready.set()
+
+    thread = threading.Thread(target=lambda: asyncio.run(run_server()), daemon=True)
+    thread.start()
+    assert ready.wait(timeout=5), "echo server on 8765 did not start"
+    if errors:
+        raise errors[0]
+    yield
+    stop.set()
+    thread.join(timeout=2)
 
 
 def test_rust_sync_api():
