@@ -1456,10 +1456,7 @@ impl NativeClient {
             }
         }
 
-        loop {
-            let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) else {
-                break;
-            };
+        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) {
             if state.buf.len() < hdr + plen {
                 break;
             }
