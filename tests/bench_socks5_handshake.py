@@ -30,7 +30,7 @@ uvloop.install()
 # ---------- Tiny self-contained SOCKS5 no-auth proxy ----------
 
 
-def _serve_socks5(port: int, ready: threading.Event):
+def _serve_socks5(port: int, ready: threading.Event, fragment_replies: bool = False):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -38,10 +38,18 @@ def _serve_socks5(port: int, ready: threading.Event):
     ready.set()
     while True:
         conn, _ = srv.accept()
-        threading.Thread(target=_handle_socks5, args=(conn,), daemon=True).start()
+        threading.Thread(target=_handle_socks5, args=(conn, fragment_replies), daemon=True).start()
 
 
-def _handle_socks5(conn: socket.socket):
+def _handle_socks5(conn: socket.socket, fragment_replies: bool = False):
+    def send_reply(data: bytes):
+        if fragment_replies:
+            for byte in data:
+                conn.sendall(bytes([byte]))
+                time.sleep(0.01)
+        else:
+            conn.sendall(data)
+
     try:
         # Greeting: VER=0x05, NMETHODS, METHODS...
         head = conn.recv(2)
@@ -50,7 +58,7 @@ def _handle_socks5(conn: socket.socket):
             return
         nmethods = head[1]
         conn.recv(nmethods)
-        conn.sendall(b"\x05\x00")  # select no-auth
+        send_reply(b"\x05\x00")  # select no-auth
         # CONNECT: VER=0x05, CMD=0x01, RSV=0x00, ATYP, ADDR, PORT
         req = conn.recv(4)
         atyp = req[3]
@@ -69,11 +77,11 @@ def _handle_socks5(conn: socket.socket):
         try:
             upstream.connect((host, port))
         except Exception:
-            conn.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+            send_reply(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             conn.close()
             return
         # Reply: VER=0x05, REP=0x00 (success), RSV=0x00, ATYP=0x01, bind addr+port (zeros ok)
-        conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        send_reply(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
         # Bidi relay until either side closes — we don't actually do any work
         # in this test (clients close immediately), so minimal relay is fine.
