@@ -159,6 +159,58 @@ fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
     Some((fin, rsv1, opcode, plen, hdr))
 }
 
+struct FastFrame<'a> {
+    opcode: u8,
+    payload: &'a [u8],
+    payload_start: usize,
+}
+
+enum VisitOutcome {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, PartialEq)]
+enum ScanOutcome {
+    Exhausted { consumed: usize },
+    Partial { consumed: usize, needed: usize },
+    Fallback { consumed: usize },
+    Stopped { consumed: usize },
+}
+
+#[inline(always)]
+fn walk_frames<'a, E>(
+    data: &'a [u8],
+    mut visitor: impl FnMut(FastFrame<'a>) -> Result<VisitOutcome, E>,
+) -> Result<ScanOutcome, E> {
+    let mut off = 0usize;
+    while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
+        if data.len() - off < hdr + plen {
+            return Ok(ScanOutcome::Partial {
+                consumed: off,
+                needed: hdr + plen,
+            });
+        }
+        if !fin || opcode == OP_CONTINUATION || rsv1 {
+            return Ok(ScanOutcome::Fallback { consumed: off });
+        }
+        let total = hdr + plen;
+        let payload_start = off + hdr;
+        let frame = FastFrame {
+            opcode,
+            payload: &data[payload_start..off + total],
+            payload_start,
+        };
+        if matches!(visitor(frame)?, VisitOutcome::Stop) {
+            return Ok(ScanOutcome::Stopped {
+                consumed: off + total,
+            });
+        }
+        off += total;
+    }
+    Ok(ScanOutcome::Exhausted { consumed: off })
+}
+
 struct State {
     transport: Option<Py<PyAny>>,
     buf: BytesMut,
@@ -1143,39 +1195,33 @@ impl NativeClient {
             self.data_received_inner(py, data)?;
             return Ok((data.len(), None));
         }
-        let mut off = 0usize;
-        let mut needed: Option<usize> = None;
-        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-            if data.len() - off < hdr + plen {
-                // Threshold is the post-compaction size — caller drops the
-                // already-consumed `[..off]` region before the next pass.
-                needed = Some(hdr + plen);
-                break;
-            }
-            if !fin || opcode == OP_CONTINUATION || rsv1 {
-                self.data_received_inner(py, &data[off..])?;
-                return Ok((data.len(), None));
-            }
-            let total = hdr + plen;
-            let payload_slice = &data[off + hdr..off + total];
-            match opcode {
+        let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
+            match frame.opcode {
                 OP_TEXT | OP_BINARY => {
-                    let payload = Bytes::copy_from_slice(payload_slice);
+                    let payload = Bytes::copy_from_slice(frame.payload);
                     let msg = Py::new(py, WSMessage { data: payload })?;
                     let mut state = self.state.borrow_mut();
                     Self::deliver_message(py, &mut state, msg)?;
                 }
                 OP_CLOSE => {
-                    let payload = &data[off + hdr..off + total];
                     let mut state = self.state.borrow_mut();
-                    Self::handle_close_frame(py, &mut state, payload);
-                    return Ok((off + total, None));
+                    Self::handle_close_frame(py, &mut state, frame.payload);
+                    return Ok(VisitOutcome::Stop);
                 }
                 _ => {}
             }
-            off += total;
+            Ok(VisitOutcome::Continue)
+        })?;
+        match outcome {
+            ScanOutcome::Exhausted { consumed } | ScanOutcome::Stopped { consumed } => {
+                Ok((consumed, None))
+            }
+            ScanOutcome::Partial { consumed, needed } => Ok((consumed, Some(needed))),
+            ScanOutcome::Fallback { consumed } => {
+                self.data_received_inner(py, &data[consumed..])?;
+                Ok((data.len(), None))
+            }
         }
-        Ok((off, needed))
     }
 
     fn data_received_inner_pybytes<'py>(
@@ -1187,36 +1233,40 @@ impl NativeClient {
         let mut state = self.state.borrow_mut();
 
         if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
-            let mut off = 0usize;
-            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-                if data.len() - off < hdr + plen {
-                    break;
-                }
-                if !fin || opcode == OP_CONTINUATION || rsv1 {
-                    break;
-                }
-                let total = hdr + plen;
-                match opcode {
+            let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
+                match frame.opcode {
                     OP_TEXT | OP_BINARY => {
                         // Zero-copy: wrap PyBytes as a Bytes owner — no memcpy
                         // of the payload bytes. PyBytes is immutable so the
                         // pointer is stable for as long as the refcount is
                         // held by PyBytesOwner.
-                        let payload = pybytes_zero_copy_slice(py, pb, data, off + hdr, off + total);
+                        let payload = pybytes_zero_copy_slice(
+                            py,
+                            pb,
+                            data,
+                            frame.payload_start,
+                            frame.payload_start + frame.payload.len(),
+                        );
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        let payload = &data[off + hdr..off + total];
-                        Self::handle_close_frame(py, &mut state, payload);
-                        return Ok(());
+                        Self::handle_close_frame(py, &mut state, frame.payload);
+                        return Ok(VisitOutcome::Stop);
                     }
                     _ => {}
                 }
-                off += total;
-            }
-            if off < data.len() {
-                state.buf.extend_from_slice(&data[off..]);
+                Ok(VisitOutcome::Continue)
+            })?;
+            let consumed = match outcome {
+                ScanOutcome::Stopped { .. } => return Ok(()),
+                ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
+                ScanOutcome::Exhausted { consumed }
+                | ScanOutcome::Partial { consumed, .. }
+                | ScanOutcome::Fallback { consumed } => consumed,
+            };
+            if consumed < data.len() {
+                state.buf.extend_from_slice(&data[consumed..]);
                 drop(state);
                 return self.process_buffered_frames(py);
             }
@@ -1235,35 +1285,30 @@ impl NativeClient {
         // buf. Servers that deliver one frame per write hit this path and save a
         // memcpy per callback.
         if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
-            let mut off = 0usize;
-            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-                if data.len() - off < hdr + plen {
-                    break;
-                }
-                // Fragmented frames (fin=false, or opcode=0x0 continuation) and
-                // compressed frames (rsv1=true) need buffered handling — bail
-                // to the slow path where the DeflateCtx lives.
-                if !fin || opcode == OP_CONTINUATION || rsv1 {
-                    break;
-                }
-                let total = hdr + plen;
-                let slice = &data[off + hdr..off + total];
-                match opcode {
+            let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
+                match frame.opcode {
                     OP_TEXT | OP_BINARY => {
-                        let payload = Bytes::copy_from_slice(slice);
+                        let payload = Bytes::copy_from_slice(frame.payload);
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        Self::handle_close_frame(py, &mut state, slice);
-                        return Ok(());
+                        Self::handle_close_frame(py, &mut state, frame.payload);
+                        return Ok(VisitOutcome::Stop);
                     }
                     _ => {}
                 }
-                off += total;
-            }
-            if off < data.len() {
-                state.buf.extend_from_slice(&data[off..]);
+                Ok(VisitOutcome::Continue)
+            })?;
+            let consumed = match outcome {
+                ScanOutcome::Stopped { .. } => return Ok(()),
+                ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
+                ScanOutcome::Exhausted { consumed }
+                | ScanOutcome::Partial { consumed, .. }
+                | ScanOutcome::Fallback { consumed } => consumed,
+            };
+            if consumed < data.len() {
+                state.buf.extend_from_slice(&data[consumed..]);
                 drop(state);
                 return self.process_buffered_frames(py);
             }
@@ -1796,7 +1841,9 @@ fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_header, parse_ws_uri, OP_PING};
+    use super::{
+        parse_header, parse_ws_uri, walk_frames, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING,
+    };
 
     #[test]
     fn test_parse_header_masked_server_frame_keeps_unmasked_header_size() {
@@ -1823,6 +1870,52 @@ mod tests {
     fn test_parse_header_incomplete_extended_lengths_returns_none() {
         assert_eq!(parse_header(&[0x82, 126, 0]), None);
         assert_eq!(parse_header(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn test_walk_frames_complete_frames_visits_payloads() {
+        let data = [0x82, 0x01, b'a', 0x82, 0x02, b'b', b'c'];
+        let mut payloads = Vec::new();
+
+        let outcome = walk_frames(&data, |frame| {
+            assert_eq!(frame.opcode, OP_BINARY);
+            payloads.push(frame.payload);
+            Ok::<_, ()>(VisitOutcome::Continue)
+        })
+        .unwrap();
+
+        assert_eq!(payloads, [b"a".as_slice(), b"bc".as_slice()]);
+        assert_eq!(outcome, ScanOutcome::Exhausted { consumed: 7 });
+    }
+
+    #[test]
+    fn test_walk_frames_partial_payload_reports_post_compaction_threshold() {
+        let data = [0x82, 0x01, b'a', 0x82, 0x03, b'b'];
+
+        let outcome = walk_frames(&data, |_| Ok::<_, ()>(VisitOutcome::Continue)).unwrap();
+
+        assert_eq!(
+            outcome,
+            ScanOutcome::Partial {
+                consumed: 3,
+                needed: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn test_walk_frames_fragmented_frame_falls_back_without_visiting() {
+        let data = [0x02, 0x01, b'a'];
+        let mut visited = false;
+
+        let outcome = walk_frames(&data, |_| {
+            visited = true;
+            Ok::<_, ()>(VisitOutcome::Continue)
+        })
+        .unwrap();
+
+        assert!(!visited);
+        assert_eq!(outcome, ScanOutcome::Fallback { consumed: 0 });
     }
 
     #[test]
