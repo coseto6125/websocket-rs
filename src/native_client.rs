@@ -1478,10 +1478,7 @@ impl NativeClient {
                     }
                     if fin {
                         let final_payload = if is_compressed {
-                            match decompress_message(&mut state, &payload) {
-                                Ok(p) => Bytes::from(p),
-                                Err(e) => return Err(e),
-                            }
+                            Bytes::from(decompress_message(&mut state, &payload)?)
                         } else {
                             payload
                         };
