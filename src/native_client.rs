@@ -1803,7 +1803,34 @@ fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ws_uri;
+    use super::{parse_header, parse_ws_uri, OP_PING};
+
+    #[test]
+    fn test_parse_header_masked_server_frame_keeps_unmasked_header_size() {
+        let frame = [0x82, 0x81, 1, 2, 3, 4, b'x'];
+
+        assert_eq!(parse_header(&frame), Some((true, false, 0x2, 1, 2)));
+    }
+
+    #[test]
+    fn test_parse_header_rsv2_rsv3_and_reserved_opcode_returns_header() {
+        let frame = [0xB3, 0x00];
+
+        assert_eq!(parse_header(&frame), Some((true, false, 0x3, 0, 2)));
+    }
+
+    #[test]
+    fn test_parse_header_fragmented_extended_ping_returns_header() {
+        let frame = [OP_PING, 126, 0, 126];
+
+        assert_eq!(parse_header(&frame), Some((false, false, OP_PING, 126, 4)));
+    }
+
+    #[test]
+    fn test_parse_header_incomplete_extended_lengths_returns_none() {
+        assert_eq!(parse_header(&[0x82, 126, 0]), None);
+        assert_eq!(parse_header(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
 
     #[test]
     fn test_parse_ws_uri_ipv6_with_port_and_query() {
