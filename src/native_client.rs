@@ -723,62 +723,6 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Parse `data` (a window into `recv_buf`) in place. Returns the number
-    /// of bytes consumed; the caller compacts the rest. The fast path
-    /// (handshake done, no fragment in flight, no deflate state, no carry-
-    /// over `state.buf`) parses straight from `data` without copying. The
-    /// slow path (handshake-in-progress / fragmented / compressed) routes
-    /// through `data_received_inner` which uses `state.buf` as its working
-    /// area — in that case we report the full window as consumed.
-    /// Returns `(consumed, next_frame_needed)`. `next_frame_needed` is
-    /// `Some(N)` when parse stopped on a partial frame: `recv_pos` (after
-    /// caller's compaction) must reach `N` before the next parse pass can
-    /// complete that frame. Caller writes it onto State once, outside any
-    /// per-frame borrow churn.
-    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<(usize, Option<usize>)> {
-        let can_fast_path = {
-            let st = self.state.borrow();
-            st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()
-        };
-        if !can_fast_path {
-            self.data_received_inner(py, data)?;
-            return Ok((data.len(), None));
-        }
-        let mut off = 0usize;
-        let mut needed: Option<usize> = None;
-        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-            if data.len() - off < hdr + plen {
-                // Threshold is the post-compaction size — caller drops the
-                // already-consumed `[..off]` region before the next pass.
-                needed = Some(hdr + plen);
-                break;
-            }
-            if !fin || opcode == OP_CONTINUATION || rsv1 {
-                self.data_received_inner(py, &data[off..])?;
-                return Ok((data.len(), None));
-            }
-            let total = hdr + plen;
-            let payload_slice = &data[off + hdr..off + total];
-            match opcode {
-                OP_TEXT | OP_BINARY => {
-                    let payload = Bytes::copy_from_slice(payload_slice);
-                    let msg = Py::new(py, WSMessage { data: payload })?;
-                    let mut state = self.state.borrow_mut();
-                    Self::deliver_message(py, &mut state, msg)?;
-                }
-                OP_CLOSE => {
-                    let payload = &data[off + hdr..off + total];
-                    let mut state = self.state.borrow_mut();
-                    Self::handle_close_frame(py, &mut state, payload);
-                    return Ok((off + total, None));
-                }
-                _ => {}
-            }
-            off += total;
-        }
-        Ok((off, needed))
-    }
-
     fn data_received<'py>(&self, py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<()> {
         // Try PyBytes zero-copy fast path (asyncio.Protocol gives PyBytes which
         // is immutable, so wrapping its buffer as a Bytes owner avoids the
@@ -802,132 +746,6 @@ impl NativeClient {
         };
         self.flush_pending_callbacks(py)?;
         result
-    }
-
-    fn data_received_inner_pybytes<'py>(
-        &self,
-        py: Python<'py>,
-        pb: &Bound<'py, PyBytes>,
-        data: &[u8],
-    ) -> PyResult<()> {
-        let mut state = self.state.borrow_mut();
-
-        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
-            let mut off = 0usize;
-            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-                if data.len() - off < hdr + plen {
-                    break;
-                }
-                if !fin || opcode == OP_CONTINUATION || rsv1 {
-                    break;
-                }
-                let total = hdr + plen;
-                match opcode {
-                    OP_TEXT | OP_BINARY => {
-                        // Zero-copy: wrap PyBytes as a Bytes owner — no memcpy
-                        // of the payload bytes. PyBytes is immutable so the
-                        // pointer is stable for as long as the refcount is
-                        // held by PyBytesOwner.
-                        let payload = pybytes_zero_copy_slice(py, pb, data, off + hdr, off + total);
-                        let msg = Py::new(py, WSMessage { data: payload })?;
-                        Self::deliver_message(py, &mut state, msg)?;
-                    }
-                    OP_CLOSE => {
-                        let payload = &data[off + hdr..off + total];
-                        Self::handle_close_frame(py, &mut state, payload);
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-                off += total;
-            }
-            if off < data.len() {
-                state.buf.extend_from_slice(&data[off..]);
-                drop(state);
-                return self.process_buffered_frames(py);
-            }
-            return Ok(());
-        }
-        state.buf.extend_from_slice(data);
-        drop(state);
-        self.process_buffered_frames(py)
-    }
-
-    fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let mut state = self.state.borrow_mut();
-
-        // Fast path: if our internal buf is empty and the handshake is already done,
-        // parse frames straight out of `data` and only copy the tail (if any) back into
-        // buf. Servers that deliver one frame per write hit this path and save a
-        // memcpy per callback.
-        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
-            let mut off = 0usize;
-            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
-                if data.len() - off < hdr + plen {
-                    break;
-                }
-                // Fragmented frames (fin=false, or opcode=0x0 continuation) and
-                // compressed frames (rsv1=true) need buffered handling — bail
-                // to the slow path where the DeflateCtx lives.
-                if !fin || opcode == OP_CONTINUATION || rsv1 {
-                    break;
-                }
-                let total = hdr + plen;
-                let slice = &data[off + hdr..off + total];
-                match opcode {
-                    OP_TEXT | OP_BINARY => {
-                        let payload = Bytes::copy_from_slice(slice);
-                        let msg = Py::new(py, WSMessage { data: payload })?;
-                        Self::deliver_message(py, &mut state, msg)?;
-                    }
-                    OP_CLOSE => {
-                        Self::handle_close_frame(py, &mut state, slice);
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-                off += total;
-            }
-            if off < data.len() {
-                state.buf.extend_from_slice(&data[off..]);
-                drop(state);
-                return self.process_buffered_frames(py);
-            }
-            return Ok(());
-        }
-
-        // Slow path: handshake in progress or buf already holds partial frame
-        // data (fragment / compression). process_buffered_frames has the full
-        // handshake parse including subprotocol + extension negotiation.
-        state.buf.extend_from_slice(data);
-        drop(state);
-        self.process_buffered_frames(py)
-    }
-
-    /// Drain pending_callback_msgs and invoke the user callback for each.
-    /// Must be called with no outstanding borrow on State.
-    fn flush_pending_callbacks(&self, py: Python<'_>) -> PyResult<()> {
-        loop {
-            // Pop one message at a time; the user callback may push new frames
-            // (e.g. by triggering re-entrant data_received) — unlikely on
-            // single-thread asyncio but cheap to handle.
-            let (cb, msg) = {
-                let mut st = self.state.borrow_mut();
-                if st.pending_callback_msgs.is_empty() {
-                    return Ok(());
-                }
-                let msg = match st.pending_callback_msgs.pop_front() {
-                    Some(m) => m,
-                    None => return Ok(()),
-                };
-                let cb = match st.on_message.as_ref() {
-                    Some(c) => c.clone_ref(py),
-                    None => return Ok(()),
-                };
-                (cb, msg)
-            };
-            cb.bind(py).call1((msg,))?;
-        }
     }
 
     /// Called by asyncio transport when its send buffer crosses the high-water mark.
@@ -1133,25 +951,6 @@ impl NativeClient {
         Ok(())
     }
 
-    /// Build a single PyBytes containing header + masked payload — used on the
-    /// slow path (paused transport, no raw fd, or sendmsg fallback).
-    fn build_merged_frame<'py>(
-        &self,
-        py: Python<'py>,
-        header: &[u8],
-        payload: &[u8],
-        mask_key: [u8; 4],
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let total = header.len() + payload.len();
-        PyBytes::new_with(py, total, |buf| {
-            buf[..header.len()].copy_from_slice(header);
-            let p = &mut buf[header.len()..];
-            p.copy_from_slice(payload);
-            apply_mask(p, mask_key);
-            Ok(())
-        })
-    }
-
     /// Returns an asyncio.Future that completes with the next received frame payload.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let mut state = self.state.borrow_mut();
@@ -1323,6 +1122,207 @@ impl NativeClient {
 
 // Helpers (non-pymethod)
 impl NativeClient {
+    /// Parse `data` (a window into `recv_buf`) in place. Returns the number
+    /// of bytes consumed; the caller compacts the rest. The fast path
+    /// (handshake done, no fragment in flight, no deflate state, no carry-
+    /// over `state.buf`) parses straight from `data` without copying. The
+    /// slow path (handshake-in-progress / fragmented / compressed) routes
+    /// through `data_received_inner` which uses `state.buf` as its working
+    /// area — in that case we report the full window as consumed.
+    /// Returns `(consumed, next_frame_needed)`. `next_frame_needed` is
+    /// `Some(N)` when parse stopped on a partial frame: `recv_pos` (after
+    /// caller's compaction) must reach `N` before the next parse pass can
+    /// complete that frame. Caller writes it onto State once, outside any
+    /// per-frame borrow churn.
+    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<(usize, Option<usize>)> {
+        let can_fast_path = {
+            let st = self.state.borrow();
+            st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()
+        };
+        if !can_fast_path {
+            self.data_received_inner(py, data)?;
+            return Ok((data.len(), None));
+        }
+        let mut off = 0usize;
+        let mut needed: Option<usize> = None;
+        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
+            if data.len() - off < hdr + plen {
+                // Threshold is the post-compaction size — caller drops the
+                // already-consumed `[..off]` region before the next pass.
+                needed = Some(hdr + plen);
+                break;
+            }
+            if !fin || opcode == OP_CONTINUATION || rsv1 {
+                self.data_received_inner(py, &data[off..])?;
+                return Ok((data.len(), None));
+            }
+            let total = hdr + plen;
+            let payload_slice = &data[off + hdr..off + total];
+            match opcode {
+                OP_TEXT | OP_BINARY => {
+                    let payload = Bytes::copy_from_slice(payload_slice);
+                    let msg = Py::new(py, WSMessage { data: payload })?;
+                    let mut state = self.state.borrow_mut();
+                    Self::deliver_message(py, &mut state, msg)?;
+                }
+                OP_CLOSE => {
+                    let payload = &data[off + hdr..off + total];
+                    let mut state = self.state.borrow_mut();
+                    Self::handle_close_frame(py, &mut state, payload);
+                    return Ok((off + total, None));
+                }
+                _ => {}
+            }
+            off += total;
+        }
+        Ok((off, needed))
+    }
+
+    fn data_received_inner_pybytes<'py>(
+        &self,
+        py: Python<'py>,
+        pb: &Bound<'py, PyBytes>,
+        data: &[u8],
+    ) -> PyResult<()> {
+        let mut state = self.state.borrow_mut();
+
+        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
+            let mut off = 0usize;
+            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
+                if data.len() - off < hdr + plen {
+                    break;
+                }
+                if !fin || opcode == OP_CONTINUATION || rsv1 {
+                    break;
+                }
+                let total = hdr + plen;
+                match opcode {
+                    OP_TEXT | OP_BINARY => {
+                        // Zero-copy: wrap PyBytes as a Bytes owner — no memcpy
+                        // of the payload bytes. PyBytes is immutable so the
+                        // pointer is stable for as long as the refcount is
+                        // held by PyBytesOwner.
+                        let payload = pybytes_zero_copy_slice(py, pb, data, off + hdr, off + total);
+                        let msg = Py::new(py, WSMessage { data: payload })?;
+                        Self::deliver_message(py, &mut state, msg)?;
+                    }
+                    OP_CLOSE => {
+                        let payload = &data[off + hdr..off + total];
+                        Self::handle_close_frame(py, &mut state, payload);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                off += total;
+            }
+            if off < data.len() {
+                state.buf.extend_from_slice(&data[off..]);
+                drop(state);
+                return self.process_buffered_frames(py);
+            }
+            return Ok(());
+        }
+        state.buf.extend_from_slice(data);
+        drop(state);
+        self.process_buffered_frames(py)
+    }
+
+    fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        let mut state = self.state.borrow_mut();
+
+        // Fast path: if our internal buf is empty and the handshake is already done,
+        // parse frames straight out of `data` and only copy the tail (if any) back into
+        // buf. Servers that deliver one frame per write hit this path and save a
+        // memcpy per callback.
+        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
+            let mut off = 0usize;
+            while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
+                if data.len() - off < hdr + plen {
+                    break;
+                }
+                // Fragmented frames (fin=false, or opcode=0x0 continuation) and
+                // compressed frames (rsv1=true) need buffered handling — bail
+                // to the slow path where the DeflateCtx lives.
+                if !fin || opcode == OP_CONTINUATION || rsv1 {
+                    break;
+                }
+                let total = hdr + plen;
+                let slice = &data[off + hdr..off + total];
+                match opcode {
+                    OP_TEXT | OP_BINARY => {
+                        let payload = Bytes::copy_from_slice(slice);
+                        let msg = Py::new(py, WSMessage { data: payload })?;
+                        Self::deliver_message(py, &mut state, msg)?;
+                    }
+                    OP_CLOSE => {
+                        Self::handle_close_frame(py, &mut state, slice);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                off += total;
+            }
+            if off < data.len() {
+                state.buf.extend_from_slice(&data[off..]);
+                drop(state);
+                return self.process_buffered_frames(py);
+            }
+            return Ok(());
+        }
+
+        // Slow path: handshake in progress or buf already holds partial frame
+        // data (fragment / compression). process_buffered_frames has the full
+        // handshake parse including subprotocol + extension negotiation.
+        state.buf.extend_from_slice(data);
+        drop(state);
+        self.process_buffered_frames(py)
+    }
+
+    /// Drain pending_callback_msgs and invoke the user callback for each.
+    /// Must be called with no outstanding borrow on State.
+    fn flush_pending_callbacks(&self, py: Python<'_>) -> PyResult<()> {
+        loop {
+            // Pop one message at a time; the user callback may push new frames
+            // (e.g. by triggering re-entrant data_received) — unlikely on
+            // single-thread asyncio but cheap to handle.
+            let (cb, msg) = {
+                let mut st = self.state.borrow_mut();
+                if st.pending_callback_msgs.is_empty() {
+                    return Ok(());
+                }
+                let msg = match st.pending_callback_msgs.pop_front() {
+                    Some(m) => m,
+                    None => return Ok(()),
+                };
+                let cb = match st.on_message.as_ref() {
+                    Some(c) => c.clone_ref(py),
+                    None => return Ok(()),
+                };
+                (cb, msg)
+            };
+            cb.bind(py).call1((msg,))?;
+        }
+    }
+
+    /// Build a single PyBytes containing header + masked payload — used on the
+    /// slow path (paused transport, no raw fd, or sendmsg fallback).
+    fn build_merged_frame<'py>(
+        &self,
+        py: Python<'py>,
+        header: &[u8],
+        payload: &[u8],
+        mask_key: [u8; 4],
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let total = header.len() + payload.len();
+        PyBytes::new_with(py, total, |buf| {
+            buf[..header.len()].copy_from_slice(header);
+            let p = &mut buf[header.len()..];
+            p.copy_from_slice(payload);
+            apply_mask(p, mask_key);
+            Ok(())
+        })
+    }
+
     /// asyncio BufferedProtocol implementation. Lives on NativeClient so the
     /// `NativeClientBuffered` subclass can forward to it. Returns a writable
     /// `recv_buf[recv_pos..capacity]` slice via `PyMemoryView_FromMemory`;

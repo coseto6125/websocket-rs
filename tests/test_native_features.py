@@ -10,11 +10,34 @@ import pytest
 import uvloop
 
 import websocket_rs.async_client
-from websocket_rs.native_client import connect
+from websocket_rs.native_client import NativeClient, NativeClientBuffered, connect
 
 uvloop.install()
 
 PORT = 8860
+
+
+def test_native_client_python_visibility_exposes_only_protocol_hooks():
+    for hook in (
+        "connection_made",
+        "data_received",
+        "pause_writing",
+        "resume_writing",
+        "connection_lost",
+    ):
+        assert hasattr(NativeClient, hook)
+
+    for hook in ("get_buffer", "buffer_updated"):
+        assert hasattr(NativeClientBuffered, hook)
+
+    for helper in (
+        "parse_recv_data",
+        "data_received_inner_pybytes",
+        "data_received_inner",
+        "flush_pending_callbacks",
+        "build_merged_frame",
+    ):
+        assert not hasattr(NativeClient, helper)
 
 
 def _server_frame(first_byte, payload):
