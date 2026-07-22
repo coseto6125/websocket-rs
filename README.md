@@ -130,6 +130,10 @@ ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
                       connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
 ```
 
+For the canonical async `websocket_rs.connect`, `connect_timeout` defaults to
+10 seconds when omitted or set to `None`. `receive_timeout` defaults to `None`,
+which waits indefinitely for each receive operation.
+
 ## 🔧 Advanced Installation
 
 ### From GitHub Releases (Pre-built wheels)

@@ -47,6 +47,8 @@ async def connect(
     *,
     headers: dict[str, str] | None = None,
     proxy: str | None = None,
+    connect_timeout: float | None = None,
+    receive_timeout: float | None = None,
     **kwargs: object,
 ) -> ClientConnection:
     """Establish an async WebSocket connection and return a connected client.
@@ -55,6 +57,8 @@ async def connect(
         uri: WebSocket server URL (e.g., ``"ws://localhost:8765"``).
         headers: Custom HTTP headers (e.g., ``{"Authorization": "Bearer token"}``).
         proxy: SOCKS5 proxy URL (e.g., ``"socks5://127.0.0.1:9050"``).
-        **kwargs: Accepted for compatibility, currently ignored.
+        connect_timeout: Maximum seconds allowed for connection setup.
+        receive_timeout: Maximum seconds allowed for each receive operation.
+        **kwargs: Additional compatibility arguments, currently ignored.
     """
     ...

@@ -10,6 +10,21 @@ const DEFAULT_RECEIVE_TIMEOUT: f64 = 10.0;
 const DEFAULT_CLOSE_TIMEOUT: f64 = 10.0;
 const DEFAULT_TCP_NODELAY: bool = true;
 
+const RESERVED_WEBSOCKET_HEADERS: &[&str] = &[
+    "host",
+    "upgrade",
+    "connection",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-protocol",
+];
+
+fn is_reserved_websocket_header(name: &str) -> bool {
+    RESERVED_WEBSOCKET_HEADERS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
 #[pymodule]
 fn websocket_rs(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Initialize Tokio runtime via pyo3-async-runtimes
