@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-05-14
+
+### Fixed
+
+- **Protocol edge cases in `NativeClient` (#21)**:
+
+  - **Hashing consistency**: Aligned `WSMessage` hashing logic with Python `bytes` equality. This ensures reliable behavior when messages are used as keys in dictionaries or stored in sets.
+
+  - **Connection teardown**: Centralized close-frame handling to ensure `close_code` and `close_reason` are correctly preserved during fast-path processing.
+
+  - **Malformed sequence defense**: Added strict validation for invalid fragmented-frame sequences; connections now terminate with a `ProtocolError` instead of potentially entering an inconsistent state.
+
+- **URI Parsing**: Migrated to the Rust `url` crate for robust WebSocket URI handling. Now correctly supports IPv6 literals, query parameters, and handles default ports automatically per scheme (`ws`/`wss`).
+
+
+
+### Changed
+
+- **Test Infrastructure**: Enabled `pytest-asyncio` integration. Refactored legacy server/async tests into standard pytest fixtures, allowing for a unified `uv run pytest` entry point with proper async collection.
+
+- **Dependency Refresh**: Updated Rust (`Cargo.lock`) and Python dev-dependencies (`uv.lock`) to the latest compatible versions for consistent benchmark and development environments.
+
+
 ## [0.7.0] - 2026-04-14
 
 ### Performance

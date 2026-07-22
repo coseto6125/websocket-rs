@@ -161,6 +161,34 @@ dependencies = [
 ]
 ```
 
+## ⚡ Event Loop Selection
+
+`websocket-rs` uses the standard asyncio Protocol API and works with any asyncio-compatible event loop. Choice depends on your workload — measured on this repo (Linux, Ryzen 9950X, N=50000 messages, 512B payload, 3-run average):
+
+| Workload | uvloop mean | rloop mean | Winner |
+|---|---|---|---|
+| Pipelined (single conn, window=100) | 0.366 ms | 0.365 ms | tie |
+| RR (single conn, serial send/recv)  | 0.084 ms | **0.077 ms** | **rloop −8.0%** |
+| on_message callback                 | 0.390 ms | **0.374 ms** | **rloop −4.2%** |
+| 100 concurrent connections          | **8.21 ms** | 9.28 ms | **uvloop −13.1%** |
+
+**Recommendation:**
+- **Single connection, high-frequency** (trading feed, chat client) → `rloop`
+- **Many concurrent connections** (scrapers, load generators, server-side) → `uvloop`
+- **Default / mixed / cross-platform** → `uvloop` (mature, wider OS support)
+
+```python
+# rloop (Linux only)
+import asyncio, rloop
+asyncio.set_event_loop_policy(rloop.EventLoopPolicy())
+
+# uvloop (Linux/macOS)
+import uvloop
+uvloop.install()
+```
+
+Reproduce the numbers: `uv run python tests/bench_rloop_vs_uvloop.py --runs 3`.
+
 ## 🧪 Running Tests and Benchmarks
 
 ```bash

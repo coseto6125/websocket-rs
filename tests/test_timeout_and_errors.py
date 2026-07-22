@@ -9,14 +9,16 @@ Covers issues found in code review:
 
 import asyncio
 import sys
+import threading
 import time
 
-sys.stdout.reconfigure(encoding="utf-8")
-
+import pytest
 import websockets
 
 import websocket_rs.async_client
 import websocket_rs.sync.client
+
+sys.stdout.reconfigure(encoding="utf-8")
 
 
 async def start_echo_server(port=8766):
@@ -27,14 +29,43 @@ async def start_echo_server(port=8766):
     return await websockets.serve(echo, "localhost", port, ping_interval=None)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def echo_server():
+    ready = threading.Event()
+    stop = threading.Event()
+    errors = []
+
+    async def run_server():
+        server = await start_echo_server(8766)
+        try:
+            ready.set()
+            while not stop.is_set():
+                await asyncio.sleep(0.05)
+        except Exception as exc:
+            errors.append(exc)
+            ready.set()
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    thread = threading.Thread(target=lambda: asyncio.run(run_server()), daemon=True)
+    thread.start()
+    assert ready.wait(timeout=5), "echo server on 8766 did not start"
+    if errors:
+        raise errors[0]
+    yield
+    stop.set()
+    thread.join(timeout=2)
+
+
 def test_sync_connect_timeout():
     """connect_timeout should raise TimeoutError for unreachable hosts."""
     # 192.0.2.1 is TEST-NET, guaranteed to be unreachable (RFC 5737)
     start = time.perf_counter()
     try:
-        with websocket_rs.sync.client.ClientConnection("ws://192.0.2.1:9999", connect_timeout=1.0) as ws:
+        with websocket_rs.sync.client.ClientConnection("ws://192.0.2.1:9999", connect_timeout=1.0):
             pass
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except TimeoutError:
         elapsed = time.perf_counter() - start
         assert elapsed < 3.0, f"Timeout took too long: {elapsed:.1f}s (expected ~1s)"
@@ -65,7 +96,7 @@ def test_sync_send_after_close():
     # ws is now closed
     try:
         ws.send("should fail")
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except RuntimeError:
         print("✓ sync send after close raises RuntimeError")
 
@@ -78,7 +109,7 @@ def test_sync_recv_timeout():
         start = time.perf_counter()
         try:
             ws.recv()  # no more messages, should timeout
-            assert False, "Should have raised"
+            pytest.fail("Should have raised")
         except TimeoutError:
             elapsed = time.perf_counter() - start
             assert 0.3 < elapsed < 2.0, f"Unexpected timeout duration: {elapsed:.1f}s"
@@ -93,7 +124,7 @@ async def test_async_send_after_close():
     await ws.close()
     try:
         await ws.send("should fail")
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except RuntimeError:
         print("✓ async send after close raises RuntimeError")
 
@@ -107,7 +138,7 @@ async def test_async_recv_timeout():
         start = time.perf_counter()
         try:
             await ws.recv()
-            assert False, "Should have raised"
+            pytest.fail("Should have raised")
         except TimeoutError:
             elapsed = time.perf_counter() - start
             print(f"✓ async recv timeout works ({elapsed:.1f}s)")
@@ -120,7 +151,7 @@ async def test_async_connect_timeout():
         ws = websocket_rs.async_client.ClientConnection("ws://192.0.2.1:9999", connect_timeout=1.0)
         async with ws:
             pass
-        assert False, "Should have raised"
+        pytest.fail("Should have raised")
     except (TimeoutError, ConnectionError):
         elapsed = time.perf_counter() - start
         print(f"✓ async connect_timeout works ({elapsed:.1f}s)")

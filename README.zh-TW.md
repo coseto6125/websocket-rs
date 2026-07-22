@@ -227,6 +227,34 @@ dependencies = [
 ]
 ```
 
+## ⚡ Event Loop 選擇
+
+`websocket-rs` 使用標準 asyncio Protocol API，與任何相容的 event loop 皆可搭配。選哪個視場景而定 — 以下是本 repo 實測（Linux、Ryzen 9950X、N=50000 訊息、512B payload、3 次平均）：
+
+| 場景 | uvloop mean | rloop mean | 贏家 |
+|---|---|---|---|
+| Pipelined（單連線 window=100） | 0.366 ms | 0.365 ms | 平手 |
+| RR（單連線序列 send/recv） | 0.084 ms | **0.077 ms** | **rloop −8.0%** |
+| on_message 回呼 | 0.390 ms | **0.374 ms** | **rloop −4.2%** |
+| 100 條並發連線 | **8.21 ms** | 9.28 ms | **uvloop −13.1%** |
+
+**建議：**
+- **單連線高頻**（行情訂閱、聊天 client）→ `rloop`
+- **大量並發連線**（爬蟲、壓測工具、server 端）→ `uvloop`
+- **預設 / 混合場景 / 跨平台** → `uvloop`（成熟、平台支援廣）
+
+```python
+# rloop（僅 Linux）
+import asyncio, rloop
+asyncio.set_event_loop_policy(rloop.EventLoopPolicy())
+
+# uvloop（Linux/macOS）
+import uvloop
+uvloop.install()
+```
+
+重現數據：`uv run python tests/bench_rloop_vs_uvloop.py --runs 3`。
+
 ## 🧪 執行測試和效能測試
 
 ```bash

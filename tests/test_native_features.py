@@ -7,11 +7,70 @@ import time
 import pytest
 import uvloop
 
-uvloop.install()
-
 from websocket_rs.native_client import connect
 
+uvloop.install()
+
 PORT = 8860
+
+
+def _server_frame(first_byte, payload):
+    if len(payload) <= 125:
+        return bytes([first_byte, len(payload)]) + payload
+    if len(payload) <= 65535:
+        return bytes([first_byte, 126]) + len(payload).to_bytes(2, "big") + payload
+    return bytes([first_byte, 127]) + len(payload).to_bytes(8, "big") + payload
+
+
+def _start_raw_ws_server(port, frames, *, extra_headers=(), wait_for_client_data=False):
+    import base64
+    import socket as _s
+    import threading
+    from hashlib import sha1
+
+    evt = threading.Event()
+
+    def tiny_server():
+        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(1)
+        evt.set()
+        conn, _ = srv.accept()
+        try:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(4096)
+
+            key_line = next(
+                ln for ln in data.decode("latin-1").split("\r\n") if ln.lower().startswith("sec-websocket-key:")
+            )
+            key = key_line.split(":", 1)[1].strip()
+            accept = base64.b64encode(sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            response_headers = [
+                "HTTP/1.1 101 Switching Protocols",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Accept: {accept}",
+                *extra_headers,
+                "",
+                "",
+            ]
+            conn.sendall("\r\n".join(response_headers).encode())
+            if wait_for_client_data:
+                conn.recv(4096)
+            for frame in frames:
+                conn.sendall(frame)
+                time.sleep(0.01)
+            time.sleep(0.2)
+        finally:
+            conn.close()
+            srv.close()
+
+    thread = threading.Thread(target=tiny_server, daemon=True)
+    thread.start()
+    evt.wait(timeout=2)
+    return thread
 
 
 def _server(port, ready, cfg):
@@ -75,6 +134,9 @@ def test_headers_and_subprotocol(server):
         ws.send(b"hello")
         resp = await ws.recv()
         assert bytes(resp) == b"hello"
+        assert resp == b"hello"
+        assert hash(resp) == hash(b"hello")
+        assert {b"hello": "hit"}[resp] == "hit"
         # Server should have selected one of our offered subprotocols
         assert ws.subprotocol in ("trade-v1", "chat")
         ws.close()
@@ -94,6 +156,20 @@ def test_close_code_tracked(server):
         await asyncio.sleep(0.1)
         # After closing from our side, is_open must be False
         assert not ws.is_open
+
+    asyncio.run(run())
+
+
+def test_recv_and_anext_after_client_close(server):
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{PORT}")
+        ws.send(b"before-close")
+        await ws.recv()
+        ws.close()
+        with pytest.raises(ConnectionError):
+            await ws.recv()
+        with pytest.raises(StopAsyncIteration):
+            await ws.__anext__()
 
     asyncio.run(run())
 
@@ -171,50 +247,14 @@ def test_receive_timeout_raises(server):
 
 def test_fragmented_message_assembled():
     """Hand-craft a fragmented binary message and ensure client reassembles it."""
-    import socket as _s
-    import threading
-
-    # Tiny ad-hoc WS server that accepts one connection and sends a fragmented
-    # binary message (two frames: FIN=0 opcode=2, then FIN=1 opcode=0).
-    # Avoids launching websockets (which always emits single-frame messages).
-
-    evt = threading.Event()
-
-    def tiny_server():
-        srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
-        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", 8818))
-        srv.listen(1)
-        evt.set()
-        conn, _ = srv.accept()
-        # Read handshake
-        data = b""
-        while b"\r\n\r\n" not in data:
-            data += conn.recv(4096)
-        # Parse Sec-WebSocket-Key
-        import base64
-        from hashlib import sha1
-
-        key_line = [ln for ln in data.decode("latin-1").split("\r\n") if ln.lower().startswith("sec-websocket-key:")][0]
-        key = key_line.split(":", 1)[1].strip()
-        accept = base64.b64encode(sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-        conn.sendall(
-            f"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode()
-        )
-        # Wait for any incoming (client sends something) — then reply with fragments
-        conn.recv(4096)
-        # Frame 1: FIN=0, opcode=2 (binary), 5 bytes payload
-        conn.sendall(bytes([0x02, 5]) + b"hello")
-        time.sleep(0.01)
-        # Frame 2: FIN=1, opcode=0 (continuation), 5 bytes payload
-        conn.sendall(bytes([0x80, 5]) + b"world")
-        time.sleep(0.5)
-        conn.close()
-        srv.close()
-
-    t = threading.Thread(target=tiny_server, daemon=True)
-    t.start()
-    evt.wait(timeout=2)
+    t = _start_raw_ws_server(
+        8818,
+        [
+            _server_frame(0x02, b"hello"),
+            _server_frame(0x80, b"world"),
+        ],
+        wait_for_client_data=True,
+    )
 
     async def run():
         ws = await connect("ws://127.0.0.1:8818")
@@ -222,6 +262,57 @@ def test_fragmented_message_assembled():
         msg = await asyncio.wait_for(ws.recv(), timeout=2)
         assert bytes(msg) == b"helloworld", f"got {bytes(msg)!r}"
         ws.close()
+
+    asyncio.run(run())
+    t.join(timeout=2)
+
+
+def test_protocol_error_for_unmatched_continuation_frame():
+    """A continuation frame without a fragmented message should close with 1002."""
+    port = 8819
+    t = _start_raw_ws_server(port, [_server_frame(0x80, b"bad")])
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        assert ws.close_code == 1002
+
+    asyncio.run(run())
+    t.join(timeout=2)
+
+
+def test_protocol_error_for_new_data_frame_during_fragment():
+    """A new data frame during fragmented message assembly should close with 1002."""
+    port = 8820
+    t = _start_raw_ws_server(
+        port,
+        [
+            _server_frame(0x02, b"one"),
+            _server_frame(0x82, b"two"),
+        ],
+    )
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        assert ws.close_code == 1002
+
+    asyncio.run(run())
+    t.join(timeout=2)
+
+
+def test_server_close_code_and_reason_tracked():
+    port = 8821
+    t = _start_raw_ws_server(port, [_server_frame(0x88, (1001).to_bytes(2, "big") + b"bye")])
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        assert ws.close_code == 1001
+        assert ws.close_reason == "bye"
 
     asyncio.run(run())
     t.join(timeout=2)
@@ -260,6 +351,14 @@ def test_socks5_proxy_invalid_scheme_rejected():
                 proxy="http://127.0.0.1:9999",
                 connect_timeout=1.0,
             )
+
+    asyncio.run(run())
+
+
+def test_invalid_uri_scheme_rejected():
+    async def run():
+        with pytest.raises(ValueError):
+            await connect("http://127.0.0.1:1")
 
     asyncio.run(run())
 
@@ -352,6 +451,35 @@ def test_permessage_deflate_round_trip():
     asyncio.run(run())
     p.terminate()
     p.join(timeout=2)
+
+
+def test_compressed_fragmented_message_is_reassembled_and_decompressed():
+    import zlib
+
+    port = 8822
+    msg = b"compressed-fragment-" * 200
+    compressor = zlib.compressobj(wbits=-15)
+    compressed = compressor.compress(msg) + compressor.flush(zlib.Z_SYNC_FLUSH)
+    assert compressed.endswith(b"\x00\x00\xff\xff")
+    compressed = compressed[:-4]
+    mid = len(compressed) // 2
+    t = _start_raw_ws_server(
+        port,
+        [
+            _server_frame(0x42, compressed[:mid]),
+            _server_frame(0x80, compressed[mid:]),
+        ],
+        extra_headers=("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover",),
+    )
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}", compression=True)
+        resp = await asyncio.wait_for(ws.recv(), timeout=2)
+        assert bytes(resp) == msg
+        ws.close()
+
+    asyncio.run(run())
+    t.join(timeout=2)
 
 
 def test_permessage_deflate_graceful_fallback():

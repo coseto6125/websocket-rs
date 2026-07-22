@@ -30,6 +30,7 @@ use rand::RngExt;
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
 use std::io::Read as _;
+use url::Url;
 
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -436,12 +437,8 @@ impl WSMessage {
         Ok(false)
     }
 
-    fn __hash__(&self) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        self.data.as_ref().hash(&mut h);
-        h.finish()
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        PyBytes::new(py, &self.data).hash()
     }
 
     // ---- Python buffer protocol ----
@@ -777,13 +774,9 @@ impl NativeClient {
                     Self::deliver_message(py, &mut state, msg)?;
                 }
                 OP_CLOSE => {
+                    let payload = &data[off + hdr..off + total];
                     let mut state = self.state.borrow_mut();
-                    state.closed = true;
-                    Self::fail_all_pending(py, &mut state, "Connection closed by peer");
-                    if let Some(t) = state.transport.as_ref() {
-                        let tb = t.bind(py);
-                        let _ = tb.call_method0("close");
-                    }
+                    Self::handle_close_frame(py, &mut state, payload);
                     return Ok((off + total, None));
                 }
                 _ => {}
@@ -847,12 +840,8 @@ impl NativeClient {
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        state.closed = true;
-                        Self::fail_all_pending(py, &mut state, "Connection closed by peer");
-                        if let Some(t) = state.transport.as_ref() {
-                            let tb = t.bind(py);
-                            let _ = tb.call_method0("close");
-                        }
+                        let payload = &data[off + hdr..off + total];
+                        Self::handle_close_frame(py, &mut state, payload);
                         return Ok(());
                     }
                     _ => {}
@@ -899,12 +888,7 @@ impl NativeClient {
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        state.closed = true;
-                        Self::fail_all_pending(py, &mut state, "Connection closed by peer");
-                        if let Some(t) = state.transport.as_ref() {
-                            let tb = t.bind(py);
-                            let _ = tb.call_method0("close");
-                        }
+                        Self::handle_close_frame(py, &mut state, slice);
                         return Ok(());
                     }
                     _ => {}
@@ -1048,13 +1032,14 @@ impl NativeClient {
                     out.reserve(raw_payload.len().max(1024));
                 }
                 let in_before = comp.total_in();
+                let out_before = comp.total_out();
                 comp.compress_vec(&raw_payload[cursor..], &mut out, FlushCompress::Sync)
                     .map_err(|e| PyRuntimeError::new_err(format!("deflate error: {e}")))?;
                 cursor += (comp.total_in() - in_before) as usize;
                 if cursor >= raw_payload.len() && out.ends_with(&[0x00, 0x00, 0xFF, 0xFF]) {
                     break;
                 }
-                if cursor >= raw_payload.len() && (comp.total_out() - in_before) == 0 {
+                if cursor >= raw_payload.len() && (comp.total_out() - out_before) == 0 {
                     // Defensive: no progress after input exhausted.
                     break;
                 }
@@ -1471,10 +1456,7 @@ impl NativeClient {
             }
         }
 
-        loop {
-            let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) else {
-                break;
-            };
+        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) {
             if state.buf.len() < hdr + plen {
                 break;
             }
@@ -1486,7 +1468,15 @@ impl NativeClient {
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen).freeze();
                     let is_compressed = rsv1;
-                    if fin && state.fragment_buf.is_none() {
+                    if state.fragment_buf.is_some() {
+                        Self::close_protocol_error(
+                            py,
+                            &mut state,
+                            "new data frame while fragmented message is in progress",
+                        )?;
+                        break;
+                    }
+                    if fin {
                         let final_payload = if is_compressed {
                             match decompress_message(&mut state, &payload) {
                                 Ok(p) => Bytes::from(p),
@@ -1510,28 +1500,21 @@ impl NativeClient {
                         state.fragment_buf = Some(acc);
                         state.fragment_opcode = opcode;
                         state.fragment_rsv1 = is_compressed;
-                        if fin {
-                            let raw = state.fragment_buf.take().unwrap().freeze();
-                            let compressed_flag = state.fragment_rsv1;
-                            state.fragment_opcode = 0;
-                            state.fragment_rsv1 = false;
-                            let out = if compressed_flag {
-                                Bytes::from(decompress_message(&mut state, &raw)?)
-                            } else {
-                                raw
-                            };
-                            let msg = Py::new(py, WSMessage { data: out })?;
-                            Self::deliver_message(py, &mut state, msg)?;
-                        }
                     }
                 }
-                0x0 => {
+                OP_CONTINUATION => {
                     // Continuation frame — append to fragment_buf; deliver on FIN.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen);
-                    if let Some(acc) = state.fragment_buf.as_mut() {
-                        acc.extend_from_slice(&payload);
-                    }
+                    let Some(acc) = state.fragment_buf.as_mut() else {
+                        Self::close_protocol_error(
+                            py,
+                            &mut state,
+                            "continuation frame without fragmented message",
+                        )?;
+                        break;
+                    };
+                    acc.extend_from_slice(&payload);
                     if fin {
                         if let Some(acc) = state.fragment_buf.take() {
                             let compressed_flag = state.fragment_rsv1;
@@ -1552,19 +1535,7 @@ impl NativeClient {
                     // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
                     state.buf.advance(hdr);
                     let payload = state.buf.split_to(plen);
-                    if payload.len() >= 2 {
-                        state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
-                        if payload.len() > 2 {
-                            state.close_reason =
-                                Some(String::from_utf8_lossy(&payload[2..]).into_owned());
-                        }
-                    }
-                    state.closed = true;
-                    Self::fail_all_pending(py, &mut state, "Connection closed by peer");
-                    if let Some(t) = state.transport.as_ref() {
-                        let tb = t.bind(py);
-                        let _ = tb.call_method0("close");
-                    }
+                    Self::handle_close_frame(py, &mut state, &payload);
                     break;
                 }
                 OP_PING => {
@@ -1606,6 +1577,34 @@ impl NativeClient {
             }
         } else {
             state.backlog.push_back(msg);
+        }
+        Ok(())
+    }
+
+    fn handle_close_frame(py: Python<'_>, state: &mut State, payload: &[u8]) {
+        if payload.len() >= 2 {
+            state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
+            state.close_reason =
+                (payload.len() > 2).then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+        }
+        state.closed = true;
+        Self::fail_all_pending(py, state, "Connection closed by peer");
+        if let Some(t) = state.transport.as_ref() {
+            let tb = t.bind(py);
+            let _ = tb.call_method0("close");
+        }
+    }
+
+    fn close_protocol_error(py: Python<'_>, state: &mut State, msg: &str) -> PyResult<()> {
+        state.close_code = Some(1002);
+        state.close_reason = Some(msg.to_string());
+        state.closed = true;
+        Self::fail_all_pending(py, state, msg);
+        let frame = encode_control_frame(state, OP_CLOSE, &1002u16.to_be_bytes());
+        if let Some(t) = state.transport.as_ref() {
+            let tb = t.bind(py);
+            let _ = tb.call_method1("write", (PyBytes::new(py, &frame),));
+            let _ = tb.call_method0("close");
         }
         Ok(())
     }
@@ -1782,28 +1781,50 @@ fn connect<'py>(
 }
 
 fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
-    let (scheme, rest, default_port): (&str, &str, u16) =
-        if let Some(r) = uri.strip_prefix("wss://") {
-            ("wss", r, 443)
-        } else if let Some(r) = uri.strip_prefix("ws://") {
-            ("ws", r, 80)
-        } else {
-            return Err(PyValueError::new_err("URI must start with ws:// or wss://"));
-        };
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
+    let parsed = Url::parse(uri).map_err(|_| PyValueError::new_err("Invalid WebSocket URI"))?;
+    let (scheme, default_port) = match parsed.scheme() {
+        "wss" => ("wss", 443),
+        "ws" => ("ws", 80),
+        _ => return Err(PyValueError::new_err("URI must start with ws:// or wss://")),
     };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => (
-            authority[..i].to_string(),
-            authority[i + 1..]
-                .parse()
-                .map_err(|_| PyValueError::new_err("Invalid port"))?,
-        ),
-        None => (authority.to_string(), default_port),
-    };
-    Ok((scheme, host, port, path.to_string()))
+    let host = parsed
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| PyValueError::new_err("URI must include a host"))?
+        .to_string();
+    let port = parsed.port().unwrap_or(default_port);
+    let mut path = parsed.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok((scheme, host, port, path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ws_uri;
+
+    #[test]
+    fn test_parse_ws_uri_ipv6_with_port_and_query() {
+        let (scheme, host, port, path) = parse_ws_uri("ws://[::1]:8860/ws?token=a").unwrap();
+        assert_eq!(scheme, "ws");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8860);
+        assert_eq!(path, "/ws?token=a");
+    }
+
+    #[test]
+    fn test_parse_ws_uri_uses_default_ports() {
+        let (scheme, host, port, path) = parse_ws_uri("wss://example.com/feed").unwrap();
+        assert_eq!(scheme, "wss");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/feed");
+    }
 }
 
 /// Cached Python helper that orchestrates create_connection -> send handshake -> await accept -> return client.
