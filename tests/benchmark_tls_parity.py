@@ -3,10 +3,13 @@
 client connects via wss:// to a tokio-tungstenite TLS echo server using
 self-signed cert from tests/certs/. Measures the production-realistic
 case where TLS handshake + AES-GCM encryption sit on the data path.
+
+Set BENCH_JSONL=1 to emit exact counts and RPS as JSON Lines.
 """
 
 import asyncio
 import gc
+import json
 import os
 import signal
 import ssl
@@ -60,6 +63,7 @@ PORT = 8835
 # Testing at 2 MB only stresses framework limits, not real workloads.
 SIZES = (256, 8 * 1024, 100 * 1024, 1024 * 1024)
 DURATION = float(os.environ.get("DURATION", "10"))
+BENCH_JSONL = os.environ.get("BENCH_JSONL") == "1"
 WARMUP = 50
 PREWARM_SECONDS = 1.0
 URI = f"wss://127.0.0.1:{PORT}"
@@ -234,6 +238,20 @@ def fmt_rps(r: float) -> str:
     return f"{r:.0f}"
 
 
+def emit_jsonl(size: int, client: str, *, count: int | None = None, error: str | None = None) -> None:
+    result = {
+        "benchmark": "tls_parity",
+        "client": client,
+        "server": "tokio-tungstenite-tls",
+        "size": size,
+    }
+    if count is not None:
+        result.update(count=count, duration=DURATION, rps=count / DURATION)
+    else:
+        result["error"] = error
+    print(json.dumps(result, separators=(",", ":"), sort_keys=True), flush=True)
+
+
 async def run_one_async(fn, size: int, duration: float) -> int:
     gc.collect()
     await fn(size, PREWARM_SECONDS)
@@ -266,23 +284,29 @@ async def main():
     try:
         await asyncio.sleep(0.3)
         enabled = [(name, fn) for name, ok, fn in CLIENTS if ok and fn is not None]
-        print("=== Server: tokio-tungstenite (TLS, rustls) ===")
-        header = f"{'size':>8} " + " ".join(f"{name:>11}" for name, _ in enabled)
-        print(header)
-        print("-" * len(header))
+        if not BENCH_JSONL:
+            print("=== Server: tokio-tungstenite (TLS, rustls) ===")
+            header = f"{'size':>8} " + " ".join(f"{name:>11}" for name, _ in enabled)
+            print(header)
+            print("-" * len(header))
         for size in SIZES:
             cells = []
-            for _, fn in enabled:
+            for name, fn in enabled:
                 try:
                     if asyncio.iscoroutinefunction(fn):
                         n = await run_one_async(fn, size, DURATION)
                     else:
                         n = await asyncio.to_thread(run_one_sync, fn, size, DURATION)
                     cells.append(fmt_rps(n / DURATION))
+                    if BENCH_JSONL:
+                        emit_jsonl(size, name, count=n)
                 except Exception as e:
                     cells.append(f"FAIL:{type(e).__name__}")
-            row = f"{fmt_size(size):>8} " + " ".join(f"{c:>11}" for c in cells)
-            print(row, flush=True)
+                    if BENCH_JSONL:
+                        emit_jsonl(size, name, error=type(e).__name__)
+            if not BENCH_JSONL:
+                row = f"{fmt_size(size):>8} " + " ".join(f"{c:>11}" for c in cells)
+                print(row, flush=True)
     finally:
         proc.send_signal(signal.SIGTERM)
         try:
