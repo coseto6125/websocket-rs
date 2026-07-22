@@ -9,6 +9,7 @@ import time
 import pytest
 import uvloop
 
+import websocket_rs.async_client
 from websocket_rs.native_client import connect
 
 uvloop.install()
@@ -34,6 +35,7 @@ def _start_raw_ws_server(
     coalesce_frames=False,
     send_with_handshake=False,
     hold_open=0.2,
+    capture_handshake=None,
 ):
     import base64
     import socket as _s
@@ -54,6 +56,8 @@ def _start_raw_ws_server(
             data = b""
             while b"\r\n\r\n" not in data:
                 data += conn.recv(4096)
+            if capture_handshake is not None:
+                capture_handshake.append(data)
 
             key_line = next(
                 ln for ln in data.decode("latin-1").split("\r\n") if ln.lower().startswith("sec-websocket-key:")
@@ -201,6 +205,49 @@ def test_headers_and_subprotocol(server):
     asyncio.run(run())
     assert server["user_agent"] == "websocket-rs-test"
     assert server["custom"] == "abc"
+
+
+def test_async_connect_reserved_headers_preserve_generated_handshake_values():
+    port = 8832
+    captured = []
+    thread = _start_raw_ws_server(
+        port,
+        [],
+        capture_handshake=captured,
+        hold_open=0.3,
+    )
+
+    async def run():
+        ws = await websocket_rs.async_client.connect(
+            f"ws://127.0.0.1:{port}",
+            headers={
+                "Host": "attacker.invalid",
+                "Upgrade": "not-websocket",
+                "Connection": "close",
+                "Sec-WebSocket-Key": "invalid-key",
+                "Sec-WebSocket-Version": "12",
+                "Sec-WebSocket-Protocol": "injected",
+                "X-Custom": "preserved",
+            },
+        )
+        await asyncio.sleep(0.4)
+        await ws.close()
+
+    asyncio.run(run())
+    thread.join(timeout=2)
+    assert captured
+    request_headers = {}
+    for line in captured[0].decode("latin-1").split("\r\n")[1:]:
+        if line:
+            name, value = line.split(":", 1)
+            request_headers[name.lower()] = value.strip()
+    assert request_headers["host"] == f"127.0.0.1:{port}"
+    assert request_headers["upgrade"].lower() == "websocket"
+    assert request_headers["connection"].lower() == "upgrade"
+    assert request_headers["sec-websocket-key"] != "invalid-key"
+    assert request_headers["sec-websocket-version"] == "13"
+    assert "sec-websocket-protocol" not in request_headers
+    assert request_headers["x-custom"] == "preserved"
 
 
 def test_close_code_tracked(server):
@@ -610,6 +657,34 @@ def test_socks5_proxy_tunnelled_handshake(server):
     asyncio.run(run())
 
 
+def test_socks5_proxy_fragmented_replies_complete_handshake(server):
+    import threading
+
+    from tests.bench_socks5_handshake import _serve_socks5
+
+    proxy_port = 19061
+    ready = threading.Event()
+    threading.Thread(
+        target=_serve_socks5,
+        args=(proxy_port, ready, True),
+        daemon=True,
+    ).start()
+    ready.wait(timeout=2)
+
+    async def run():
+        ws = await connect(
+            f"ws://127.0.0.1:{PORT}",
+            proxy=f"socks5://127.0.0.1:{proxy_port}",
+            connect_timeout=3.0,
+        )
+        ws.send(b"fragmented-proxy-replies")
+        response = await ws.recv()
+        assert bytes(response) == b"fragmented-proxy-replies"
+        ws.close()
+
+    asyncio.run(run())
+
+
 def test_socks5_proxy_invalid_scheme_rejected():
     async def run():
         with pytest.raises(ValueError):
@@ -789,3 +864,49 @@ def test_connect_timeout_on_unreachable():
             assert elapsed < 2.0, f"timeout didn't fire: {elapsed}s"
 
     asyncio.run(run())
+
+
+def test_native_connect_default_timeout_uses_ten_seconds(monkeypatch):
+    class TimeoutProbe(Exception):
+        pass
+
+    original_wait_for = asyncio.wait_for
+    calls = []
+
+    async def capture_wait_for(awaitable, timeout):
+        calls.append(timeout)
+        awaitable.close()
+        raise TimeoutProbe
+
+    monkeypatch.setattr(asyncio, "wait_for", capture_wait_for)
+
+    async def run():
+        with pytest.raises(TimeoutProbe):
+            await original_wait_for(connect("ws://127.0.0.1:1"), timeout=0.5)
+
+    asyncio.run(run())
+    assert calls == [10.0]
+
+
+def test_native_receive_timeout_none_skips_wait_for(monkeypatch):
+    port = 8834
+    thread = _start_raw_ws_server(port, [], hold_open=1)
+    original_wait_for = asyncio.wait_for
+    calls = []
+
+    async def capture_wait_for(awaitable, timeout):
+        calls.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, "wait_for", capture_wait_for)
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}", connect_timeout=0.5)
+        assert calls == [0.5]
+        pending = ws.recv()
+        assert calls == [0.5]
+        pending.cancel()
+        ws.close()
+
+    asyncio.run(run())
+    thread.join(timeout=2)

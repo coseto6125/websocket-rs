@@ -19,7 +19,10 @@ use tokio_tungstenite::tungstenite::protocol::frame::Utf8Bytes;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream};
 
-use crate::{DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT, DEFAULT_TCP_NODELAY};
+use crate::{
+    is_reserved_websocket_header, DEFAULT_CONNECT_TIMEOUT, DEFAULT_RECEIVE_TIMEOUT,
+    DEFAULT_TCP_NODELAY,
+};
 
 type MessageReceiver = Arc<AsyncMutex<mpsc::Receiver<Result<Message, String>>>>;
 
@@ -693,6 +696,9 @@ impl AsyncClientConnection {
                     // Inject custom headers (already validated in new())
                     if let Some(ref headers) = headers_opt {
                         for (k, v) in headers {
+                            if is_reserved_websocket_header(k) {
+                                continue;
+                            }
                             if let (Ok(k_hdr), Ok(v_hdr)) =
                                 (HeaderName::from_str(k), HeaderValue::from_str(v))
                             {
@@ -946,12 +952,14 @@ impl AsyncClientConnection {
 }
 
 #[pyfunction]
-#[pyo3(signature = (uri, *, headers=None, proxy=None, **_kwargs))]
+#[pyo3(signature = (uri, *, headers=None, proxy=None, connect_timeout=None, receive_timeout=None, **_kwargs))]
 pub fn connect<'py>(
     py: Python<'py>,
     uri: String,
     headers: Option<HashMap<String, String>>,
     proxy: Option<String>,
+    connect_timeout: Option<f64>,
+    receive_timeout: Option<f64>,
     _kwargs: Option<&Bound<'py, PyAny>>,
 ) -> PyResult<Bound<'py, PyAny>> {
     // Emit a one-shot deprecation notice — the legacy tokio-backed async client
@@ -968,7 +976,8 @@ pub fn connect<'py>(
             cat,
         ),
     )?;
-    let ws = AsyncClientConnection::new(uri, headers, proxy, None, None, None)?;
+    let ws =
+        AsyncClientConnection::new(uri, headers, proxy, connect_timeout, receive_timeout, None)?;
     let ws_cell = Py::new(py, ws)?;
     AsyncClientConnection::__aenter__(ws_cell, py)
 }

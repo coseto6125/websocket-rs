@@ -98,11 +98,13 @@ async def connect(
     - ``ssl_context`` overrides the default ``ssl.create_default_context()``
       used for ``wss://``. TLS is driven by asyncio so the protocol sees
       decrypted bytes.
-    - ``connect_timeout`` wraps the full TCP+TLS+handshake sequence in
-      ``asyncio.wait_for``; raises ``TimeoutError`` on expiry.
-    - ``receive_timeout`` wraps every ``recv()`` / ``async for`` step in
-      ``asyncio.wait_for``; the backlog fast-path is not wrapped so
-      already-queued messages return immediately.
+    - ``connect_timeout`` defaults to 10 seconds when omitted or ``None`` and
+      wraps the full TCP+TLS+handshake sequence in ``asyncio.wait_for``;
+      raises ``TimeoutError`` on expiry.
+    - ``receive_timeout=None`` (the default) waits indefinitely. A numeric
+      value wraps every ``recv()`` / ``async for`` step in
+      ``asyncio.wait_for``; the backlog fast-path is not wrapped so already
+      queued messages return immediately.
     - ``proxy`` accepts ``socks5://[user:password@]host:port``. Handshake
       runs in ``loop.run_in_executor`` so the event loop stays responsive;
       once the tunnel is up all traffic goes through the native

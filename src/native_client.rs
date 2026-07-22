@@ -32,6 +32,8 @@ use std::cell::RefCell;
 use std::io::Read as _;
 use url::Url;
 
+use crate::{is_reserved_websocket_header, DEFAULT_CONNECT_TIMEOUT};
+
 const MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 // WebSocket opcodes per RFC 6455 §5.2.
@@ -559,17 +561,8 @@ fn build_handshake(
              client_no_context_takeover; server_no_context_takeover\r\n",
         );
     }
-    // Skip the handful of headers we already manage ourselves; case-insensitive match.
-    const RESERVED: &[&str] = &[
-        "host",
-        "upgrade",
-        "connection",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-    ];
     for (k, v) in headers {
-        if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+        if is_reserved_websocket_header(k) {
             continue;
         }
         req.push_str(k);
@@ -1753,10 +1746,10 @@ fn connect<'py>(
     // run_in_executor (see _connect_helper). Otherwise create_connection takes
     // host/port directly.
     let helper = get_connect_helper(py)?;
-    let timeout_obj = match connect_timeout {
-        Some(t) => t.into_pyobject(py)?.into_any(),
-        None => py.None().into_bound(py),
-    };
+    let timeout_obj = connect_timeout
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT)
+        .into_pyobject(py)?
+        .into_any();
     let proxy_obj = match proxy {
         Some(p) => p.into_pyobject(py)?.into_any().unbind(),
         None => py.None(),
@@ -1863,6 +1856,18 @@ import asyncio as _asyncio
 import socket as _socket
 
 
+def _recv_exact(sock, size, stage):
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError(f"SOCKS5 proxy closed during {stage}")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
 def _socks5_connect_blocking(proxy_host, proxy_port, user, password, target_host, target_port):
     """Blocking SOCKS5 CONNECT. Designed to run inside loop.run_in_executor so it
     never blocks the asyncio event loop. Returns a connected, non-blocking socket
@@ -1873,8 +1878,8 @@ def _socks5_connect_blocking(proxy_host, proxy_port, user, password, target_host
         s.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
         methods = b"\x00" if not user else b"\x00\x02"
         s.sendall(b"\x05" + bytes([len(methods)]) + methods)
-        reply = s.recv(2)
-        if len(reply) < 2 or reply[0] != 0x05:
+        reply = _recv_exact(s, 2, "greeting")
+        if reply[0] != 0x05:
             raise ConnectionError("SOCKS5 proxy rejected greeting")
         method = reply[1]
         if method == 0x02:
@@ -1882,28 +1887,28 @@ def _socks5_connect_blocking(proxy_host, proxy_port, user, password, target_host
                 raise ConnectionError("SOCKS5 proxy requires auth but none supplied")
             ub, pb = user.encode(), password.encode()
             s.sendall(b"\x01" + bytes([len(ub)]) + ub + bytes([len(pb)]) + pb)
-            ar = s.recv(2)
-            if len(ar) < 2 or ar[1] != 0x00:
+            ar = _recv_exact(s, 2, "authentication")
+            if ar[1] != 0x00:
                 raise ConnectionError("SOCKS5 auth failed")
         elif method != 0x00:
             raise ConnectionError(f"SOCKS5 proxy selected unsupported method {method}")
         host_b = target_host.encode("idna")
         req = b"\x05\x01\x00\x03" + bytes([len(host_b)]) + host_b + int(target_port).to_bytes(2, "big")
         s.sendall(req)
-        hdr = s.recv(4)
-        if len(hdr) < 4 or hdr[1] != 0x00:
-            raise ConnectionError(f"SOCKS5 CONNECT failed: status={hdr[1] if len(hdr) >= 2 else '?'}")
+        hdr = _recv_exact(s, 4, "CONNECT reply")
+        if hdr[1] != 0x00:
+            raise ConnectionError(f"SOCKS5 CONNECT failed: status={hdr[1]}")
         atyp = hdr[3]
         if atyp == 0x01:
-            s.recv(4)
+            _recv_exact(s, 4, "IPv4 bind address")
         elif atyp == 0x03:
-            nlen = s.recv(1)[0]
-            s.recv(nlen)
+            nlen = _recv_exact(s, 1, "domain bind length")[0]
+            _recv_exact(s, nlen, "domain bind address")
         elif atyp == 0x04:
-            s.recv(16)
+            _recv_exact(s, 16, "IPv6 bind address")
         else:
             raise ConnectionError(f"SOCKS5 returned unsupported ATYP {atyp}")
-        s.recv(2)
+        _recv_exact(s, 2, "bind port")
         s.setblocking(False)
         return s
     except Exception:

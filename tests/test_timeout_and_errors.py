@@ -8,6 +8,7 @@ Covers issues found in code review:
 """
 
 import asyncio
+import socket
 import sys
 import threading
 import time
@@ -27,6 +28,26 @@ async def start_echo_server(port=8766):
             await ws.send(msg)
 
     return await websockets.serve(echo, "localhost", port, ping_interval=None)
+
+
+def start_stalled_handshake_server(port):
+    ready = threading.Event()
+
+    def serve():
+        with socket.socket() as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", port))
+            server.listen(1)
+            ready.set()
+            conn, _ = server.accept()
+            with conn:
+                conn.recv(4096)
+                time.sleep(1)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    assert ready.wait(timeout=2)
+    return thread
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -155,6 +176,37 @@ async def test_async_connect_timeout():
     except (TimeoutError, ConnectionError):
         elapsed = time.perf_counter() - start
         print(f"✓ async connect_timeout works ({elapsed:.1f}s)")
+
+
+async def test_async_connect_function_connect_timeout_kwarg_expires_promptly():
+    thread = start_stalled_handshake_server(8767)
+    start = time.perf_counter()
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            websocket_rs.async_client.connect(
+                "ws://127.0.0.1:8767",
+                connect_timeout=0.05,
+            ),
+            timeout=0.8,
+        )
+
+    assert time.perf_counter() - start < 0.4
+    thread.join(timeout=2)
+
+
+async def test_async_connect_function_receive_timeout_kwarg_expires_promptly():
+    ws = await websocket_rs.async_client.connect(
+        "ws://localhost:8766",
+        receive_timeout=0.05,
+    )
+    start = time.perf_counter()
+    try:
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(ws.recv(), timeout=0.8)
+        assert time.perf_counter() - start < 0.4
+    finally:
+        await ws.close()
 
 
 async def main():
