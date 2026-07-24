@@ -15,7 +15,7 @@ Fastest Python WebSocket client on plain TCP — wins **12/12** benchmark cells 
 | Plain Python script / CLI tool (no asyncio) | **ws-rs sync** | picows is async-only; 1.3–7× over websocket-client (size-dependent) |
 | asyncio app, sequential RR ≤ 8 KB | **ws-rs sync** via `to_thread` | +13–28% over picows; sync bypasses asyncio overhead |
 | asyncio app, pipelined / streaming | **ws-rs async** | mean RPS +14–21% over picows on best path |
-| asyncio app, ≥ 1 MB payloads | **ws-rs async** ≈ **picows** | tied within 5%; server-side ceiling |
+| asyncio app, ≥ 1 MB payloads | **ws-rs async** | +15–20% over picows (RR, two servers, 7-round median; v0.7.3 zero-copy recv) |
 | RR latency-sensitive, payload ≥ 16 KB | **picows** | 3–5 µs lower per-message RTT (Cython cdef vs PyO3) |
 | Cross-network (real server, real RTT) | **Either** | network RT dominates; library choice < 1% of total latency |
 
@@ -34,9 +34,25 @@ Neutral Rust echo server (tokio-tungstenite), pinned cores, uvloop, 1 s discarde
 | 256 B | **15.0k** | 12.8k | 13.5k | 12.0k | 9.9k | 11.7k |
 | 8 KB  | **15.1k** | 13.4k | 13.2k | 11.8k | 9.6k | 10.1k |
 | 100 KB | **10.8k** | 10.3k | 10.5k | 9.4k | 8.1k | 4.5k |
-| 1 MB  | 4.0k | **4.2k** | **4.2k** | 3.4k | 3.0k | 509 |
+| 1 MB  | 4.0k | **4.2k** | 3.4k | 3.4k | 3.0k | 509 |
+
+> The legacy multi-client table above predates picows 2.1.1 and the v0.7.3 zero-copy path; the async-vs-picows section below supersedes its `ws-rs async` / `picows` columns. Its 1 MB `picows` cell is corrected here (was tied at 4.2k, now 3.4k on picows 2.1.1); the aiohttp / websockets / websocket-client columns are the older single-round figures pending a decision-grade re-measure.
 
 ws-rs wins or ties **12/12 cells** across three server architectures (tokio-tungstenite, fastwebsockets, picows-server).
+
+#### Apples-to-apples: async vs picows (v0.7.3, decision-grade)
+
+Both are `asyncio.Protocol` peers, so this is the fair head-to-head. Measured against **picows 2.1.1** (latest) on an AMD Ryzen 9 9950X / WSL2, single-connection plain-TCP RR loopback, one discarded warm-up round + **7 interleaved scored rounds**, pooled median. Cross-checked on two independent servers so the result isn't tied to one server implementation:
+
+| Payload | tokio-tungstenite server | picows-exact-echo server | verdict |
+|---------|---:|---:|---|
+| 256 B | 100.4% | ~parity | tie |
+| 8 KB | 102.5% | 102.4% | +2.4% |
+| 100 KB | 102.6% | 100.7% | ~parity–small win |
+| 1 MB | **120.0%** | **115.5%** | **+15–20%** |
+| **geomean** | **+6.1%** | **+5.2%** | ws-rs ahead |
+
+The 1 MB win is the direct payoff of the v0.7.3 zero-copy receive path. Scope: these numbers are specific to this machine and a request-response workload — they do **not** cover TLS, pipelining, multiple concurrent connections, or streaming throughput.
 
 ### Request-Response Throughput — TLS / wss:// (rustls)
 
