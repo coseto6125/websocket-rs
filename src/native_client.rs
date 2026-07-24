@@ -159,6 +159,13 @@ fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
     Some((fin, rsv1, opcode, plen, hdr))
 }
 
+/// Close-frame payload → (code, reason). Empty/short payloads carry neither.
+fn parse_close_payload(payload: &[u8]) -> (Option<u16>, Option<String>) {
+    let code = (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
+    let reason = (payload.len() > 2).then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+    (code, reason)
+}
+
 struct FastFrame<'a> {
     opcode: u8,
     payload: &'a [u8],
@@ -350,10 +357,7 @@ impl ProtocolCore<'_> {
                 OP_CLOSE => {
                     self.buf.advance(hdr);
                     let payload = self.buf.split_to(plen);
-                    let code =
-                        (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
-                    let reason = (payload.len() > 2)
-                        .then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+                    let (code, reason) = parse_close_payload(&payload);
                     return Ok(Some(ProtocolEvent::Close { code, reason }));
                 }
                 OP_PING => {
@@ -1026,10 +1030,13 @@ impl NativeClient {
     }
 
     fn connection_lost(&self, py: Python<'_>, _exc: Py<PyAny>) {
-        let mut state = self.state.borrow_mut();
-        state.closed = true;
-        Self::fail_all_pending(py, &mut state, "Connection lost");
-        state.transport = None;
+        let pending = {
+            let mut state = self.state.borrow_mut();
+            state.closed = true;
+            state.transport = None;
+            std::mem::take(&mut state.pending_recv)
+        };
+        Self::fail_pending(py, pending, "Connection lost");
     }
 
     // ---- User-facing API ----
@@ -1347,8 +1354,9 @@ impl NativeClient {
         state.create_future = None;
         state.wait_for = None;
         let write_queue = std::mem::take(&mut state.write_queue);
-        Self::fail_all_pending(py, &mut state, "Connection closed by client");
+        let pending = std::mem::take(&mut state.pending_recv);
         drop(state);
+        Self::fail_pending(py, pending, "Connection closed by client");
         // All mutex-guarded references are gone; drop pending writes and then
         // issue the close frame + transport.close() on the surviving transport ref.
         drop(write_queue);
@@ -1388,6 +1396,7 @@ impl NativeClient {
             self.data_received_inner(py, data)?;
             return Ok((data.len(), None));
         }
+        let mut close_effects = None;
         let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
             match frame.opcode {
                 OP_TEXT | OP_BINARY => {
@@ -1397,14 +1406,18 @@ impl NativeClient {
                     Self::deliver_message(py, &mut state, msg)?;
                 }
                 OP_CLOSE => {
+                    let (code, reason) = parse_close_payload(frame.payload);
                     let mut state = self.state.borrow_mut();
-                    Self::handle_close_frame(py, &mut state, frame.payload);
+                    close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
                     return Ok(VisitOutcome::Stop);
                 }
                 _ => {}
             }
             Ok(VisitOutcome::Continue)
         })?;
+        if let Some((pending, transport)) = close_effects {
+            Self::apply_peer_close(py, pending, transport);
+        }
         match outcome {
             ScanOutcome::Exhausted { consumed } | ScanOutcome::Stopped { consumed } => {
                 Ok((consumed, None))
@@ -1429,6 +1442,7 @@ impl NativeClient {
         };
         if can_fast_path {
             let mut state = self.state.borrow_mut();
+            let mut close_effects = None;
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
@@ -1447,7 +1461,8 @@ impl NativeClient {
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        Self::handle_close_frame(py, &mut state, frame.payload);
+                        let (code, reason) = parse_close_payload(frame.payload);
+                        close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
                         return Ok(VisitOutcome::Stop);
                     }
                     _ => {}
@@ -1455,7 +1470,13 @@ impl NativeClient {
                 Ok(VisitOutcome::Continue)
             })?;
             let consumed = match outcome {
-                ScanOutcome::Stopped { .. } => return Ok(()),
+                ScanOutcome::Stopped { .. } => {
+                    drop(state);
+                    if let Some((pending, transport)) = close_effects {
+                        Self::apply_peer_close(py, pending, transport);
+                    }
+                    return Ok(());
+                }
                 ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
                 ScanOutcome::Exhausted { consumed }
                 | ScanOutcome::Partial { consumed, .. }
@@ -1483,6 +1504,7 @@ impl NativeClient {
         };
         if can_fast_path {
             let mut state = self.state.borrow_mut();
+            let mut close_effects = None;
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
@@ -1491,7 +1513,8 @@ impl NativeClient {
                         Self::deliver_message(py, &mut state, msg)?;
                     }
                     OP_CLOSE => {
-                        Self::handle_close_frame(py, &mut state, frame.payload);
+                        let (code, reason) = parse_close_payload(frame.payload);
+                        close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
                         return Ok(VisitOutcome::Stop);
                     }
                     _ => {}
@@ -1499,7 +1522,13 @@ impl NativeClient {
                 Ok(VisitOutcome::Continue)
             })?;
             let consumed = match outcome {
-                ScanOutcome::Stopped { .. } => return Ok(()),
+                ScanOutcome::Stopped { .. } => {
+                    drop(state);
+                    if let Some((pending, transport)) = close_effects {
+                        Self::apply_peer_close(py, pending, transport);
+                    }
+                    return Ok(());
+                }
                 ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
                 ScanOutcome::Exhausted { consumed }
                 | ScanOutcome::Partial { consumed, .. }
@@ -1736,19 +1765,9 @@ impl NativeClient {
             ProtocolEvent::Close { code, reason } => {
                 let (pending, transport) = {
                     let mut state = self.state.borrow_mut();
-                    if code.is_some() {
-                        state.close_code = code;
-                        state.close_reason = reason;
-                    }
-                    state.closed = true;
-                    let pending = std::mem::take(&mut state.pending_recv);
-                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                    (pending, transport)
+                    Self::begin_peer_close(py, &mut state, code, reason)
                 };
-                Self::fail_pending(py, pending, "Connection closed by peer");
-                if let Some(transport) = transport {
-                    let _ = transport.bind(py).call_method0("close");
-                }
+                Self::apply_peer_close(py, pending, transport);
                 Ok(EventFlow::Stop)
             }
             ProtocolEvent::ProtocolError(reason) => {
@@ -1812,33 +1831,33 @@ impl NativeClient {
         Ok(())
     }
 
-    fn handle_close_frame(py: Python<'_>, state: &mut State, payload: &[u8]) {
-        if payload.len() >= 2 {
-            state.close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
-            state.close_reason =
-                (payload.len() > 2).then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+    /// Record a peer-initiated close in `state` and hand back the effects the
+    /// caller must apply AFTER releasing the State borrow — the same
+    /// reentrancy discipline as the slow-path event sink.
+    fn begin_peer_close(
+        py: Python<'_>,
+        state: &mut State,
+        code: Option<u16>,
+        reason: Option<String>,
+    ) -> (VecDeque<Py<PyAny>>, Option<Py<PyAny>>) {
+        if code.is_some() {
+            state.close_code = code;
+            state.close_reason = reason;
         }
         state.closed = true;
-        Self::fail_all_pending(py, state, "Connection closed by peer");
-        if let Some(t) = state.transport.as_ref() {
-            let tb = t.bind(py);
-            let _ = tb.call_method0("close");
-        }
+        let pending = std::mem::take(&mut state.pending_recv);
+        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+        (pending, transport)
     }
 
-    fn fail_all_pending(py: Python<'_>, state: &mut State, msg: &str) {
-        while let Some(fut) = state.pending_recv.pop_front() {
-            let fb = fut.bind(py);
-            if !fb
-                .call_method0("done")
-                .and_then(|d| d.extract::<bool>())
-                .unwrap_or(true)
-            {
-                let _ = fb.call_method1(
-                    "set_exception",
-                    (PyConnectionError::new_err(msg.to_string()),),
-                );
-            }
+    fn apply_peer_close(
+        py: Python<'_>,
+        pending: VecDeque<Py<PyAny>>,
+        transport: Option<Py<PyAny>>,
+    ) {
+        Self::fail_pending(py, pending, "Connection closed by peer");
+        if let Some(transport) = transport {
+            let _ = transport.bind(py).call_method0("close");
         }
     }
 }
