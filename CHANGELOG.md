@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] - 2026-07-24
+
+### Performance
+
+- **Sync receive without the intermediate copy (#29)**: tungstenite's owned `Bytes` payload now moves through the synchronous receive path instead of being copied into an intermediate `Vec<u8>`. Measured medians on an idle host: plain 1 MiB +9.1%, TLS 1 MiB +27.9%.
+
+- **Sync send borrows exact `bytes` (#30)**: exact CPython `bytes` payloads are sent through an owner-backed `Bytes` with no extraction copy; `bytearray`, `memoryview`, other buffer-protocol objects, and `bytes` subclasses keep the existing copy path. Pooled 7-round median: plain 1 MiB +7.2%.
+
+- **Interned Future-delivery identifiers (#31)**: `done` / `set_result` lookups in the hot async receive path use interned strings. Merged under the documented micro-optimization exception — the +2% performance gate was **not** met (~+1% on TLS 256 B, 7/7 positive rounds); this entry must not be cited as a perf-gate pass.
+
+### Fixed
+
+- **Interrupted socket I/O in the sync client (#34)**: blocking read/write/flush now follow PEP 475 — on `EINTR` the client checks pending Python signals first (so Ctrl-C still raises `KeyboardInterrupt`) and then retries, and an overall receive deadline is enforced across retries so `receive_timeout` is never extended by signal storms. Previously any signal delivered during a blocking `recv()` surfaced `RuntimeError: Interrupted system call`.
+
+### Internal
+
+- **Owner invariants compiler-enforced (#32)**: the sync-send `PyBytes` owner moved into a private module with a single constructor, making its safety invariants unconstructible-wrong; mutate-after-send tripwire tests added for mutable input types.
+
+- **Peer-close unified behind one seam (#33)**: close parsing and effects flow through `parse_close_payload` + `begin_peer_close` / `apply_peer_close` on every path (slow-path event sink, all three fast-path adapters, `connection_lost`, client `close()`). The remaining future-failure and transport calls made under an active `RefCell` borrow were eliminated — the same reentrancy discipline the 0.7.2 event sink introduced — and `handle_close_frame` / `fail_all_pending` were deleted outright.
+
 ## [0.7.2] - 2026-07-24
 
 ### Fixed

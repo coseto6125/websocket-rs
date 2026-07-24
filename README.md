@@ -55,12 +55,11 @@ Sync wins TLS 256 B–100 KB by 30–60%. At 1 MB picows leads by ~7%; ws-rs tie
 
 📊 **[Full benchmarks — all 3 servers, TCP & TLS, latency distributions, compression](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
-## ✨ What's New in v0.7.2
+## ✨ What's New in v0.7.3
 
-- **Timeout correctness**: async `connect()` now honors its `connect_timeout` / `receive_timeout` kwargs (previously dropped); native `connect_timeout=None` applies the 10 s default across all clients instead of hanging indefinitely. `receive_timeout=None` stays unlimited by design.
-- **Stability**: receiving a Ping on the buffered slow path under transport backpressure no longer panics — protocol decisions and transport effects are fully decoupled.
-- **SOCKS5**: proxy handshake replies split across TCP segments no longer fail the connection.
-- **Internals**: the buffered state machine is now a pure sans-I/O `ProtocolCore` with an allocation-free event sink, and the three fast-path frame walks share one monomorphized scanner — receive-path performance held or improved (several parity cells +3–11%).
+- **Faster sync client**: both directions of the synchronous client drop their per-message payload copy — large-message throughput up 7–28% (plain 1 MiB recv +9.1%, TLS 1 MiB recv +27.9%, plain 1 MiB send +7.2%; medians on an idle host).
+- **Signal-safe sync I/O**: blocking read/write now follow PEP 475 — signals during a blocking `recv()` no longer surface `Interrupted system call` errors, Ctrl-C still raises `KeyboardInterrupt`, and `receive_timeout` deadlines hold across retries.
+- **Internals**: peer-close handling unified behind one seam with all transport effects outside internal borrows; the sync-send buffer owner's safety invariants are now compiler-enforced.
 
 Full details in [CHANGELOG.md](CHANGELOG.md).
 
