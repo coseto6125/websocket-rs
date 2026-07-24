@@ -208,7 +208,10 @@ def test_sync_recv_eintr_retries_preserve_timeout_deadline():
     assert 0.1 < elapsed < 0.6
 
 
-@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="POSIX signals are unavailable")
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(signal, "SIGINT"),
+    reason="POSIX SIGINT is unavailable",
+)
 def test_sync_recv_eintr_propagates_keyboard_interrupt():
     previous_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
 
