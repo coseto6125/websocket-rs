@@ -7,6 +7,7 @@ import asyncio
 import sys
 import threading
 import time
+from array import array
 
 import pytest
 import websockets
@@ -19,6 +20,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 
 sync_connect = websocket_rs.sync.client.connect
 async_connect = websocket_rs.async_client.connect
+
+
+class BytesSubclass(bytes):
+    pass
 
 
 async def start_echo_server():
@@ -118,6 +123,54 @@ def test_sync_recv_binary_move_path_preserves_content():
 
     assert isinstance(received, bytes)
     assert received == payload
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(bytearray(b"bytearray payload"), id="bytearray"),
+        pytest.param(memoryview(b"memoryview payload"), id="memoryview"),
+        pytest.param(array("B", b"buffer object payload"), id="buffer-object"),
+        pytest.param(BytesSubclass(b"bytes subclass payload"), id="bytes-subclass"),
+    ],
+)
+def test_sync_send_non_exact_bytes_copy_path_round_trips(payload):
+    expected = bytes(payload)
+
+    with sync_connect("ws://localhost:8765") as ws:
+        ws.send(payload)
+        received = ws.recv()
+
+    assert received == expected
+
+
+def test_sync_send_exact_bytes_owner_survives_allocator_pressure():
+    stop = threading.Event()
+    churn_cycles = 0
+
+    def churn_allocator():
+        nonlocal churn_cycles
+        while not stop.is_set():
+            blocks = [bytes(bytearray(64 * 1024)) for _ in range(8)]
+            churn_cycles += 1
+            del blocks
+
+    churn_thread = threading.Thread(target=churn_allocator, daemon=True)
+    churn_thread.start()
+    try:
+        with sync_connect("ws://localhost:8765") as ws:
+            for marker in range(16):
+                expected = bytes([marker]) * (256 * 1024)
+                payload = bytes(bytearray(expected))
+                assert type(payload) is bytes
+                ws.send(payload)
+                del payload
+                assert ws.recv() == expected
+    finally:
+        stop.set()
+        churn_thread.join(timeout=2)
+
+    assert churn_cycles > 0
 
 
 async def test_python_async_api():

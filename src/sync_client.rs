@@ -56,6 +56,37 @@ enum RecvResult {
     Binary(Bytes),
 }
 
+struct SendPyBytesOwner {
+    _bytes: Py<PyBytes>,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: this owner is constructed only from an exact CPython `bytes`, whose
+// buffer is immutable and pointer-stable. `_bytes` is an owned reference cloned
+// while the GIL is held before `py.detach`; it keeps the allocation alive until
+// tungstenite drops the owner-backed `Bytes`. PyO3 permits `Py<PyBytes>` to cross
+// threads and defers its decref until the GIL can be acquired.
+unsafe impl Send for SendPyBytesOwner {}
+unsafe impl Sync for SendPyBytesOwner {}
+
+impl AsRef<[u8]> for SendPyBytesOwner {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: `ptr` and `len` describe the immutable buffer owned by
+        // `_bytes`, which remains alive for this owner's entire lifetime.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+fn borrow_exact_pybytes(bytes: &Bound<'_, PyBytes>) -> Bytes {
+    let data = bytes.as_bytes();
+    Bytes::from_owner(SendPyBytesOwner {
+        _bytes: bytes.clone().unbind(),
+        ptr: data.as_ptr(),
+        len: data.len(),
+    })
+}
+
 /// Type-erased stream for WebSocket (avoids generic type in pyclass)
 enum WsStream {
     Plain(TcpStream),
@@ -225,6 +256,8 @@ impl SyncClientConnection {
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
             Message::Text(s.to_str()?.into())
+        } else if let Ok(bytes) = message.cast_exact::<PyBytes>() {
+            Message::Binary(borrow_exact_pybytes(bytes))
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
             Message::Binary(bytes.into())
         } else {
