@@ -211,6 +211,181 @@ fn walk_frames<'a, E>(
     Ok(ScanOutcome::Exhausted { consumed: off })
 }
 
+struct ProtocolCore<'a> {
+    buf: &'a mut BytesMut,
+    handshake_done: &'a mut bool,
+    expected_accept: &'a str,
+    compression_enabled: bool,
+    fragment_buf: &'a mut Option<BytesMut>,
+    fragment_opcode: &'a mut u8,
+    fragment_rsv1: &'a mut bool,
+}
+
+enum HandshakeOutcome {
+    Complete,
+    Pending,
+    Accepted {
+        subprotocol: Option<String>,
+        compression_enabled: bool,
+    },
+    Rejected,
+}
+
+enum ProtocolEvent {
+    Message(Bytes),
+    SendPong(Bytes),
+    Close {
+        code: Option<u16>,
+        reason: Option<String>,
+    },
+    ProtocolError(&'static str),
+}
+
+enum EventFlow {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug)]
+struct ProtocolCoreError(String);
+
+#[derive(Debug)]
+enum EmitError<E> {
+    Core(ProtocolCoreError),
+    Sink(E),
+}
+
+impl ProtocolCore<'_> {
+    #[cold]
+    fn process_handshake(&mut self) -> HandshakeOutcome {
+        if *self.handshake_done {
+            return HandshakeOutcome::Complete;
+        }
+        let Some(end) = find_header_end(self.buf) else {
+            return HandshakeOutcome::Pending;
+        };
+        let headers = String::from_utf8_lossy(&self.buf[..end]).into_owned();
+        let mut matched = false;
+        let mut subprotocol = None;
+        let mut deflate_accepted = false;
+        for line in headers.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.starts_with("sec-websocket-accept:") && line.contains(self.expected_accept) {
+                matched = true;
+            } else if lower.starts_with("sec-websocket-protocol:") {
+                if let Some((_, rest)) = line.split_once(':') {
+                    subprotocol = Some(rest.trim().to_string());
+                }
+            } else if lower.starts_with("sec-websocket-extensions:")
+                && lower.contains("permessage-deflate")
+            {
+                deflate_accepted = true;
+            }
+        }
+        self.buf.advance(end);
+        if !matched {
+            return HandshakeOutcome::Rejected;
+        }
+        *self.handshake_done = true;
+        self.compression_enabled &= deflate_accepted;
+        HandshakeOutcome::Accepted {
+            subprotocol,
+            compression_enabled: self.compression_enabled,
+        }
+    }
+
+    #[cold]
+    fn next_event(&mut self) -> Result<Option<ProtocolEvent>, ProtocolCoreError> {
+        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(self.buf) {
+            if self.buf.len() < hdr + plen {
+                return Ok(None);
+            }
+            let total = hdr + plen;
+            match opcode {
+                OP_TEXT | OP_BINARY => {
+                    self.buf.advance(hdr);
+                    let payload = self.buf.split_to(plen).freeze();
+                    if self.fragment_buf.is_some() {
+                        return Ok(Some(ProtocolEvent::ProtocolError(
+                            "new data frame while fragmented message is in progress",
+                        )));
+                    }
+                    if fin {
+                        let payload = if rsv1 {
+                            Bytes::from(decompress_message(self.compression_enabled, &payload)?)
+                        } else {
+                            payload
+                        };
+                        return Ok(Some(ProtocolEvent::Message(payload)));
+                    }
+                    let mut fragment = BytesMut::with_capacity(plen);
+                    fragment.extend_from_slice(&payload);
+                    *self.fragment_buf = Some(fragment);
+                    *self.fragment_opcode = opcode;
+                    *self.fragment_rsv1 = rsv1;
+                }
+                OP_CONTINUATION => {
+                    self.buf.advance(hdr);
+                    let payload = self.buf.split_to(plen);
+                    let Some(fragment) = self.fragment_buf.as_mut() else {
+                        return Ok(Some(ProtocolEvent::ProtocolError(
+                            "continuation frame without fragmented message",
+                        )));
+                    };
+                    fragment.extend_from_slice(&payload);
+                    if fin {
+                        let fragment = self.fragment_buf.take().expect("fragment exists");
+                        let compressed = *self.fragment_rsv1;
+                        *self.fragment_opcode = 0;
+                        *self.fragment_rsv1 = false;
+                        let raw = fragment.freeze();
+                        let payload = if compressed {
+                            Bytes::from(decompress_message(self.compression_enabled, &raw)?)
+                        } else {
+                            raw
+                        };
+                        return Ok(Some(ProtocolEvent::Message(payload)));
+                    }
+                }
+                OP_CLOSE => {
+                    self.buf.advance(hdr);
+                    let payload = self.buf.split_to(plen);
+                    let code =
+                        (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
+                    let reason = (payload.len() > 2)
+                        .then(|| String::from_utf8_lossy(&payload[2..]).into_owned());
+                    return Ok(Some(ProtocolEvent::Close { code, reason }));
+                }
+                OP_PING => {
+                    self.buf.advance(hdr);
+                    return Ok(Some(ProtocolEvent::SendPong(
+                        self.buf.split_to(plen).freeze(),
+                    )));
+                }
+                OP_PONG => self.buf.advance(total),
+                _ => self.buf.advance(total),
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[cold]
+fn emit_protocol_events<E>(
+    mut next_event: impl FnMut() -> Result<Option<ProtocolEvent>, ProtocolCoreError>,
+    mut sink: impl FnMut(ProtocolEvent) -> Result<EventFlow, E>,
+) -> Result<(), EmitError<E>> {
+    loop {
+        let event = next_event().map_err(EmitError::Core)?;
+        let Some(event) = event else {
+            return Ok(());
+        };
+        if matches!(sink(event).map_err(EmitError::Sink)?, EventFlow::Stop) {
+            return Ok(());
+        }
+    }
+}
+
 struct State {
     transport: Option<Py<PyAny>>,
     buf: BytesMut,
@@ -295,6 +470,21 @@ struct State {
     fragment_rsv1: bool,
     /// permessage-deflate context, lazily initialised after negotiation.
     deflate: Option<DeflateCtx>,
+}
+
+impl State {
+    #[inline]
+    fn protocol_core(&mut self) -> ProtocolCore<'_> {
+        ProtocolCore {
+            buf: &mut self.buf,
+            handshake_done: &mut self.handshake_done,
+            expected_accept: &self.expected_accept,
+            compression_enabled: self.deflate.is_some(),
+            fragment_buf: &mut self.fragment_buf,
+            fragment_opcode: &mut self.fragment_opcode,
+            fragment_rsv1: &mut self.fragment_rsv1,
+        }
+    }
 }
 
 /// permessage-deflate per-connection state. We always negotiate
@@ -632,10 +822,13 @@ fn build_handshake(
 /// Uses a fresh Decompress per call — matches server_no_context_takeover and
 /// sidesteps a real miniz_oxide bug where `reset(false)` leaves residual
 /// internal state that corrupts subsequent decompression of large inputs.
-fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>> {
-    if state.deflate.is_none() {
-        return Err(PyRuntimeError::new_err(
-            "received compressed frame but permessage-deflate is not enabled",
+fn decompress_message(
+    compression_enabled: bool,
+    compressed: &[u8],
+) -> Result<Vec<u8>, ProtocolCoreError> {
+    if !compression_enabled {
+        return Err(ProtocolCoreError(
+            "received compressed frame but permessage-deflate is not enabled".to_string(),
         ));
     }
     let mut with_marker = Vec::with_capacity(compressed.len() + 4);
@@ -650,7 +843,7 @@ fn decompress_message(state: &mut State, compressed: &[u8]) -> PyResult<Vec<u8>>
     let mut out = Vec::with_capacity(compressed.len() * 4 + 128);
     decoder
         .read_to_end(&mut out)
-        .map_err(|e| PyRuntimeError::new_err(format!("deflate decode error: {e}")))?;
+        .map_err(|e| ProtocolCoreError(format!("deflate decode error: {e}")))?;
     Ok(out)
 }
 
@@ -1177,9 +1370,9 @@ impl NativeClient {
     /// Parse `data` (a window into `recv_buf`) in place. Returns the number
     /// of bytes consumed; the caller compacts the rest. The fast path
     /// (handshake done, no fragment in flight, no deflate state, no carry-
-    /// over `state.buf`) parses straight from `data` without copying. The
+    /// over `buf`) parses straight from `data` without copying. The
     /// slow path (handshake-in-progress / fragmented / compressed) routes
-    /// through `data_received_inner` which uses `state.buf` as its working
+    /// through `data_received_inner` which uses `buf` as its working
     /// area — in that case we report the full window as consumed.
     /// Returns `(consumed, next_frame_needed)`. `next_frame_needed` is
     /// `Some(N)` when parse stopped on a partial frame: `recv_pos` (after
@@ -1230,9 +1423,12 @@ impl NativeClient {
         pb: &Bound<'py, PyBytes>,
         data: &[u8],
     ) -> PyResult<()> {
-        let mut state = self.state.borrow_mut();
-
-        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
+        let can_fast_path = {
+            let state = self.state.borrow();
+            state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none()
+        };
+        if can_fast_path {
+            let mut state = self.state.borrow_mut();
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
@@ -1272,19 +1468,21 @@ impl NativeClient {
             }
             return Ok(());
         }
-        state.buf.extend_from_slice(data);
-        drop(state);
+        self.state.borrow_mut().buf.extend_from_slice(data);
         self.process_buffered_frames(py)
     }
 
     fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        let mut state = self.state.borrow_mut();
-
         // Fast path: if our internal buf is empty and the handshake is already done,
         // parse frames straight out of `data` and only copy the tail (if any) back into
         // buf. Servers that deliver one frame per write hit this path and save a
         // memcpy per callback.
-        if state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none() {
+        let can_fast_path = {
+            let state = self.state.borrow();
+            state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none()
+        };
+        if can_fast_path {
+            let mut state = self.state.borrow_mut();
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
@@ -1318,8 +1516,7 @@ impl NativeClient {
         // Slow path: handshake in progress or buf already holds partial frame
         // data (fragment / compression). process_buffered_frames has the full
         // handshake parse including subprotocol + extension negotiation.
-        state.buf.extend_from_slice(data);
-        drop(state);
+        self.state.borrow_mut().buf.extend_from_slice(data);
         self.process_buffered_frames(py)
     }
 
@@ -1423,7 +1620,7 @@ impl NativeClient {
             (st.recv_buf.as_ptr(), st.recv_pos)
         };
         // SAFETY: `recv_buf` is not realloc'd during parsing — only
-        // `state.buf` / `state.backlog` / `state.pending_callback_msgs` get
+        // `protocol.buf` / `state.backlog` / `state.pending_callback_msgs` get
         // mutated. Pointer stays valid for the slice's lifetime.
         let data = unsafe { std::slice::from_raw_parts(ptr, total) };
         let (consumed, needed) = self.parse_recv_data(py, data)?;
@@ -1439,162 +1636,157 @@ impl NativeClient {
         self.flush_pending_callbacks(py)
     }
 
-    /// Parse and dispatch all complete frames currently sitting in state.buf.
+    /// Parse and dispatch all complete frames currently sitting in State::buf.
     /// Also completes the HTTP/101 handshake on first invocation.
+    #[cold]
     fn process_buffered_frames(&self, py: Python<'_>) -> PyResult<()> {
-        let mut state = self.state.borrow_mut();
-
-        if !state.handshake_done {
-            let Some(end) = find_header_end(&state.buf) else {
+        let handshake = { self.state.borrow_mut().protocol_core().process_handshake() };
+        match handshake {
+            HandshakeOutcome::Pending => return Ok(()),
+            HandshakeOutcome::Rejected => {
+                let future = { self.state.borrow_mut().handshake_fut.take() };
+                if let Some(future) = future {
+                    let error = PyConnectionError::new_err("WebSocket handshake failed");
+                    let _ = future.bind(py).call_method1("set_exception", (error,));
+                }
                 return Ok(());
-            };
-            let headers_str = String::from_utf8_lossy(&state.buf[..end]).to_string();
-            let expected = state.expected_accept.clone();
-            let mut matched = false;
-            let mut subprotocol: Option<String> = None;
-            let mut deflate_accepted = false;
-            for line in headers_str.lines() {
-                let lower = line.to_ascii_lowercase();
-                if lower.starts_with("sec-websocket-accept:") && line.contains(&expected) {
-                    matched = true;
-                } else if lower.starts_with("sec-websocket-protocol:") {
-                    if let Some((_, rest)) = line.split_once(':') {
-                        subprotocol = Some(rest.trim().to_string());
+            }
+            HandshakeOutcome::Accepted {
+                subprotocol,
+                compression_enabled,
+            } => {
+                let future = {
+                    let mut state = self.state.borrow_mut();
+                    state.handshake_done = true;
+                    state.subprotocol = subprotocol;
+                    if !compression_enabled {
+                        state.deflate = None;
                     }
-                } else if lower.starts_with("sec-websocket-extensions:")
-                    && lower.contains("permessage-deflate")
-                {
-                    deflate_accepted = true;
+                    state.handshake_fut.take()
+                };
+                if let Some(future) = future {
+                    let future = future.bind(py);
+                    if !future
+                        .call_method0("done")?
+                        .extract::<bool>()
+                        .unwrap_or(false)
+                    {
+                        let _ = future.call_method1("set_result", (py.None(),));
+                    }
                 }
             }
-            state.buf.advance(end);
-            state.subprotocol = subprotocol;
-            // Server didn't echo permessage-deflate → disable our compressor.
-            if !deflate_accepted {
-                state.deflate = None;
-            }
-            if !matched {
-                if let Some(fut) = state.handshake_fut.take() {
-                    let fut_b = fut.bind(py);
-                    let exc = PyConnectionError::new_err("WebSocket handshake failed");
-                    let _ = fut_b.call_method1("set_exception", (exc,));
-                }
-                return Ok(());
-            }
-            state.handshake_done = true;
-            if let Some(fut) = state.handshake_fut.take() {
-                let fut_b = fut.bind(py);
-                if !fut_b
-                    .call_method0("done")?
-                    .extract::<bool>()
-                    .unwrap_or(false)
-                {
-                    let _ = fut_b.call_method1("set_result", (py.None(),));
-                }
-            }
+            HandshakeOutcome::Complete => {}
         }
 
-        while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&state.buf) {
-            if state.buf.len() < hdr + plen {
-                break;
-            }
-            let total = hdr + plen;
-            match opcode {
-                OP_TEXT | OP_BINARY => {
-                    // Data frame (text / binary). FIN=1 and no pending fragment =
-                    // complete message. Otherwise start accumulating.
-                    state.buf.advance(hdr);
-                    let payload = state.buf.split_to(plen).freeze();
-                    let is_compressed = rsv1;
-                    if state.fragment_buf.is_some() {
-                        Self::close_protocol_error(
-                            py,
-                            &mut state,
-                            "new data frame while fragmented message is in progress",
-                        )?;
-                        break;
-                    }
-                    if fin {
-                        let final_payload = if is_compressed {
-                            Bytes::from(decompress_message(&mut state, &payload)?)
-                        } else {
-                            payload
-                        };
-                        let msg = Py::new(
-                            py,
-                            WSMessage {
-                                data: final_payload,
-                            },
-                        )?;
-                        Self::deliver_message(py, &mut state, msg)?;
+        match emit_protocol_events(
+            || self.state.borrow_mut().protocol_core().next_event(),
+            |event| self.handle_protocol_event(py, event),
+        ) {
+            Ok(()) => Ok(()),
+            Err(EmitError::Core(error)) => Err(PyRuntimeError::new_err(error.0)),
+            Err(EmitError::Sink(error)) => Err(error),
+        }
+    }
+
+    #[cold]
+    fn handle_protocol_event(&self, py: Python<'_>, event: ProtocolEvent) -> PyResult<EventFlow> {
+        match event {
+            ProtocolEvent::Message(payload) => {
+                let message = Py::new(py, WSMessage { data: payload })?;
+                let pending = {
+                    let mut state = self.state.borrow_mut();
+                    if state.on_message.is_some() {
+                        state.pending_callback_msgs.push_back(message);
+                        None
+                    } else if let Some(future) = state.pending_recv.pop_front() {
+                        Some((future, message))
                     } else {
-                        // Fragmented message: remember whether RSV1 was on the
-                        // first frame; continuation frames don't carry it.
-                        let mut acc = BytesMut::with_capacity(plen);
-                        acc.extend_from_slice(&payload);
-                        state.fragment_buf = Some(acc);
-                        state.fragment_opcode = opcode;
-                        state.fragment_rsv1 = is_compressed;
+                        state.backlog.push_back(message);
+                        None
+                    }
+                };
+                if let Some((future, message)) = pending {
+                    let future = future.bind(py);
+                    if !future
+                        .call_method0("done")?
+                        .extract::<bool>()
+                        .unwrap_or(false)
+                    {
+                        future.call_method1("set_result", (message,))?;
                     }
                 }
-                OP_CONTINUATION => {
-                    // Continuation frame — append to fragment_buf; deliver on FIN.
-                    state.buf.advance(hdr);
-                    let payload = state.buf.split_to(plen);
-                    let Some(acc) = state.fragment_buf.as_mut() else {
-                        Self::close_protocol_error(
-                            py,
-                            &mut state,
-                            "continuation frame without fragmented message",
-                        )?;
-                        break;
-                    };
-                    acc.extend_from_slice(&payload);
-                    if fin {
-                        if let Some(acc) = state.fragment_buf.take() {
-                            let compressed_flag = state.fragment_rsv1;
-                            state.fragment_opcode = 0;
-                            state.fragment_rsv1 = false;
-                            let raw = acc.freeze();
-                            let out = if compressed_flag {
-                                Bytes::from(decompress_message(&mut state, &raw)?)
-                            } else {
-                                raw
-                            };
-                            let msg = Py::new(py, WSMessage { data: out })?;
-                            Self::deliver_message(py, &mut state, msg)?;
-                        }
-                    }
-                }
-                OP_CLOSE => {
-                    // Close: body is [u16 code | reason (utf-8)] per RFC 6455 §5.5.1.
-                    state.buf.advance(hdr);
-                    let payload = state.buf.split_to(plen);
-                    Self::handle_close_frame(py, &mut state, &payload);
-                    break;
-                }
-                OP_PING => {
-                    // Ping: echo payload back as a Pong frame (RFC 6455 §5.5.2).
-                    state.buf.advance(hdr);
-                    let payload = state.buf.split_to(plen).freeze();
+                Ok(EventFlow::Continue)
+            }
+            ProtocolEvent::SendPong(payload) => {
+                let write = {
+                    let mut state = self.state.borrow_mut();
                     let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                    if let Some(t) = transport {
+                    transport.map(|transport| {
                         let frame = encode_control_frame(&mut state, OP_PONG, &payload);
-                        let _ = t
-                            .bind(py)
-                            .call_method1("write", (PyBytes::new(py, &frame),));
+                        (transport, frame)
+                    })
+                };
+                if let Some((transport, frame)) = write {
+                    let _ = transport
+                        .bind(py)
+                        .call_method1("write", (PyBytes::new(py, &frame),));
+                }
+                Ok(EventFlow::Continue)
+            }
+            ProtocolEvent::Close { code, reason } => {
+                let (pending, transport) = {
+                    let mut state = self.state.borrow_mut();
+                    if code.is_some() {
+                        state.close_code = code;
+                        state.close_reason = reason;
                     }
+                    state.closed = true;
+                    let pending = std::mem::take(&mut state.pending_recv);
+                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                    (pending, transport)
+                };
+                Self::fail_pending(py, pending, "Connection closed by peer");
+                if let Some(transport) = transport {
+                    let _ = transport.bind(py).call_method0("close");
                 }
-                OP_PONG => {
-                    // Pong — silently consumed; could dispatch to a ping-waiter in future.
-                    state.buf.advance(total);
+                Ok(EventFlow::Stop)
+            }
+            ProtocolEvent::ProtocolError(reason) => {
+                let (pending, transport, frame) = {
+                    let mut state = self.state.borrow_mut();
+                    state.close_code = Some(1002);
+                    state.close_reason = Some(reason.to_string());
+                    state.closed = true;
+                    let pending = std::mem::take(&mut state.pending_recv);
+                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                    let frame = encode_control_frame(&mut state, OP_CLOSE, &1002u16.to_be_bytes());
+                    (pending, transport, frame)
+                };
+                Self::fail_pending(py, pending, reason);
+                if let Some(transport) = transport {
+                    let transport = transport.bind(py);
+                    let _ = transport.call_method1("write", (PyBytes::new(py, &frame),));
+                    let _ = transport.call_method0("close");
                 }
-                _ => {
-                    state.buf.advance(total);
-                }
+                Ok(EventFlow::Stop)
             }
         }
-        Ok(())
+    }
+
+    fn fail_pending(py: Python<'_>, mut pending: VecDeque<Py<PyAny>>, msg: &str) {
+        while let Some(future) = pending.pop_front() {
+            let future = future.bind(py);
+            if !future
+                .call_method0("done")
+                .and_then(|done| done.extract::<bool>())
+                .unwrap_or(true)
+            {
+                let _ = future.call_method1(
+                    "set_exception",
+                    (PyConnectionError::new_err(msg.to_string()),),
+                );
+            }
+        }
     }
 
     fn deliver_message(py: Python<'_>, state: &mut State, msg: Py<WSMessage>) -> PyResult<()> {
@@ -1628,20 +1820,6 @@ impl NativeClient {
             let tb = t.bind(py);
             let _ = tb.call_method0("close");
         }
-    }
-
-    fn close_protocol_error(py: Python<'_>, state: &mut State, msg: &str) -> PyResult<()> {
-        state.close_code = Some(1002);
-        state.close_reason = Some(msg.to_string());
-        state.closed = true;
-        Self::fail_all_pending(py, state, msg);
-        let frame = encode_control_frame(state, OP_CLOSE, &1002u16.to_be_bytes());
-        if let Some(t) = state.transport.as_ref() {
-            let tb = t.bind(py);
-            let _ = tb.call_method1("write", (PyBytes::new(py, &frame),));
-            let _ = tb.call_method0("close");
-        }
-        Ok(())
     }
 
     fn fail_all_pending(py: Python<'_>, state: &mut State, msg: &str) {
@@ -1683,19 +1861,20 @@ fn connect<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let (scheme, host, port, path) = parse_ws_uri(&uri)?;
     let is_tls = scheme == "wss";
+    let headers = headers.unwrap_or_default();
+    let subprotocols = subprotocols.unwrap_or_default();
+    let (req_bytes, expected_accept) =
+        build_handshake(&host, port, &path, &headers, &subprotocols, compression);
     let client = NativeClient {
         #[allow(clippy::arc_with_non_send_sync)]
         state: Arc::new(RefCell::new(State {
             transport: None,
-            // Buffers start empty — first send / recv / fragment triggers
-            // growth via the existing `reserve()` paths. Saves ~130 KB/conn
-            // for connections that stay idle (notification listeners,
-            // long-poll style fan-out). Cost: one-time alloc + page faults
-            // on the first message (~5 μs); not visible past warmup.
+            // Buffers start empty — first receive or fragment triggers growth.
+            // This avoids reserving receive memory for idle connections.
             buf: BytesMut::new(),
             handshake_done: false,
             handshake_fut: None,
-            expected_accept: String::new(),
+            expected_accept,
             pending_recv: VecDeque::new(),
             backlog: VecDeque::new(),
             on_message,
@@ -1731,19 +1910,6 @@ fn connect<'py>(
     } else {
         Py::new(py, (NativeClientBuffered, client))?.into_any()
     };
-
-    // Build handshake bytes + expected accept
-    let headers_vec = headers.unwrap_or_default();
-    let subprotocols_vec = subprotocols.unwrap_or_default();
-    let (req_bytes, expected) = build_handshake(
-        &host,
-        port,
-        &path,
-        &headers_vec,
-        &subprotocols_vec,
-        compression,
-    );
-    state_arc.borrow_mut().expected_accept = expected;
 
     // Create the handshake future. Cache `loop.create_future` and
     // `asyncio.wait_for` bound methods so the recv/anext hot paths don't
@@ -1837,104 +2003,6 @@ fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
         path.push_str(query);
     }
     Ok((scheme, host, port, path))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        parse_header, parse_ws_uri, walk_frames, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING,
-    };
-
-    #[test]
-    fn test_parse_header_masked_server_frame_keeps_unmasked_header_size() {
-        let frame = [0x82, 0x81, 1, 2, 3, 4, b'x'];
-
-        assert_eq!(parse_header(&frame), Some((true, false, 0x2, 1, 2)));
-    }
-
-    #[test]
-    fn test_parse_header_rsv2_rsv3_and_reserved_opcode_returns_header() {
-        let frame = [0xB3, 0x00];
-
-        assert_eq!(parse_header(&frame), Some((true, false, 0x3, 0, 2)));
-    }
-
-    #[test]
-    fn test_parse_header_fragmented_extended_ping_returns_header() {
-        let frame = [OP_PING, 126, 0, 126];
-
-        assert_eq!(parse_header(&frame), Some((false, false, OP_PING, 126, 4)));
-    }
-
-    #[test]
-    fn test_parse_header_incomplete_extended_lengths_returns_none() {
-        assert_eq!(parse_header(&[0x82, 126, 0]), None);
-        assert_eq!(parse_header(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0]), None);
-    }
-
-    #[test]
-    fn test_walk_frames_complete_frames_visits_payloads() {
-        let data = [0x82, 0x01, b'a', 0x82, 0x02, b'b', b'c'];
-        let mut payloads = Vec::new();
-
-        let outcome = walk_frames(&data, |frame| {
-            assert_eq!(frame.opcode, OP_BINARY);
-            payloads.push(frame.payload);
-            Ok::<_, ()>(VisitOutcome::Continue)
-        })
-        .unwrap();
-
-        assert_eq!(payloads, [b"a".as_slice(), b"bc".as_slice()]);
-        assert_eq!(outcome, ScanOutcome::Exhausted { consumed: 7 });
-    }
-
-    #[test]
-    fn test_walk_frames_partial_payload_reports_post_compaction_threshold() {
-        let data = [0x82, 0x01, b'a', 0x82, 0x03, b'b'];
-
-        let outcome = walk_frames(&data, |_| Ok::<_, ()>(VisitOutcome::Continue)).unwrap();
-
-        assert_eq!(
-            outcome,
-            ScanOutcome::Partial {
-                consumed: 3,
-                needed: 5,
-            }
-        );
-    }
-
-    #[test]
-    fn test_walk_frames_fragmented_frame_falls_back_without_visiting() {
-        let data = [0x02, 0x01, b'a'];
-        let mut visited = false;
-
-        let outcome = walk_frames(&data, |_| {
-            visited = true;
-            Ok::<_, ()>(VisitOutcome::Continue)
-        })
-        .unwrap();
-
-        assert!(!visited);
-        assert_eq!(outcome, ScanOutcome::Fallback { consumed: 0 });
-    }
-
-    #[test]
-    fn test_parse_ws_uri_ipv6_with_port_and_query() {
-        let (scheme, host, port, path) = parse_ws_uri("ws://[::1]:8860/ws?token=a").unwrap();
-        assert_eq!(scheme, "ws");
-        assert_eq!(host, "::1");
-        assert_eq!(port, 8860);
-        assert_eq!(path, "/ws?token=a");
-    }
-
-    #[test]
-    fn test_parse_ws_uri_uses_default_ports() {
-        let (scheme, host, port, path) = parse_ws_uri("wss://example.com/feed").unwrap();
-        assert_eq!(scheme, "wss");
-        assert_eq!(host, "example.com");
-        assert_eq!(port, 443);
-        assert_eq!(path, "/feed");
-    }
 }
 
 /// Cached Python helper that orchestrates create_connection -> send handshake -> await accept -> return client.
@@ -2078,4 +2146,227 @@ pub fn register_native_client(py: Python<'_>, parent: &Bound<'_, PyModule>) -> P
     let sys_modules = py.import("sys")?.getattr("modules")?;
     sys_modules.set_item("websocket_rs.native_client", &m)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use bytes::BytesMut;
+
+    use super::{
+        emit_protocol_events, parse_header, parse_ws_uri, walk_frames, EventFlow, HandshakeOutcome,
+        ProtocolCore, ProtocolEvent, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING,
+    };
+
+    struct CoreState {
+        buf: BytesMut,
+        handshake_done: bool,
+        expected_accept: String,
+        compression_enabled: bool,
+        fragment_buf: Option<BytesMut>,
+        fragment_opcode: u8,
+        fragment_rsv1: bool,
+    }
+
+    impl CoreState {
+        fn core(&mut self) -> ProtocolCore<'_> {
+            ProtocolCore {
+                buf: &mut self.buf,
+                handshake_done: &mut self.handshake_done,
+                expected_accept: &self.expected_accept,
+                compression_enabled: self.compression_enabled,
+                fragment_buf: &mut self.fragment_buf,
+                fragment_opcode: &mut self.fragment_opcode,
+                fragment_rsv1: &mut self.fragment_rsv1,
+            }
+        }
+    }
+
+    fn frame_core(data: &[u8]) -> RefCell<CoreState> {
+        RefCell::new(CoreState {
+            buf: BytesMut::from(data),
+            handshake_done: true,
+            expected_accept: String::new(),
+            compression_enabled: false,
+            fragment_buf: None,
+            fragment_opcode: 0,
+            fragment_rsv1: false,
+        })
+    }
+
+    #[test]
+    fn test_parse_header_masked_server_frame_keeps_unmasked_header_size() {
+        let frame = [0x82, 0x81, 1, 2, 3, 4, b'x'];
+
+        assert_eq!(parse_header(&frame), Some((true, false, 0x2, 1, 2)));
+    }
+
+    #[test]
+    fn test_parse_header_rsv2_rsv3_and_reserved_opcode_returns_header() {
+        let frame = [0xB3, 0x00];
+
+        assert_eq!(parse_header(&frame), Some((true, false, 0x3, 0, 2)));
+    }
+
+    #[test]
+    fn test_parse_header_fragmented_extended_ping_returns_header() {
+        let frame = [OP_PING, 126, 0, 126];
+
+        assert_eq!(parse_header(&frame), Some((false, false, OP_PING, 126, 4)));
+    }
+
+    #[test]
+    fn test_parse_header_incomplete_extended_lengths_returns_none() {
+        assert_eq!(parse_header(&[0x82, 126, 0]), None);
+        assert_eq!(parse_header(&[0x82, 127, 0, 0, 0, 0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn test_walk_frames_complete_frames_visits_payloads() {
+        let data = [0x82, 0x01, b'a', 0x82, 0x02, b'b', b'c'];
+        let mut payloads = Vec::new();
+
+        let outcome = walk_frames(&data, |frame| {
+            assert_eq!(frame.opcode, OP_BINARY);
+            payloads.push(frame.payload);
+            Ok::<_, ()>(VisitOutcome::Continue)
+        })
+        .unwrap();
+
+        assert_eq!(payloads, [b"a".as_slice(), b"bc".as_slice()]);
+        assert_eq!(outcome, ScanOutcome::Exhausted { consumed: 7 });
+    }
+
+    #[test]
+    fn test_walk_frames_partial_payload_reports_post_compaction_threshold() {
+        let data = [0x82, 0x01, b'a', 0x82, 0x03, b'b'];
+
+        let outcome = walk_frames(&data, |_| Ok::<_, ()>(VisitOutcome::Continue)).unwrap();
+
+        assert_eq!(
+            outcome,
+            ScanOutcome::Partial {
+                consumed: 3,
+                needed: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn test_walk_frames_fragmented_frame_falls_back_without_visiting() {
+        let data = [0x02, 0x01, b'a'];
+        let mut visited = false;
+
+        let outcome = walk_frames(&data, |_| {
+            visited = true;
+            Ok::<_, ()>(VisitOutcome::Continue)
+        })
+        .unwrap();
+
+        assert!(!visited);
+        assert_eq!(outcome, ScanOutcome::Fallback { consumed: 0 });
+    }
+
+    #[test]
+    fn test_protocol_handshake_accepts_subprotocol_and_compression() {
+        let mut state = CoreState {
+            buf: BytesMut::from(
+                &b"HTTP/1.1 101 Switching Protocols\r\n\
+                   Sec-WebSocket-Accept: expected\r\n\
+                   Sec-WebSocket-Protocol: chat\r\n\
+                   Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n"[..],
+            ),
+            handshake_done: false,
+            expected_accept: "expected".to_string(),
+            compression_enabled: true,
+            fragment_buf: None,
+            fragment_opcode: 0,
+            fragment_rsv1: false,
+        };
+
+        let outcome = state.core().process_handshake();
+
+        assert!(matches!(
+            outcome,
+            HandshakeOutcome::Accepted {
+                subprotocol: Some(ref protocol),
+                compression_enabled: true,
+            } if protocol == "chat"
+        ));
+        assert!(state.handshake_done);
+        assert!(state.buf.is_empty());
+    }
+
+    #[test]
+    fn test_emit_protocol_events_fragment_ping_message_order_and_releases_borrow() {
+        let core = frame_core(
+            b"\x02\x05hello\
+              \x89\x04ping\
+              \x80\x05world",
+        );
+        let mut index = 0;
+
+        emit_protocol_events(
+            || core.borrow_mut().core().next_event(),
+            |event| {
+                assert!(core.try_borrow_mut().is_ok());
+                match (index, event) {
+                    (0, ProtocolEvent::SendPong(payload)) => assert_eq!(payload, b"ping"[..]),
+                    (1, ProtocolEvent::Message(payload)) => assert_eq!(payload, b"helloworld"[..]),
+                    _ => panic!("unexpected protocol event"),
+                }
+                index += 1;
+                Ok::<_, ()>(EventFlow::Continue)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(index, 2);
+    }
+
+    #[test]
+    fn test_protocol_core_continuation_without_fragment_emits_protocol_error() {
+        let core = frame_core(b"\x80\x01x");
+
+        let event = core.borrow_mut().core().next_event().unwrap().unwrap();
+
+        assert!(matches!(
+            event,
+            ProtocolEvent::ProtocolError("continuation frame without fragmented message")
+        ));
+    }
+
+    #[test]
+    fn test_protocol_core_close_emits_code_and_reason() {
+        let core = frame_core(b"\x88\x05\x03\xe9bye");
+
+        let event = core.borrow_mut().core().next_event().unwrap().unwrap();
+
+        assert!(matches!(
+            event,
+            ProtocolEvent::Close {
+                code: Some(1001),
+                reason: Some(ref reason),
+            } if reason == "bye"
+        ));
+    }
+
+    #[test]
+    fn test_parse_ws_uri_ipv6_with_port_and_query() {
+        let (scheme, host, port, path) = parse_ws_uri("ws://[::1]:8860/ws?token=a").unwrap();
+        assert_eq!(scheme, "ws");
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8860);
+        assert_eq!(path, "/ws?token=a");
+    }
+
+    #[test]
+    fn test_parse_ws_uri_uses_default_ports() {
+        let (scheme, host, port, path) = parse_ws_uri("wss://example.com/feed").unwrap();
+        assert_eq!(scheme, "wss");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/feed");
+    }
 }

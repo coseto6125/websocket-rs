@@ -555,10 +555,6 @@ def _exercise_ping_pause_writing_reentry():
     thread.join(timeout=2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="PR5/C1b: slow-path Pong writes hold State across pause_writing reentry",
-)
 def test_receive_slow_path_ping_reentrant_pause_writing_does_not_panic():
     result = subprocess.run(
         [
