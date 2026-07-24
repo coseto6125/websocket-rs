@@ -2,9 +2,9 @@ use bytes::Bytes;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
 use tungstenite::WebSocket;
@@ -91,42 +91,175 @@ mod send_pybytes_owner {
     }
 }
 
+/// Keeps EINTR handling below rustls, whose internal I/O loop otherwise retries
+/// interrupted socket reads without giving Python a chance to raise a signal.
+struct SignalAwareTcpStream {
+    stream: TcpStream,
+    read_deadline: Option<Instant>,
+    enforce_read_deadline: bool,
+}
+
+impl SignalAwareTcpStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            read_deadline: None,
+            enforce_read_deadline: false,
+        }
+    }
+
+    fn apply_remaining_read_timeout(&self) -> io::Result<()> {
+        let remaining = self
+            .read_deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "read deadline elapsed"))?;
+        self.stream.set_read_timeout(Some(remaining))
+    }
+}
+
+impl Read for SignalAwareTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.enforce_read_deadline {
+                self.apply_remaining_read_timeout()?;
+            }
+            match self.stream.read(buf) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    check_python_signals()?;
+                    self.enforce_read_deadline = true;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for SignalAwareTcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        retry_interrupted(|| self.stream.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry_interrupted(|| self.stream.flush())
+    }
+}
+
+type TlsStream = rustls::StreamOwned<rustls::ClientConnection, SignalAwareTcpStream>;
+
 /// Type-erased stream for WebSocket (avoids generic type in pyclass)
 enum WsStream {
-    Plain(TcpStream),
-    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    Plain(SignalAwareTcpStream),
+    Tls(Box<TlsStream>),
 }
 
 impl Read for WsStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            WsStream::Plain(s) => s.read(buf),
-            WsStream::Tls(s) => s.read(buf),
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
         }
     }
 }
 
 impl Write for WsStream {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            WsStream::Plain(s) => s.write(buf),
-            WsStream::Tls(s) => s.write(buf),
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
         }
     }
-    fn flush(&mut self) -> std::io::Result<()> {
+
+    fn flush(&mut self) -> io::Result<()> {
         match self {
-            WsStream::Plain(s) => s.flush(),
-            WsStream::Tls(s) => s.flush(),
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
         }
     }
 }
 
 impl WsStream {
+    fn plain(stream: TcpStream) -> Self {
+        Self::Plain(SignalAwareTcpStream::new(stream))
+    }
+
+    fn tls(connection: rustls::ClientConnection, stream: TcpStream) -> Self {
+        Self::Tls(Box::new(TlsStream::new(
+            connection,
+            SignalAwareTcpStream::new(stream),
+        )))
+    }
+
+    fn begin_read_deadline(&mut self, timeout: Duration) {
+        let socket = self.socket_mut();
+        socket.read_deadline = Some(Instant::now() + timeout);
+        socket.enforce_read_deadline = false;
+    }
+
+    fn clear_read_deadline(&mut self, timeout: Duration) {
+        let socket = self.socket_mut();
+        if socket.enforce_read_deadline {
+            let _ = socket.stream.set_read_timeout(Some(timeout));
+        }
+        socket.read_deadline = None;
+        socket.enforce_read_deadline = false;
+    }
+
     fn tcp_ref(&self) -> &TcpStream {
         match self {
-            WsStream::Plain(s) => s,
-            WsStream::Tls(s) => s.get_ref(),
+            Self::Plain(s) => &s.stream,
+            Self::Tls(s) => &s.get_ref().stream,
         }
+    }
+
+    fn socket_mut(&mut self) -> &mut SignalAwareTcpStream {
+        match self {
+            Self::Plain(s) => s,
+            Self::Tls(s) => s.get_mut(),
+        }
+    }
+}
+
+fn check_python_signals() -> io::Result<()> {
+    // PEP 475 retries EINTR only after giving Python a chance to raise a
+    // pending signal exception such as KeyboardInterrupt.
+    Python::attach(|py| py.check_signals()).map_err(io::Error::from)
+}
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => check_python_signals()?,
+            result => return result,
+        }
+    }
+}
+
+fn is_python_error(error: &io::Error) -> bool {
+    // PyO3 preserves a PyErr wrapped in io::Error, allowing the API boundary
+    // to recover the original Python exception instead of replacing its type.
+    error.get_ref().is_some_and(|inner| inner.is::<PyErr>())
+}
+
+fn map_websocket_error(context: &str, error: tungstenite::Error) -> PyErr {
+    match error {
+        tungstenite::Error::Io(error) if is_python_error(&error) => error.into(),
+        error => PyRuntimeError::new_err(format!("{context} failed: {error}")),
+    }
+}
+
+fn map_receive_error(error: tungstenite::Error, receive_timeout: f64) -> PyErr {
+    match error {
+        tungstenite::Error::Io(error) if is_python_error(&error) => error.into(),
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            PyTimeoutError::new_err(format!("Receive timed out ({receive_timeout} seconds)"))
+        }
+        error => PyRuntimeError::new_err(format!("Receive failed: {error}")),
     }
 }
 
@@ -228,14 +361,18 @@ impl SyncClientConnection {
                     })?;
                 let conn = rustls::ClientConnection::new(config, server_name)
                     .map_err(|e| PyConnectionError::new_err(format!("TLS init failed: {}", e)))?;
-                let tls = rustls::StreamOwned::new(conn, tcp);
-                WsStream::Tls(Box::new(tls))
+                WsStream::tls(conn, tcp)
             } else {
-                WsStream::Plain(tcp)
+                WsStream::plain(tcp)
             };
 
-            let (ws, _) = tungstenite::client(request, ws_stream).map_err(|e| {
-                PyConnectionError::new_err(format!("WebSocket handshake failed: {}", e))
+            let (ws, _) = tungstenite::client(request, ws_stream).map_err(|error| match error {
+                tungstenite::HandshakeError::Failure(tungstenite::Error::Io(error))
+                    if is_python_error(&error) =>
+                {
+                    error.into()
+                }
+                error => PyConnectionError::new_err(format!("WebSocket handshake failed: {error}")),
             })?;
 
             // Reset timeouts: read = receive_timeout, write = unlimited
@@ -275,47 +412,49 @@ impl SyncClientConnection {
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
             ws.send(msg)
-                .map_err(|e| PyRuntimeError::new_err(format!("Send failed: {}", e)))
+                .map_err(|error| map_websocket_error("Send", error))
         })
     }
 
     fn recv(&mut self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let receive_timeout = self.receive_timeout;
         let result = py.detach(|| {
             let ws = self
                 .ws
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
 
-            loop {
-                let msg = ws.read().map_err(|e| match &e {
-                    tungstenite::Error::Io(io_err)
-                        if matches!(
-                            io_err.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        PyTimeoutError::new_err(format!(
-                            "Receive timed out ({} seconds)",
-                            self.receive_timeout
-                        ))
-                    }
-                    _ => PyRuntimeError::new_err(format!("Receive failed: {}", e)),
-                })?;
+            ws.get_mut()
+                .begin_read_deadline(Duration::from_secs_f64(receive_timeout));
+            let mut close_details = None;
+            let result = loop {
+                let msg = match ws.read() {
+                    Ok(msg) => msg,
+                    Err(error) => break Err(map_receive_error(error, receive_timeout)),
+                };
 
                 match msg {
-                    Message::Text(text) => return Ok(RecvResult::Text(text.to_string())),
-                    Message::Binary(data) => return Ok(RecvResult::Binary(data)),
+                    Message::Text(text) => break Ok(RecvResult::Text(text.to_string())),
+                    Message::Binary(data) => break Ok(RecvResult::Binary(data)),
                     Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(frame) => {
                         if let Some(f) = frame {
-                            self.close_code = Some(f.code.into());
-                            self.close_reason = Some(f.reason.to_string());
+                            close_details = Some((f.code.into(), f.reason.to_string()));
                         }
-                        return Err(PyRuntimeError::new_err("Connection closed by server"));
+                        break Err(PyRuntimeError::new_err("Connection closed by server"));
                     }
-                    _ => return Err(PyRuntimeError::new_err("Received unsupported message type")),
+                    _ => {
+                        break Err(PyRuntimeError::new_err("Received unsupported message type"));
+                    }
                 }
+            };
+            ws.get_mut()
+                .clear_read_deadline(Duration::from_secs_f64(receive_timeout));
+            if let Some((code, reason)) = close_details {
+                self.close_code = Some(code);
+                self.close_reason = Some(reason);
             }
+            result
         })?;
 
         match result {
@@ -329,18 +468,30 @@ impl SyncClientConnection {
         py.detach(|| {
             if let Some(mut ws) = self.ws.take() {
                 // Set a timeout for the close handshake
-                let tcp_ref = ws.get_ref().tcp_ref();
-                let _ = tcp_ref.set_read_timeout(Some(Duration::from_secs_f64(close_timeout)));
-                if let Err(e) = ws.close(None) {
-                    // Read remaining frames until close confirmation or timeout
-                    if !matches!(e, tungstenite::Error::ConnectionClosed) {
+                let close_duration = Duration::from_secs_f64(close_timeout);
+                let _ = ws
+                    .get_ref()
+                    .tcp_ref()
+                    .set_read_timeout(Some(close_duration));
+                ws.get_mut().begin_read_deadline(close_duration);
+                match ws.close(None) {
+                    Err(tungstenite::Error::Io(error)) if is_python_error(&error) => {
+                        return Err(error.into());
+                    }
+                    Err(error) if !matches!(error, tungstenite::Error::ConnectionClosed) => {
+                        // Read remaining frames until close confirmation or timeout
                         loop {
                             match ws.read() {
-                                Ok(Message::Close(_)) | Err(_) => break,
+                                Ok(Message::Close(_)) => break,
+                                Err(tungstenite::Error::Io(error)) if is_python_error(&error) => {
+                                    return Err(error.into());
+                                }
+                                Err(_) => break,
                                 _ => continue,
                             }
                         }
                     }
+                    _ => {}
                 }
             }
             Ok(())
@@ -355,7 +506,7 @@ impl SyncClientConnection {
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
             ws.send(Message::Ping(data.into()))
-                .map_err(|e| PyRuntimeError::new_err(format!("Ping failed: {}", e)))
+                .map_err(|error| map_websocket_error("Ping", error))
         })
     }
 
@@ -367,7 +518,7 @@ impl SyncClientConnection {
                 .as_mut()
                 .ok_or_else(|| PyRuntimeError::new_err("WebSocket is not connected"))?;
             ws.send(Message::Pong(data.into()))
-                .map_err(|e| PyRuntimeError::new_err(format!("Pong failed: {}", e)))
+                .map_err(|error| map_websocket_error("Pong", error))
         })
     }
 

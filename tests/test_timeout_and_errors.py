@@ -8,6 +8,8 @@ Covers issues found in code review:
 """
 
 import asyncio
+import os
+import signal
 import socket
 import sys
 import threading
@@ -25,6 +27,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 async def start_echo_server(port=8766):
     async def echo(ws):
         async for msg in ws:
+            if msg == b"delayed EINTR reply":
+                await asyncio.sleep(0.25)
+            elif msg == b"delayed EINTR timeout":
+                await asyncio.sleep(1)
             await ws.send(msg)
 
     return await websockets.serve(echo, "localhost", port, ping_interval=None)
@@ -137,6 +143,93 @@ def test_sync_recv_timeout():
             print(f"✓ sync recv timeout works ({elapsed:.1f}s)")
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is unavailable")
+def test_sync_recv_retries_eintr_after_python_signal():
+    previous_handler = signal.signal(signal.SIGUSR1, lambda *_: None)
+    stop = threading.Event()
+    signals_sent = 0
+
+    def send_signals():
+        nonlocal signals_sent
+        while not stop.wait(0.01):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            signals_sent += 1
+
+    try:
+        with websocket_rs.sync.client.ClientConnection(
+            "ws://localhost:8766", receive_timeout=1.0
+        ) as ws:
+            ws.send(b"delayed EINTR reply")
+            signal_thread = threading.Thread(target=send_signals, daemon=True)
+            signal_thread.start()
+            try:
+                received = ws.recv()
+            finally:
+                stop.set()
+                signal_thread.join(timeout=1)
+    finally:
+        signal.signal(signal.SIGUSR1, previous_handler)
+
+    assert signals_sent > 0
+    assert received == b"delayed EINTR reply"
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is unavailable")
+def test_sync_recv_eintr_retries_preserve_timeout_deadline():
+    previous_handler = signal.signal(signal.SIGUSR1, lambda *_: None)
+    stop = threading.Event()
+    signals_sent = 0
+
+    def send_signals():
+        nonlocal signals_sent
+        while not stop.wait(0.01):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            signals_sent += 1
+
+    try:
+        with websocket_rs.sync.client.ClientConnection(
+            "ws://localhost:8766", receive_timeout=0.2
+        ) as ws:
+            ws.send(b"delayed EINTR timeout")
+            signal_thread = threading.Thread(target=send_signals, daemon=True)
+            signal_thread.start()
+            started = time.perf_counter()
+            try:
+                with pytest.raises(TimeoutError):
+                    ws.recv()
+            finally:
+                elapsed = time.perf_counter() - started
+                stop.set()
+                signal_thread.join(timeout=1)
+    finally:
+        signal.signal(signal.SIGUSR1, previous_handler)
+
+    assert signals_sent > 0
+    assert 0.1 < elapsed < 0.6
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="POSIX signals are unavailable")
+def test_sync_recv_eintr_propagates_keyboard_interrupt():
+    previous_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def interrupt_recv():
+        time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    try:
+        with websocket_rs.sync.client.ClientConnection(
+            "ws://localhost:8766", receive_timeout=1.0
+        ) as ws:
+            ws.send(b"delayed EINTR reply")
+            signal_thread = threading.Thread(target=interrupt_recv, daemon=True)
+            signal_thread.start()
+            with pytest.raises(KeyboardInterrupt):
+                ws.recv()
+            signal_thread.join(timeout=1)
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+
+
 async def test_async_send_after_close():
     """Async: sending after close should raise RuntimeError."""
     ws = await websocket_rs.async_client.connect("ws://localhost:8766")
@@ -209,27 +302,5 @@ async def test_async_connect_function_receive_timeout_kwarg_expires_promptly():
         await ws.close()
 
 
-async def main():
-    server = await start_echo_server(8766)
-
-    try:
-        print("=== Timeout & Error Tests ===\n")
-
-        # Sync tests
-        test_sync_connect_timeout()
-        test_sync_connect_forwards_params()
-        await asyncio.to_thread(test_sync_send_after_close)
-        await asyncio.to_thread(test_sync_recv_timeout)
-
-        # Async tests
-        await test_async_send_after_close()
-        await test_async_recv_timeout()
-        await test_async_connect_timeout()
-
-        print("\n✅ All timeout & error tests passed!")
-    finally:
-        server.close()
-
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(pytest.main([__file__]))
