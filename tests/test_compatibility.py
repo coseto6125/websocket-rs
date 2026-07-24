@@ -126,19 +126,25 @@ def test_sync_recv_binary_move_path_preserves_content():
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "mutate_after_send"),
     [
-        pytest.param(bytearray(b"bytearray payload"), id="bytearray"),
-        pytest.param(memoryview(b"memoryview payload"), id="memoryview"),
-        pytest.param(array("B", b"buffer object payload"), id="buffer-object"),
-        pytest.param(BytesSubclass(b"bytes subclass payload"), id="bytes-subclass"),
+        pytest.param(bytearray(b"bytearray payload"), True, id="bytearray"),
+        pytest.param(memoryview(b"memoryview payload"), False, id="memoryview"),
+        pytest.param(array("B", b"buffer object payload"), True, id="buffer-object"),
+        pytest.param(BytesSubclass(b"bytes subclass payload"), False, id="bytes-subclass"),
     ],
 )
-def test_sync_send_non_exact_bytes_copy_path_round_trips(payload):
+def test_sync_send_non_exact_bytes_copy_path_round_trips(payload, mutate_after_send):
     expected = bytes(payload)
 
     with sync_connect("ws://localhost:8765") as ws:
         ws.send(payload)
+        if mutate_after_send:
+            # Tripwire for future deferred-write or borrow-path expansion, not
+            # a probe of the current synchronous send behavior.
+            for index in range(len(payload)):
+                payload[index] ^= 0xFF
+            assert bytes(payload) != expected
         received = ws.recv()
 
     assert received == expected
