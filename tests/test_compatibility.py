@@ -109,6 +109,17 @@ def test_rust_sync_api():
     print("\n所有同步 API 測試通過！\n")
 
 
+def test_sync_recv_binary_move_path_preserves_content():
+    payload = bytes(range(256)) * 4096
+
+    with sync_connect("ws://localhost:8765") as ws:
+        ws.send(payload)
+        received = ws.recv()
+
+    assert isinstance(received, bytes)
+    assert received == payload
+
+
 async def test_python_async_api():
     """測試 Python 原生 async API"""
     print("測試 Python websockets 異步 API...")

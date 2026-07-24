@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyTimeoutError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -52,7 +53,7 @@ pub(crate) fn build_rustls_client_config() -> PyResult<std::sync::Arc<rustls::Cl
 
 enum RecvResult {
     Text(String),
-    Binary(Vec<u8>),
+    Binary(Bytes),
 }
 
 /// Type-erased stream for WebSocket (avoids generic type in pyclass)
@@ -266,7 +267,7 @@ impl SyncClientConnection {
 
                 match msg {
                     Message::Text(text) => return Ok(RecvResult::Text(text.to_string())),
-                    Message::Binary(data) => return Ok(RecvResult::Binary(data.to_vec())),
+                    Message::Binary(data) => return Ok(RecvResult::Binary(data)),
                     Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(frame) => {
                         if let Some(f) = frame {
@@ -282,7 +283,7 @@ impl SyncClientConnection {
 
         match result {
             RecvResult::Text(s) => Ok(PyString::new(py, &s).into_any().unbind()),
-            RecvResult::Binary(b) => Ok(PyBytes::new(py, &b).into_any().unbind()),
+            RecvResult::Binary(b) => Ok(PyBytes::new(py, b.as_ref()).into_any().unbind()),
         }
     }
 
