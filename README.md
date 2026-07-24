@@ -55,13 +55,12 @@ Sync wins TLS 256 B–100 KB by 30–60%. At 1 MB picows leads by ~7%; ws-rs tie
 
 📊 **[Full benchmarks — all 3 servers, TCP & TLS, latency distributions, compression](docs/BENCHMARKS.md)** | 📝 **[Optimization Research](docs/OPTIMIZATION_RESEARCH.md)**
 
-## ✨ What's New in v0.7.0
+## ✨ What's New in v0.7.2
 
-- **TLS backend: `native-tls` → `rustls`** (pure-Rust, no OpenSSL). Eliminates the OpenSSL global-state conflict that crashed picows when loaded in the same process. Cross-platform wheel builds simplified.
-- **`asyncio.BufferedProtocol` + ring-buffer recv**: 64 KB pipelined +15% mean vs picows.
-- **Lazy buffer allocation**: per-connection memory 130 KB → 8.9 KB (−93%).
-- **`on_message` callback API** for users who want to bypass the per-frame Future overhead.
-- **Scheme-dispatched protocol class**: `ws://` uses BufferedProtocol; `wss://` uses plain Protocol (asyncio's SSLProtocol interacts poorly with BufferedProtocol's small TLS-record callbacks).
+- **Timeout correctness**: async `connect()` now honors its `connect_timeout` / `receive_timeout` kwargs (previously dropped); native `connect_timeout=None` applies the 10 s default across all clients instead of hanging indefinitely. `receive_timeout=None` stays unlimited by design.
+- **Stability**: receiving a Ping on the buffered slow path under transport backpressure no longer panics — protocol decisions and transport effects are fully decoupled.
+- **SOCKS5**: proxy handshake replies split across TCP segments no longer fail the connection.
+- **Internals**: the buffered state machine is now a pure sans-I/O `ProtocolCore` with an allocation-free event sink, and the three fast-path frame walks share one monomorphized scanner — receive-path performance held or improved (several parity cells +3–11%).
 
 Full details in [CHANGELOG.md](CHANGELOG.md).
 

@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] - 2026-07-24
+
+### Fixed
+
+- **Async client `connect()` timeout kwargs (#24)**: `connect_timeout` / `receive_timeout` passed to the pure-Python async client's `connect()` were silently dropped; they are now honored.
+
+- **Async client reserved-header filtering (#24)**: user-supplied extra headers that collide with reserved WebSocket handshake headers are now filtered by the async client, matching the native client's behavior.
+
+- **Native SOCKS5 proxy short reads (#24)**: proxy handshake replies are now read with an exact-length loop, fixing connection failures when the reply arrived split across TCP segments.
+
+- **Slow-path Ping panic under backpressure (#27)**: receiving a Ping on the buffered slow path while the transport applies write backpressure (`pause_writing` reentry) no longer panics. Protocol decisions and transport effects are now decoupled — all writes and future completions run after internal state borrows are released, with a regression test pinning the invariant.
+
+### Changed
+
+- **Native `connect_timeout` default (#24)**: `connect_timeout=None` now applies the 10-second default (aligned across all three clients) instead of allowing an indefinite connect hang. `receive_timeout=None` remains unlimited by design — idle connections that legitimately wait minutes between messages are unaffected.
+
+### Removed
+
+- **Leaked internal methods (#25)**: `parse_recv_data`, `data_received_inner`, `data_received_inner_pybytes`, `flush_pending_callbacks`, and `build_merged_frame` are no longer exposed as Python methods on the native client. They were undocumented implementation details.
+
+### Internal
+
+- **Receive-path characterization suite (#23)**: slow/fast-path protocol behavior — including known quirks — is pinned as regression tests before any restructuring.
+
+- **Unified frame scanner (#26)**: the three native fast-path frame walks now share one monomorphized visitor (`walk_frames`); each adapter keeps its payload-ownership strategy. Benchmarks held or improved (all 16 parity cells ≥ baseline, several +3–11%).
+
+- **`ProtocolCore` extraction (#27)**: the buffered handshake/frame state machine is now a pure bytes-in/events-out core emitting through a one-event-at-a-time sink (no event `Vec`, no `Box`, no `dyn`). Protocol edge cases are unit-testable without a live socket. Performance gates held (per-cell ≥98.77%, family geomeans ≥99.7%).
+
 ## [0.7.1] - 2026-05-14
 
 ### Fixed
