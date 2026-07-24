@@ -1799,8 +1799,12 @@ impl NativeClient {
         }
         if let Some(fut) = state.pending_recv.pop_front() {
             let fb = fut.bind(py);
-            if !fb.call_method0("done")?.extract::<bool>().unwrap_or(false) {
-                fb.call_method1("set_result", (msg,))?;
+            if !fb
+                .call_method0(pyo3::intern!(py, "done"))?
+                .extract::<bool>()
+                .unwrap_or(false)
+            {
+                fb.call_method1(pyo3::intern!(py, "set_result"), (msg,))?;
             }
         } else {
             state.backlog.push_back(msg);
