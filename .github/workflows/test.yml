@@ -55,7 +55,10 @@ jobs:
           uv venv --python ${{ matrix.python-version }}
 
       - name: Install dependencies with uv
-        run: uv pip install maturin pytest websockets
+        # uvloop has no Windows wheels; without it the uvloop half of the
+        # peer-close matrix silently drops, and uvloop+wss is a combination
+        # that actually regressed once.
+        run: uv pip install maturin pytest websockets "uvloop; sys_platform != 'win32'"
 
       - name: Build
         run: uv run maturin develop --release

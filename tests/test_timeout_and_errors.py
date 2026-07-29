@@ -9,8 +9,10 @@ Covers issues found in code review:
 
 import asyncio
 import os
+import shutil
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -320,50 +322,53 @@ def _ws_accept_key(request: bytes) -> str:
     return base64.b64encode(sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
 
 
-def _tls_cert():
-    """Self-signed test cert. tests/certs/ is gitignored and CI never runs
-    `make tls-certs`, so generate it on demand with the same openssl call."""
-    import pathlib
-    import subprocess
-
-    certs = pathlib.Path(__file__).parent / "certs"
+@pytest.fixture(scope="session")
+def tls_cert(tmp_path_factory):
+    """Self-signed cert in a temp dir. tests/certs/ is gitignored and CI never runs
+    `make tls-certs`; writing into the source tree would also race across workers."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not available")
+    certs = tmp_path_factory.mktemp("certs")
     cert, key = certs / "cert.pem", certs / "key.pem"
-    if not (cert.exists() and key.exists()):
-        certs.mkdir(exist_ok=True)
-        subprocess.run(
-            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-days", "3650", "-nodes",
-             "-keyout", str(key), "-out", str(cert), "-subj", "/CN=127.0.0.1",
-             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
-             "-addext", "basicConstraints=critical,CA:FALSE",
-             "-addext", "extendedKeyUsage=serverAuth"],
-            check=True, capture_output=True,
-        )
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-days", "3650", "-nodes",
+         "-keyout", str(key), "-out", str(cert), "-subj", "/CN=127.0.0.1",
+         "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+         "-addext", "basicConstraints=critical,CA:FALSE",
+         "-addext", "extendedKeyUsage=serverAuth"],
+        check=True, capture_output=True,
+    )
     return cert, key
 
 
-def _start_closing_ws_server(port, *, tls):
-    """Complete the handshake, send one frame, then close from the server side.
+def _start_closing_ws_server(certs):
+    """Handshake, send one frame, then close from the server side.
 
-    TLS closes with unwrap() so a close_notify actually goes out: a bare close()
-    would just drop the socket, and only close_notify reaches eof_received.
+    Returns (thread, port, errors). Port 0 lets the OS pick a free one, so
+    parallel runs and stray local services cannot collide. TLS closes via
+    unwrap() so a close_notify actually goes out — a bare close() just drops the
+    socket, and only close_notify reaches eof_received.
     """
     import ssl
 
-    ready = threading.Event()
+    errors = []
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    port = srv.getsockname()[1]
+    srv.listen(1)
 
     def serve():
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", port))
-        srv.listen(1)
-        ready.set()
-        conn, _ = srv.accept()
-        if tls:
-            cert, key = _tls_cert()
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(cert, key)
-            conn = ctx.wrap_socket(conn, server_side=True)
+        conn = None
         try:
+            srv.settimeout(5)
+            conn, _ = srv.accept()
+            conn.settimeout(5)  # never block the thread forever on a stuck peer
+            if certs is not None:
+                cert, key = certs
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cert, key)
+                conn = ctx.wrap_socket(conn, server_side=True)
             request = b""
             while b"\r\n\r\n" not in request:
                 request += conn.recv(4096)
@@ -379,50 +384,54 @@ def _start_closing_ws_server(port, *, tls):
                 + bytes([0x81, 3])
                 + b"bye"
             )
+        except Exception as error:  # surfaced by the test, never swallowed
+            errors.append(error)
         finally:
-            if tls:
-                try:
-                    conn = conn.unwrap()
-                except OSError:
-                    pass
-            conn.close()
+            if conn is not None:
+                if certs is not None:
+                    try:
+                        conn = conn.unwrap()
+                    except OSError:
+                        pass
+                conn.close()
             srv.close()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    assert ready.wait(timeout=2)
-    return thread
+    return thread, port, errors
 
 
 def _event_loops():
-    """uvloop when it is installed (it is not on Windows, and CI does not add it)."""
-    loops = ["asyncio"]
+    """uvloop where it is installed; it has no Windows wheels."""
     try:
         import uvloop  # noqa: F401
     except ImportError:
-        return loops
-    return [*loops, "uvloop"]
+        return ["asyncio"]
+    return ["asyncio", "uvloop"]
 
 
 @pytest.mark.parametrize("loop_name", _event_loops())
 @pytest.mark.parametrize("tls", [False, True], ids=["ws", "wss"])
-def test_peer_close_does_not_raise_in_transport_callback(loop_name, tls):
+def test_peer_close_does_not_raise_in_transport_callback(loop_name, tls, request):
     """The peer closes first, so the transport calls eof_received() on our protocol.
 
     NativeClient is a pyclass and inherits nothing from asyncio.Protocol, so the
-    base class's default is not available and the method has to exist on our side.
+    base class default is not available and the method has to exist on our side.
     Every call site invokes it unguarded except uvloop's plain-TCP _on_eof, so a
-    missing method raised an AttributeError inside asyncio's own callback — under
-    TLS that lands in _fatal_error and reads as a connection failure.
+    missing method raised inside asyncio's own callback — under TLS that lands in
+    _fatal_error and reads as a connection failure.
 
-    Tests where the client closes first never reach this path.
+    The second recv() is what makes this a real check rather than a sleep: it must
+    fail promptly because the EOF closed the transport and connection_lost failed
+    the pending future. Asserting no exception at all reached the loop (not just
+    AttributeError) keeps any other broken callback from passing silently.
     """
     import ssl
 
     import websocket_rs
 
-    port = 8790 + 2 * int(tls) + int(loop_name == "uvloop")
-    thread = _start_closing_ws_server(port, tls=tls)
+    certs = request.getfixturevalue("tls_cert") if tls else None
+    thread, port, server_errors = _start_closing_ws_server(certs)
     caught = []
 
     ssl_ctx = None
@@ -434,25 +443,34 @@ def test_peer_close_does_not_raise_in_transport_callback(loop_name, tls):
     async def run():
         asyncio.get_running_loop().set_exception_handler(lambda _loop, ctx: caught.append(ctx))
         scheme = "wss" if tls else "ws"
-        ws = await websocket_rs.connect(f"{scheme}://127.0.0.1:{port}", ssl_context=ssl_ctx, receive_timeout=2)
+        ws = await websocket_rs.connect(f"{scheme}://127.0.0.1:{port}", ssl_context=ssl_ctx, receive_timeout=5)
         assert bytes(await ws.recv()) == b"bye"
-        await asyncio.sleep(0.3)  # let the peer's FIN / close_notify arrive
-        ws.close()
+        started = time.perf_counter()
+        with pytest.raises((OSError, RuntimeError, ConnectionError, EOFError)):
+            # connection_lost must fail it immediately; a TimeoutError here would
+            # mean the pending receive hung until the timeout instead.
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        assert time.perf_counter() - started < 1
+        try:
+            ws.close()
+        except Exception:
+            pass
 
     if loop_name == "uvloop":
         import uvloop
 
         uvloop.run(run())
     else:
-        loop = asyncio.SelectorEventLoop()
+        loop = asyncio.SelectorEventLoop()  # CPython's own, not an installed uvloop
         try:
             loop.run_until_complete(run())
         finally:
             loop.close()
 
-    thread.join(timeout=2)
-    missing = [c for c in caught if isinstance(c.get("exception"), AttributeError)]
-    assert missing == [], f"transport callback raised: {missing}"
+    thread.join(timeout=5)
+    assert not thread.is_alive(), "server thread did not finish"
+    assert server_errors == [], f"server failed: {server_errors}"
+    assert caught == [], f"transport callback failed: {caught}"
 
 
 if __name__ == "__main__":

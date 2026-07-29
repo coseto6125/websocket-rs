@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Affects every combination except plain TCP under uvloop, whose `_on_eof` is the only call site that guards with `try/except AttributeError`. Both TLS stacks (CPython `sslproto._call_eof_received`, uvloop `sslproto.pyx` `_call_eof_received`) call it directly, so `wss://` was affected under both event loops. Client-closes-first tests never reach this path, which is why it went unnoticed.
 
-  `NativeClientBuffered` inherits the fix. The regression test lives in `tests/test_timeout_and_errors.py` (one of the two files CI actually runs) and covers the loop × transport matrix, skipping the uvloop half where uvloop is unavailable; the TLS cases generate their own self-signed cert, since `tests/certs/` is gitignored and CI does not run `make tls-certs`.
+  `NativeClientBuffered` inherits the fix. The regression test lives in `tests/test_timeout_and_errors.py` (one of the two files CI actually runs) and covers the loop × transport matrix; CI now installs uvloop everywhere it has wheels, so `uvloop + wss` is exercised there too. After the peer closes, a second `recv()` must fail immediately rather than hang to the timeout, which is what proves `connection_lost` still fails pending receives. The TLS cases mint a self-signed cert into a pytest temp dir.
 
 ## [0.7.3] - 2026-07-24
 
