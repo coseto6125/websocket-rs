@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`__version__` reported 0.7.1 (#TBD)**: the Python package hard-coded a version literal that was never bumped, so `websocket_rs.__version__` read `0.7.1` through the 0.7.2 and 0.7.3 releases while the installed distribution said otherwise. It now derives from the compiled module's `CARGO_PKG_VERSION`, leaving `Cargo.toml` as the single place a version is written by hand (`pyproject.toml` still mirrors it for the build backend).
+
 - **`eof_received` on the native protocol (#TBD)**: `NativeClient` implements asyncio's protocol callbacks by hand — it is a pyclass and inherits nothing from `asyncio.Protocol`, so the base class's default was never available — and `eof_received` was missing. When the peer half-closes, the transport calls it unguarded and the resulting `AttributeError` was raised inside asyncio's own callback: CPython routes it into `_fatal_error` ("Fatal error: protocol.eof_received() call failed."), so it surfaced as a connection error rather than a warning.
 
   Affects every combination except plain TCP under uvloop, whose `_on_eof` is the only call site that guards with `try/except AttributeError`. Both TLS stacks (CPython `sslproto._call_eof_received`, uvloop `sslproto.pyx` `_call_eof_received`) call it directly, so `wss://` was affected under both event loops. Client-closes-first tests never reach this path, which is why it went unnoticed.

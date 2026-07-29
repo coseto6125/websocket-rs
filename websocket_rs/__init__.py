@@ -42,7 +42,10 @@ connect = native_client.connect
 # Canonical message type (zero-copy buffer-protocol view).
 WSMessage = native_client.WSMessage
 
-__version__ = "0.7.1"
+# Derived from Cargo.toml via CARGO_PKG_VERSION (src/lib.rs), so it cannot fall
+# behind the way a hand-written literal did — this read "0.7.1" through both
+# the 0.7.2 and 0.7.3 releases.
+__version__ = _websocket_rs.__version__
 
 __all__ = [
     "connect",
