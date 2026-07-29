@@ -17,6 +17,7 @@ import signal
 import struct
 import subprocess
 import time
+from collections import Counter
 
 import uvloop
 
@@ -294,9 +295,6 @@ async def main():
             print(f"\npayload={size}B ×100 msgs:")
             for label, _, port in servers:
                 r = await probe_pipelined("127.0.0.1", port, size, 100)
-                unique_sizes = sorted(set(r["chunk_sizes"]))
-                from collections import Counter
-
                 dist = Counter(r["chunk_sizes"]).most_common(4)
                 print(f"  {label:18} {r['n_chunks']:3d} chunks  total={r['total_ms']:.3f}ms  size_distribution={dist}")
     finally:
