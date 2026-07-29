@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Affects every combination except plain TCP under uvloop, whose `_on_eof` is the only call site that guards with `try/except AttributeError`. Both TLS stacks (CPython `sslproto._call_eof_received`, uvloop `sslproto.pyx` `_call_eof_received`) call it directly, so `wss://` was affected under both event loops. Client-closes-first tests never reach this path, which is why it went unnoticed.
 
-  `NativeClientBuffered` inherits the fix. Regression test covers the loop × transport matrix (`uvloop`/`asyncio` × `ws`/`wss`); the TLS cases generate their own self-signed cert when `tests/certs/` is absent, since it is gitignored and CI does not run `make tls-certs`.
+  `NativeClientBuffered` inherits the fix. The regression test lives in `tests/test_timeout_and_errors.py` (one of the two files CI actually runs) and covers the loop × transport matrix, skipping the uvloop half where uvloop is unavailable; the TLS cases generate their own self-signed cert, since `tests/certs/` is gitignored and CI does not run `make tls-certs`.
 
 ## [0.7.3] - 2026-07-24
 
