@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] - 2026-07-29
+
+### Fixed
+
+- **`eof_received` on the native protocol (#TBD)**: `NativeClient` implements asyncio's protocol callbacks by hand — it is a pyclass and inherits nothing from `asyncio.Protocol`, so the base class's default was never available — and `eof_received` was missing. When the peer half-closes, the transport calls it unguarded and the resulting `AttributeError` was raised inside asyncio's own callback: CPython routes it into `_fatal_error` ("Fatal error: protocol.eof_received() call failed."), so it surfaced as a connection error rather than a warning.
+
+  Affects every combination except plain TCP under uvloop, whose `_on_eof` is the only call site that guards with `try/except AttributeError`. Both TLS stacks (CPython `sslproto._call_eof_received`, uvloop `sslproto.pyx` `_call_eof_received`) call it directly, so `wss://` was affected under both event loops. Client-closes-first tests never reach this path, which is why it went unnoticed.
+
+  `NativeClientBuffered` inherits the fix. Regression test covers the loop × transport matrix (`uvloop`/`asyncio` × `ws`/`wss`); the TLS cases generate their own self-signed cert when `tests/certs/` is absent, since it is gitignored and CI does not run `make tls-certs`.
+
 ## [0.7.3] - 2026-07-24
 
 ### Performance

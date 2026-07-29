@@ -1029,6 +1029,20 @@ impl NativeClient {
         Ok(())
     }
 
+    /// The peer half-closed (TCP FIN, or TLS close_notify). No further frame can
+    /// arrive, so let the transport close itself and let `connection_lost` do the
+    /// cleanup: returning true would mean "the protocol keeps this open", which is
+    /// wrong for a WebSocket client and is ignored under TLS anyway.
+    ///
+    /// asyncio.Protocol supplies a default, but this class is a pyclass and is not
+    /// a subclass of it, so the method has to exist here. Both call sites are
+    /// unconditional and unguarded (`sslproto._call_eof_received`,
+    /// `_SelectorSocketTransport._read_ready__data_received`), and the TLS one
+    /// routes a missing attribute into `_fatal_error`.
+    fn eof_received(&self) -> bool {
+        false
+    }
+
     fn connection_lost(&self, py: Python<'_>, _exc: Py<PyAny>) {
         let pending = {
             let mut state = self.state.borrow_mut();

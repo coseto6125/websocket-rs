@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "websocket_rs"
-version = "0.7.3"
+version = "0.7.4"
 dependencies = [
  "base64 0.22.1",
  "bytes",

@@ -21,6 +21,7 @@ def test_native_client_python_visibility_exposes_only_protocol_hooks():
     for hook in (
         "connection_made",
         "data_received",
+        "eof_received",
         "pause_writing",
         "resume_writing",
         "connection_lost",
@@ -38,6 +39,27 @@ def test_native_client_python_visibility_exposes_only_protocol_hooks():
         "build_merged_frame",
     ):
         assert not hasattr(NativeClient, helper)
+
+@pytest.fixture(scope="session")
+def tls_certs():
+    """Self-signed test cert. tests/certs/ is gitignored and CI never runs
+    `make tls-certs`, so generate it on demand with the same openssl invocation."""
+    import pathlib
+    import subprocess
+
+    certs = pathlib.Path(__file__).parent / "certs"
+    cert, key = certs / "cert.pem", certs / "key.pem"
+    if not (cert.exists() and key.exists()):
+        certs.mkdir(exist_ok=True)
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-days", "3650", "-nodes",
+             "-keyout", str(key), "-out", str(cert), "-subj", "/CN=127.0.0.1",
+             "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1",
+             "-addext", "basicConstraints=critical,CA:FALSE",
+             "-addext", "extendedKeyUsage=serverAuth"],
+            check=True, capture_output=True,
+        )
+    return cert, key
 
 
 def _server_frame(first_byte, payload):
@@ -59,9 +81,12 @@ def _start_raw_ws_server(
     send_with_handshake=False,
     hold_open=0.2,
     capture_handshake=None,
+    tls=False,
 ):
     import base64
+    import os
     import socket as _s
+    import ssl
     import threading
     from hashlib import sha1
 
@@ -75,6 +100,11 @@ def _start_raw_ws_server(
         srv.listen(1)
         evt.set()
         conn, _ = srv.accept()
+        if tls:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            certs = os.path.join(os.path.dirname(__file__), "certs")
+            ctx.load_cert_chain(os.path.join(certs, "cert.pem"), os.path.join(certs, "key.pem"))
+            conn = ctx.wrap_socket(conn, server_side=True)
         try:
             data = b""
             while b"\r\n\r\n" not in data:
@@ -118,6 +148,13 @@ def _start_raw_ws_server(
                     capture_client_data.append(b"")
             time.sleep(hold_open)
         finally:
+            if tls:
+                # unwrap() sends close_notify; a bare close() would just drop the
+                # socket, and only close_notify takes the eof_received path.
+                try:
+                    conn = conn.unwrap()
+                except OSError:
+                    pass
             conn.close()
             srv.close()
 
@@ -929,3 +966,54 @@ def test_native_receive_timeout_none_skips_wait_for(monkeypatch):
 
     asyncio.run(run())
     thread.join(timeout=2)
+
+
+@pytest.mark.parametrize("loop_name", ["uvloop", "asyncio"])
+@pytest.mark.parametrize("tls", [True, False], ids=["wss", "ws"])
+def test_peer_half_close_does_not_raise_in_transport_callback(loop_name, tls, tls_certs):
+    """The peer closes first, so the transport calls eof_received() on us.
+
+    asyncio.Protocol supplies a default; NativeClient is a pyclass and inherits
+    nothing, so a missing method surfaced as an AttributeError raised inside the
+    transport's own callback. Both event loops call it the same unguarded way on
+    the TLS path (CPython `sslproto._call_eof_received`, uvloop's `sslproto.pyx`
+    `_call_eof_received`); only uvloop's plain-TCP `_on_eof` guards with
+    try/except AttributeError. The wss cases are the ones that would catch a
+    regression — the ws/uvloop case is here so that stops being true silently.
+
+    Client-closes-first tests never reach this path, which is why it went unnoticed.
+    """
+    import ssl
+
+    port = 8833 + 2 * int(tls) + int(loop_name == "asyncio")
+    frames = (_server_frame(0x81, b"bye"),)
+    thread = _start_raw_ws_server(port, frames, hold_open=0, tls=tls)
+    caught = []
+
+    if tls:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx = None
+
+    async def run():
+        asyncio.get_running_loop().set_exception_handler(lambda _loop, ctx_: caught.append(ctx_))
+        scheme = "wss" if tls else "ws"
+        ws = await connect(f"{scheme}://127.0.0.1:{port}", ssl_context=ctx, receive_timeout=2)
+        assert bytes(await ws.recv()) == b"bye"
+        await asyncio.sleep(0.3)  # let the peer's FIN / close_notify arrive
+        ws.close()
+
+    if loop_name == "uvloop":
+        uvloop.run(run())
+    else:
+        loop = asyncio.SelectorEventLoop()  # CPython's own, not the installed uvloop
+        try:
+            loop.run_until_complete(run())
+        finally:
+            loop.close()
+
+    thread.join(timeout=2)
+    missing = [c for c in caught if isinstance(c.get("exception"), AttributeError)]
+    assert missing == [], f"transport callback raised: {missing}"
