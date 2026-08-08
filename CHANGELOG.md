@@ -5,25 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Internal
-
-- **Measured findings for the send and receive paths (#TBD)**: two directions that looked open are now measured rather than estimated, using `tests/bench_ab.py`.
-
-  The TLS send path does not benefit from single-pass masking. `wss://` has no raw fd, so every send goes through `build_merged_frame`, and 0.7.5's change does run there — it just cannot be seen: TLS 1 MiB round-trip time is 791 µs against plain's 231 µs, so the same 4.75 µs saving is 0.60% instead of 2.05% and falls under the noise floor (-0.95%, 15 rounds, 95% CI [-5.86%, +1.50%]). Prediction and measurement agree at all four points tested. Memory-pass optimizations on that path have roughly a third of the leverage they have on plain, which is now a documented reason not to try.
-
-  The receive-path `Bytes::copy_from_slice` cost is the pass, not the allocation. Removing the per-message allocation entirely measured -0.98% (95% CI [-2.25%, +0.35%]) — nothing, because the allocator hands the just-freed same-size block straight back. A footprint-controlled probe that changes only the number of passes measured -7.58% (95% CI [-9.48%, -2.07%]) at 1 MiB and nothing at 100 KiB, which puts the ceiling on removing that copy at **+7.6%**, not the +10-18% previously estimated.
-
-  Both results are written up in `docs/OPTIMIZATION_RESEARCH.md`, including why the abandoned owned-slab design's memory-bound objection does not apply once a size threshold restricts it to one message per buffer, and which test the naive version breaks.
-
-### Internal
-
-- **A/B benchmark harness (`tests/bench_ab.py`) (#TBD)**: the existing benchmark scripts answer "how does websocket-rs compare to other clients"; none of them answer "did my change help", which is the question the +2% CHANGELOG gate is actually about. Measuring that by hand is where the time goes: the 0.7.5 masking change measured +8.02%, +4.62%, +2.40%, +2.20% and +2.69% across five sessions on this machine, and believing the first would have put a wrong figure in the CHANGELOG.
-
-  The harness takes two built `.so` files and runs paired interleaved rounds: both builds back to back against the same server process, with the arm order alternating each round, reported as the median of per-round ratios with a percentile bootstrap confidence interval. Each cell runs in its own interpreter with its own staged copy of the package, so the two builds never share a process and the working tree's `.so` is untouched while a comparison runs.
-
-  `--transport tls` drives the wss:// path, which is a different code path rather than just a slower one: no raw fd means every send goes through `build_merged_frame`. `make bench-servers` builds both echo servers. Calibrated by passing one build as both arms (+0.16% / -0.09% at 256 B / 1 MiB, intervals containing zero) and by reproducing a known effect (the 0.7.5 masking change, +4.08% at 1 MiB, 11/11 rounds positive).
+## [0.7.5] - 2026-08-09
 
 ### Performance
 
@@ -46,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One masking primitive instead of two (#39)**: `apply_mask` and its scalar/AVX-512 pair existed only to serve control frames once `copy_masked` took over the data path. Control-frame encoding now uses `copy_masked` too, and the duplicate AVX-512 kernel is deleted — the Rust side is net smaller while doing strictly more.
 
 - **Outbound masking pinned byte-for-byte (#39)**: a regression suite sweeps payload sizes across the 1-/2-/8-byte length headers and every shape the vectorised loop can take (empty, sub-word, sub-vector, exact 64-byte multiples, and multiples plus a scalar-tail remainder), decoding the frame off the wire and unmasking it. Verified to have teeth: dropping the scalar tail from the AVX-512 path fails 12 of its 15 cases. The scalar kernel is unreachable on an AVX-512 host, so it is the ARM legs of the CI matrix that exercise it — which #38 is what makes possible.
+
+- **A/B benchmark harness (`tests/bench_ab.py`) (#40)**: the existing benchmark scripts answer "how does websocket-rs compare to other clients"; none of them answer "did my change help", which is the question the +2% CHANGELOG gate is actually about. Measuring that by hand is where the time goes: the 0.7.5 masking change measured +8.02%, +4.62%, +2.40%, +2.20% and +2.69% across five sessions on this machine, and believing the first would have put a wrong figure in the CHANGELOG.
+
+  The harness takes two built `.so` files and runs paired interleaved rounds: both builds back to back against the same server process, with the arm order alternating each round, reported as the median of per-round ratios with a percentile bootstrap confidence interval. Each cell runs in its own interpreter with its own staged copy of the package, so the two builds never share a process and the working tree's `.so` is untouched while a comparison runs.
+
+  `--transport tls` drives the wss:// path, which is a different code path rather than just a slower one: no raw fd means every send goes through `build_merged_frame`. `make bench-servers` builds both echo servers. Calibrated by passing one build as both arms (+0.16% / -0.09% at 256 B / 1 MiB, intervals containing zero) and by reproducing a known effect (the 0.7.5 masking change, +4.08% at 1 MiB, 11/11 rounds positive).
+
+- **Measured findings for the send and receive paths (#41)**: two directions that looked open are now measured rather than estimated, using `tests/bench_ab.py`.
+
+  The TLS send path does not benefit from single-pass masking. `wss://` has no raw fd, so every send goes through `build_merged_frame`, and 0.7.5's change does run there — it just cannot be seen: TLS 1 MiB round-trip time is 791 µs against plain's 231 µs, so the same 4.75 µs saving is 0.60% instead of 2.05% and falls under the noise floor (-0.95%, 15 rounds, 95% CI [-5.86%, +1.50%]). Prediction and measurement agree at all four points tested. Memory-pass optimizations on that path have roughly a third of the leverage they have on plain, which is now a documented reason not to try.
+
+  The receive-path `Bytes::copy_from_slice` cost is the pass, not the allocation. Removing the per-message allocation entirely measured -0.98% (95% CI [-2.25%, +0.35%]) — nothing, because the allocator hands the just-freed same-size block straight back. A footprint-controlled probe that changes only the number of passes measured -7.58% (95% CI [-9.48%, -2.07%]) at 1 MiB and nothing at 100 KiB, which puts the ceiling on removing that copy at **+7.6%**, not the +10-18% previously estimated.
+
+  Both results are written up in `docs/OPTIMIZATION_RESEARCH.md`, including why the abandoned owned-slab design's memory-bound objection does not apply once a size threshold restricts it to one message per buffer, and which test the naive version breaks.
 
 ## [0.7.4] - 2026-07-29
 
