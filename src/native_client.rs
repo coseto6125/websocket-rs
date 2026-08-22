@@ -93,8 +93,13 @@ fn copy_masked_fallback(dst: &mut [u8], src: &[u8], mask: [u8; 4]) {
     let words = dst.len() / 4;
     let (dw, dtail) = dst.split_at_mut(words * 4);
     let (sw, stail) = src.split_at(words * 4);
-    for (d, s) in dw.chunks_exact_mut(4).zip(sw.chunks_exact(4)) {
-        let v = u32::from_ne_bytes([s[0], s[1], s[2], s[3]]) ^ mask_u32;
+    for (d, s) in dw
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(sw.as_chunks::<4>().0)
+    {
+        let v = u32::from_ne_bytes(*s) ^ mask_u32;
         d.copy_from_slice(&v.to_ne_bytes());
     }
     for (i, (d, s)) in dtail.iter_mut().zip(stail.iter()).enumerate() {

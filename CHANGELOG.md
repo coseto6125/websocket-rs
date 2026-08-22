@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - MIGRATION.md claimed SOCKS5 was "not yet ported to the native client"; it is available as `proxy=` on `websocket_rs.connect`.
 - The deprecated async client is now marked as such everywhere it is taught: a deprecation notice at the top of docs/API.md and on its reference section, a note in the `websocket_rs.async_client` type stub, and README quick-start examples switched to the canonical `websocket_rs.connect`.
 
+### Internal
+
+- `copy_masked_fallback`'s 4-byte loop adopts the `as_chunks` form requested by clippy 1.98 (`chunks_exact_to_as_chunks`), which this repository's unpinned CI toolchain now ships. Same iteration, same loads, byte-identical output; the mask test matrix covers every size class including non-multiple-of-4 tails.
+
 ## [0.7.5] - 2026-08-09
 
 ### Performance
