@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] - 2026-08-23
+
+### Internal
+
+- **The three receive fast paths now share one frame-walking core**: `data_received`, the zero-copy `PyBytes` variant, and `parse_recv_data` each carried their own copy of the opcode dispatch loop, and 0.7.6's ping fix had to be applied to all three by hand. They now delegate to a single `scan_frame_aligned` visitor next to `ProtocolCore`'s walker, so ping answering, close handling, and message delivery have one implementation instead of four near-copies. Behavior is unchanged; three new tests pin ping-then-message, ping-then-close ordering, and a ping split across a buffered window boundary.
+
+- **Future-resolution guards and protocol-error teardown consolidated**: the four inline `!future.done()` probe-then-resolve sites became `set_future_result` / `set_future_exception`, which name the two policies (resolve even if the probe loses a race, never throw during teardown), and protocol-error close framing moved into `begin_protocol_error`, mirroring `begin_peer_close`. No behavior change intended or observed.
+
+- **native_client.rs split into modules**: the 2432-line file is now a directory module — `codec.rs` (frame primitives: masking, header parse, frame walk), `protocol.rs` (ProtocolCore state machine, handshake accept key, permessage-deflate decode), `client.rs` (pyclass bindings, State, send-side control frames), and `mod.rs` (`connect()`, URI parsing, registration, unit tests). The ~110-line embedded SOCKS5 connect helper moves from an `r#"..."#` literal to `include_str!("connect_helper.py")`, so it is visible to editors and linters.
+
+- **No performance change measured**: paired interleaved A/B against the 0.7.6 release binary (21 rounds per cell, bootstrap 95% CI) puts every cell inside noise — plain transport medians +0.34% at 256 B [-0.60%, +1.58%], −0.20% at 8 KiB [-0.59%, +0.20%], +0.18% at 100 KiB [-0.17%, +0.99%], +0.20% at 1 MiB [-0.64%, +0.56%]; TLS 1 MiB −0.34% [-1.32%, +0.42%]. All intervals straddle zero; none meets or breaches the ±2% gate. The split .so is also ~3 KB smaller than 0.7.6's.
+
 ## [0.7.6] - 2026-08-22
 
 ### Fixed
