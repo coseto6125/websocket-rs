@@ -1255,7 +1255,9 @@ impl NativeClient {
                     state.handshake_fut.take()
                 };
                 if let Some(future) = future {
-                    Self::set_future_result(py, future.bind(py), py.None())?;
+                    // Pre-refactor behavior: a set_result failure here must
+                    // not abort processing of queued protocol events.
+                    let _ = Self::set_future_result(py, future.bind(py), py.None());
                 }
             }
             HandshakeOutcome::Complete => {}
