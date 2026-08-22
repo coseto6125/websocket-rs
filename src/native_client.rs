@@ -4,15 +4,16 @@
 //! post-handshake, no cross-thread wakeup (call_soon_threadsafe). Frame codec is
 //! in Rust with AVX2-friendly masking.
 //!
-//! Scope for this MVP commit:
-//! - ws:// plain TCP only (TLS / proxy land in follow-ups)
-//! - Binary + Text messages; opcodes 0x1 / 0x2 / 0x8 (close)
-//! - Client-side handshake (RFC 6455 §4.1)
-//! - Fire-and-forget send(), async recv()
-//!
-//! Deliberately NOT in this commit: ping/pong, fragmented messages, permessage-deflate,
-//! custom headers/subprotocols, receive_timeout. All can be layered on without
-//! touching the hot path.
+//! Current scope:
+//! - ws:// plain TCP and wss:// TLS delegated to Python ssl; SOCKS5 via the
+//!   embedded connect helper
+//! - Binary + Text messages, fragmented messages, permessage-deflate when
+//!   negotiated
+//! - Control frames: close, client ping, and server pings answered with a
+//!   masked pong on every receive path (fast paths and ProtocolCore alike)
+//! - Client-side handshake (RFC 6455 §4.1) with subprotocol negotiation
+//! - Fire-and-forget send(), async recv() with optional receive_timeout
+//! - BufferedProtocol variant (NativeClientBuffered) sharing the same codec
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -1439,6 +1440,21 @@ impl NativeClient {
                     close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
                     return Ok(VisitOutcome::Stop);
                 }
+                OP_PING => {
+                    // Unfragmented server ping: answer with a masked pong,
+                    // matching the ProtocolCore slow path (SendPong).
+                    let pong = {
+                        let mut state = self.state.borrow_mut();
+                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                        transport
+                            .map(|t| (t, encode_control_frame(&mut state, OP_PONG, frame.payload)))
+                    };
+                    if let Some((transport, pong_frame)) = pong {
+                        let _ = transport
+                            .bind(py)
+                            .call_method1("write", (PyBytes::new(py, &pong_frame),));
+                    }
+                }
                 _ => {}
             }
             Ok(VisitOutcome::Continue)
@@ -1471,6 +1487,7 @@ impl NativeClient {
         if can_fast_path {
             let mut state = self.state.borrow_mut();
             let mut close_effects = None;
+            let mut pongs: Vec<(Py<PyAny>, Vec<u8>)> = Vec::new();
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
@@ -1488,6 +1505,16 @@ impl NativeClient {
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
                     }
+                    OP_PING => {
+                        // Unfragmented server ping: queue a masked pong,
+                        // matching the ProtocolCore slow path (SendPong).
+                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                        if let Some(transport) = transport {
+                            let pong_frame =
+                                encode_control_frame(&mut state, OP_PONG, frame.payload);
+                            pongs.push((transport, pong_frame));
+                        }
+                    }
                     OP_CLOSE => {
                         let (code, reason) = parse_close_payload(frame.payload);
                         close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
@@ -1497,9 +1524,15 @@ impl NativeClient {
                 }
                 Ok(VisitOutcome::Continue)
             })?;
+            drop(state);
+            // Answer queued pings once the State borrow is released.
+            for (transport, pong_frame) in pongs {
+                let _ = transport
+                    .bind(py)
+                    .call_method1("write", (PyBytes::new(py, &pong_frame),));
+            }
             let consumed = match outcome {
                 ScanOutcome::Stopped { .. } => {
-                    drop(state);
                     if let Some((pending, transport)) = close_effects {
                         Self::apply_peer_close(py, pending, transport);
                     }
@@ -1511,8 +1544,10 @@ impl NativeClient {
                 | ScanOutcome::Fallback { consumed } => consumed,
             };
             if consumed < data.len() {
-                state.buf.extend_from_slice(&data[consumed..]);
-                drop(state);
+                self.state
+                    .borrow_mut()
+                    .buf
+                    .extend_from_slice(&data[consumed..]);
                 return self.process_buffered_frames(py);
             }
             return Ok(());
@@ -1533,12 +1568,23 @@ impl NativeClient {
         if can_fast_path {
             let mut state = self.state.borrow_mut();
             let mut close_effects = None;
+            let mut pongs: Vec<(Py<PyAny>, Vec<u8>)> = Vec::new();
             let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
                 match frame.opcode {
                     OP_TEXT | OP_BINARY => {
                         let payload = Bytes::copy_from_slice(frame.payload);
                         let msg = Py::new(py, WSMessage { data: payload })?;
                         Self::deliver_message(py, &mut state, msg)?;
+                    }
+                    OP_PING => {
+                        // Unfragmented server ping: queue a masked pong,
+                        // matching the ProtocolCore slow path (SendPong).
+                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                        if let Some(transport) = transport {
+                            let pong_frame =
+                                encode_control_frame(&mut state, OP_PONG, frame.payload);
+                            pongs.push((transport, pong_frame));
+                        }
                     }
                     OP_CLOSE => {
                         let (code, reason) = parse_close_payload(frame.payload);
@@ -1549,9 +1595,15 @@ impl NativeClient {
                 }
                 Ok(VisitOutcome::Continue)
             })?;
+            drop(state);
+            // Answer queued pings once the State borrow is released.
+            for (transport, pong_frame) in pongs {
+                let _ = transport
+                    .bind(py)
+                    .call_method1("write", (PyBytes::new(py, &pong_frame),));
+            }
             let consumed = match outcome {
                 ScanOutcome::Stopped { .. } => {
-                    drop(state);
                     if let Some((pending, transport)) = close_effects {
                         Self::apply_peer_close(py, pending, transport);
                     }
@@ -1563,8 +1615,10 @@ impl NativeClient {
                 | ScanOutcome::Fallback { consumed } => consumed,
             };
             if consumed < data.len() {
-                state.buf.extend_from_slice(&data[consumed..]);
-                drop(state);
+                self.state
+                    .borrow_mut()
+                    .buf
+                    .extend_from_slice(&data[consumed..]);
                 return self.process_buffered_frames(py);
             }
             return Ok(());

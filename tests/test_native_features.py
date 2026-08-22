@@ -503,12 +503,13 @@ def test_receive_fragment_with_ping_emits_pong_and_assembles_message():
     assert _decode_client_frame(captured[0]) == (0xA, b"keepalive")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="PR5/C1b: unfragmented server Ping is ignored by the receive fast paths",
+@pytest.mark.parametrize(
+    ("path", "port"),
+    [("buffered", 8830), ("pybytes", 8846), ("bytearray", 8847)],
 )
-def test_receive_fast_path_ping_emits_pong():
-    port = 8830
+def test_receive_fast_path_ping_emits_pong(path, port):
+    """A server ping must be answered on every receive path, not only the
+    ProtocolCore slow path (regression for PR5/C1b)."""
     thread = _start_raw_ws_server(port, [], hold_open=1)
 
     class RecordingTransport:
@@ -532,7 +533,7 @@ def test_receive_fast_path_ping_emits_pong():
         transport = RecordingTransport()
         ws.connection_made(transport)
         try:
-            ws.data_received(_server_frame(0x89, b"fast-ping"))
+            _feed_client(ws, _server_frame(0x89, b"fast-ping"), path)
             assert _decode_client_frame(transport.writes[0]) == (0xA, b"fast-ping")
         finally:
             ws.close()
