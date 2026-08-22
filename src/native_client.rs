@@ -182,6 +182,17 @@ fn parse_close_payload(payload: &[u8]) -> (Option<u16>, Option<String>) {
     (code, reason)
 }
 
+/// Payload construction strategy for `scan_frame_aligned`.
+enum PayloadMode<'py, 'a> {
+    /// Copy payload bytes out of the incoming buffer. Plain `data_received`
+    /// chunks and buffered windows, where the window is invalidated right
+    /// after the call, both need this.
+    Copy,
+    /// Zero-copy: wrap a slice of the incoming `PyBytes` as the `Bytes`
+    /// owner. No memcpy of message payloads on this path.
+    ZeroCopy { pb: &'a Bound<'py, PyBytes> },
+}
+
 struct FastFrame<'a> {
     opcode: u8,
     payload: &'a [u8],
@@ -1421,52 +1432,123 @@ impl NativeClient {
     /// caller's compaction) must reach `N` before the next parse pass can
     /// complete that frame. Caller writes it onto State once, outside any
     /// per-frame borrow churn.
-    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<(usize, Option<usize>)> {
-        let can_fast_path = {
-            let st = self.state.borrow();
-            st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()
-        };
-        if !can_fast_path {
-            self.data_received_inner(py, data)?;
-            return Ok((data.len(), None));
-        }
+    /// True when frames arriving now are frame-aligned: handshake done,
+    /// nothing parked in `buf`, no fragment assembly in flight. Only then
+    /// may a caller scan incoming bytes directly instead of parking them.
+    fn fast_path_eligible(&self) -> bool {
+        let st = self.state.borrow();
+        st.handshake_done && st.buf.is_empty() && st.fragment_buf.is_none()
+    }
+
+    /// Single pass over frame-aligned `data` — THE opcode dispatch shared by
+    /// every receive path: deliver TEXT/BINARY per `mode`, queue one masked
+    /// pong per unfragmented PING, stop at the first peer CLOSE.
+    ///
+    /// Borrow discipline: queued pongs are written and peer-close effects
+    /// applied only AFTER the State borrow is released, because transport
+    /// writes and close bookkeeping may re-enter the client (send(), recv()
+    /// resolution). Flushing pings before applying the close also keeps the
+    /// wire order "pong, then close" for a batch ending in CLOSE, matching
+    /// the ProtocolCore slow path's event order.
+    fn scan_frame_aligned(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        mode: PayloadMode<'_, '_>,
+    ) -> PyResult<ScanOutcome> {
+        let mut state = self.state.borrow_mut();
         let mut close_effects = None;
+        let mut pongs: Vec<(Py<PyAny>, Vec<u8>)> = Vec::new();
         let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
             match frame.opcode {
                 OP_TEXT | OP_BINARY => {
-                    let payload = Bytes::copy_from_slice(frame.payload);
+                    let payload = match mode {
+                        PayloadMode::Copy => Bytes::copy_from_slice(frame.payload),
+                        PayloadMode::ZeroCopy { pb } => {
+                            // PyBytes is immutable, so the pointer stays
+                            // valid as long as the PyBytesOwner refcount
+                            // keeps it alive.
+                            pybytes_zero_copy_slice(
+                                py,
+                                pb,
+                                data,
+                                frame.payload_start,
+                                frame.payload_start + frame.payload.len(),
+                            )
+                        }
+                    };
                     let msg = Py::new(py, WSMessage { data: payload })?;
-                    let mut state = self.state.borrow_mut();
                     Self::deliver_message(py, &mut state, msg)?;
+                }
+                OP_PING => {
+                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+                    if let Some(transport) = transport {
+                        let pong_frame = encode_control_frame(&mut state, OP_PONG, frame.payload);
+                        pongs.push((transport, pong_frame));
+                    }
                 }
                 OP_CLOSE => {
                     let (code, reason) = parse_close_payload(frame.payload);
-                    let mut state = self.state.borrow_mut();
                     close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
                     return Ok(VisitOutcome::Stop);
-                }
-                OP_PING => {
-                    // Unfragmented server ping: answer with a masked pong,
-                    // matching the ProtocolCore slow path (SendPong).
-                    let pong = {
-                        let mut state = self.state.borrow_mut();
-                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                        transport
-                            .map(|t| (t, encode_control_frame(&mut state, OP_PONG, frame.payload)))
-                    };
-                    if let Some((transport, pong_frame)) = pong {
-                        let _ = transport
-                            .bind(py)
-                            .call_method1("write", (PyBytes::new(py, &pong_frame),));
-                    }
                 }
                 _ => {}
             }
             Ok(VisitOutcome::Continue)
         })?;
-        if let Some((pending, transport)) = close_effects {
-            Self::apply_peer_close(py, pending, transport);
+        drop(state);
+        // Answer queued pings once the State borrow is released.
+        for (transport, pong_frame) in pongs {
+            let _ = transport
+                .bind(py)
+                .call_method1("write", (PyBytes::new(py, &pong_frame),));
         }
+        if let ScanOutcome::Stopped { .. } = outcome {
+            if let Some((pending, transport)) = close_effects {
+                Self::apply_peer_close(py, pending, transport);
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Shared epilogue of the callback-driven receive paths: park any
+    /// unconsumed tail in State.buf and re-drain it through the slow path.
+    fn park_tail_and_drain(
+        &self,
+        py: Python<'_>,
+        outcome: ScanOutcome,
+        data: &[u8],
+    ) -> PyResult<()> {
+        let consumed = match outcome {
+            ScanOutcome::Stopped { .. } => return Ok(()),
+            ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
+            ScanOutcome::Exhausted { consumed }
+            | ScanOutcome::Partial { consumed, .. }
+            | ScanOutcome::Fallback { consumed } => consumed,
+        };
+        if consumed < data.len() {
+            self.state
+                .borrow_mut()
+                .buf
+                .extend_from_slice(&data[consumed..]);
+            return self.process_buffered_frames(py);
+        }
+        Ok(())
+    }
+
+    /// Parse `data` (a window into `recv_buf`) in place; the caller compacts
+    /// the remainder. Frame-aligned windows take the shared fast-path scan;
+    /// anything else routes through `data_received_inner`, which reports the
+    /// full window as consumed because it parked the bytes itself.
+    /// Returns `(consumed, next_frame_needed)`; `Some(N)` means the caller's
+    /// `recv_pos` must reach `N` before the next parse pass can finish the
+    /// partial frame.
+    fn parse_recv_data(&self, py: Python<'_>, data: &[u8]) -> PyResult<(usize, Option<usize>)> {
+        if !self.fast_path_eligible() {
+            self.data_received_inner(py, data)?;
+            return Ok((data.len(), None));
+        }
+        let outcome = self.scan_frame_aligned(py, data, PayloadMode::Copy)?;
         match outcome {
             ScanOutcome::Exhausted { consumed } | ScanOutcome::Stopped { consumed } => {
                 Ok((consumed, None))
@@ -1485,150 +1567,19 @@ impl NativeClient {
         pb: &Bound<'py, PyBytes>,
         data: &[u8],
     ) -> PyResult<()> {
-        let can_fast_path = {
-            let state = self.state.borrow();
-            state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none()
-        };
-        if can_fast_path {
-            let mut state = self.state.borrow_mut();
-            let mut close_effects = None;
-            let mut pongs: Vec<(Py<PyAny>, Vec<u8>)> = Vec::new();
-            let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
-                match frame.opcode {
-                    OP_TEXT | OP_BINARY => {
-                        // Zero-copy: wrap PyBytes as a Bytes owner — no memcpy
-                        // of the payload bytes. PyBytes is immutable so the
-                        // pointer is stable for as long as the refcount is
-                        // held by PyBytesOwner.
-                        let payload = pybytes_zero_copy_slice(
-                            py,
-                            pb,
-                            data,
-                            frame.payload_start,
-                            frame.payload_start + frame.payload.len(),
-                        );
-                        let msg = Py::new(py, WSMessage { data: payload })?;
-                        Self::deliver_message(py, &mut state, msg)?;
-                    }
-                    OP_PING => {
-                        // Unfragmented server ping: queue a masked pong,
-                        // matching the ProtocolCore slow path (SendPong).
-                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                        if let Some(transport) = transport {
-                            let pong_frame =
-                                encode_control_frame(&mut state, OP_PONG, frame.payload);
-                            pongs.push((transport, pong_frame));
-                        }
-                    }
-                    OP_CLOSE => {
-                        let (code, reason) = parse_close_payload(frame.payload);
-                        close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
-                        return Ok(VisitOutcome::Stop);
-                    }
-                    _ => {}
-                }
-                Ok(VisitOutcome::Continue)
-            })?;
-            drop(state);
-            // Answer queued pings once the State borrow is released.
-            for (transport, pong_frame) in pongs {
-                let _ = transport
-                    .bind(py)
-                    .call_method1("write", (PyBytes::new(py, &pong_frame),));
-            }
-            let consumed = match outcome {
-                ScanOutcome::Stopped { .. } => {
-                    if let Some((pending, transport)) = close_effects {
-                        Self::apply_peer_close(py, pending, transport);
-                    }
-                    return Ok(());
-                }
-                ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
-                ScanOutcome::Exhausted { consumed }
-                | ScanOutcome::Partial { consumed, .. }
-                | ScanOutcome::Fallback { consumed } => consumed,
-            };
-            if consumed < data.len() {
-                self.state
-                    .borrow_mut()
-                    .buf
-                    .extend_from_slice(&data[consumed..]);
-                return self.process_buffered_frames(py);
-            }
-            return Ok(());
+        if self.fast_path_eligible() {
+            let outcome = self.scan_frame_aligned(py, data, PayloadMode::ZeroCopy { pb })?;
+            return self.park_tail_and_drain(py, outcome, data);
         }
         self.state.borrow_mut().buf.extend_from_slice(data);
         self.process_buffered_frames(py)
     }
 
     fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        // Fast path: if our internal buf is empty and the handshake is already done,
-        // parse frames straight out of `data` and only copy the tail (if any) back into
-        // buf. Servers that deliver one frame per write hit this path and save a
-        // memcpy per callback.
-        let can_fast_path = {
-            let state = self.state.borrow();
-            state.handshake_done && state.buf.is_empty() && state.fragment_buf.is_none()
-        };
-        if can_fast_path {
-            let mut state = self.state.borrow_mut();
-            let mut close_effects = None;
-            let mut pongs: Vec<(Py<PyAny>, Vec<u8>)> = Vec::new();
-            let outcome = walk_frames(data, |frame| -> PyResult<VisitOutcome> {
-                match frame.opcode {
-                    OP_TEXT | OP_BINARY => {
-                        let payload = Bytes::copy_from_slice(frame.payload);
-                        let msg = Py::new(py, WSMessage { data: payload })?;
-                        Self::deliver_message(py, &mut state, msg)?;
-                    }
-                    OP_PING => {
-                        // Unfragmented server ping: queue a masked pong,
-                        // matching the ProtocolCore slow path (SendPong).
-                        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                        if let Some(transport) = transport {
-                            let pong_frame =
-                                encode_control_frame(&mut state, OP_PONG, frame.payload);
-                            pongs.push((transport, pong_frame));
-                        }
-                    }
-                    OP_CLOSE => {
-                        let (code, reason) = parse_close_payload(frame.payload);
-                        close_effects = Some(Self::begin_peer_close(py, &mut state, code, reason));
-                        return Ok(VisitOutcome::Stop);
-                    }
-                    _ => {}
-                }
-                Ok(VisitOutcome::Continue)
-            })?;
-            drop(state);
-            // Answer queued pings once the State borrow is released.
-            for (transport, pong_frame) in pongs {
-                let _ = transport
-                    .bind(py)
-                    .call_method1("write", (PyBytes::new(py, &pong_frame),));
-            }
-            let consumed = match outcome {
-                ScanOutcome::Stopped { .. } => {
-                    if let Some((pending, transport)) = close_effects {
-                        Self::apply_peer_close(py, pending, transport);
-                    }
-                    return Ok(());
-                }
-                ScanOutcome::Exhausted { consumed } if consumed == data.len() => return Ok(()),
-                ScanOutcome::Exhausted { consumed }
-                | ScanOutcome::Partial { consumed, .. }
-                | ScanOutcome::Fallback { consumed } => consumed,
-            };
-            if consumed < data.len() {
-                self.state
-                    .borrow_mut()
-                    .buf
-                    .extend_from_slice(&data[consumed..]);
-                return self.process_buffered_frames(py);
-            }
-            return Ok(());
+        if self.fast_path_eligible() {
+            let outcome = self.scan_frame_aligned(py, data, PayloadMode::Copy)?;
+            return self.park_tail_and_drain(py, outcome, data);
         }
-
         // Slow path: handshake in progress or buf already holds partial frame
         // data (fragment / compression). process_buffered_frames has the full
         // handshake parse including subprotocol + extension negotiation.

@@ -1,6 +1,7 @@
 """Smoke-test native_client production features: headers, subprotocol, ping, close code."""
 
 import asyncio
+import contextlib
 import multiprocessing as mp
 import subprocess
 import sys
@@ -535,6 +536,132 @@ def test_receive_fast_path_ping_emits_pong(path, port):
         try:
             _feed_client(ws, _server_frame(0x89, b"fast-ping"), path)
             assert _decode_client_frame(transport.writes[0]) == (0xA, b"fast-ping")
+        finally:
+            ws.close()
+
+    asyncio.run(run())
+    thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("path", "port"),
+    [("buffered", 8848), ("pybytes", 8849), ("bytearray", 8850)],
+)
+def test_receive_batch_ping_then_message_answers_and_delivers(path, port):
+    """One chunk carrying [PING, BINARY] must produce BOTH the pong and the
+    message, on every receive path (unified fast-path scan semantics)."""
+    thread = _start_raw_ws_server(port, [], hold_open=1)
+
+    class RecordingTransport:
+        def __init__(self):
+            self.writes = []
+
+        def get_extra_info(self, _name):
+            return None
+
+        def get_write_buffer_size(self):
+            return 0
+
+        def write(self, data):
+            self.writes.append(bytes(data))
+
+        def close(self):
+            pass
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        transport = RecordingTransport()
+        ws.connection_made(transport)
+        try:
+            batch = _server_frame(0x89, b"mid-batch") + _server_frame(0x82, b"payload")
+            _feed_client(ws, batch, path)
+            assert _decode_client_frame(transport.writes[0]) == (0xA, b"mid-batch")
+            message = await asyncio.wait_for(ws.recv(), timeout=1)
+            assert bytes(message) == b"payload"
+        finally:
+            ws.close()
+
+    asyncio.run(run())
+    thread.join(timeout=2)
+
+
+@pytest.mark.parametrize(
+    ("path", "port"),
+    [("buffered", 8851), ("pybytes", 8852), ("bytearray", 8853)],
+)
+def test_receive_ping_then_close_writes_pong_before_close(path, port):
+    """A batch ending in CLOSE must still put the pong on the wire BEFORE
+    transport.close() runs — pong-then-close ordering on every fast path."""
+    thread = _start_raw_ws_server(port, [], hold_open=1)
+    calls = []
+
+    class OrderedTransport:
+        def get_extra_info(self, _name):
+            return None
+
+        def get_write_buffer_size(self):
+            return 0
+
+        def write(self, data):
+            calls.append(("write", bytes(data)))
+
+        def close(self):
+            calls.append(("close", None))
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        ws.connection_made(OrderedTransport())
+        try:
+            batch = _server_frame(0x89, b"bye-ping") + _server_frame(0x88, b"")
+            _feed_client(ws, batch, path)
+        finally:
+            # The peer already closed us; a client-side close here may raise
+            # or add trailing traffic. Both land AFTER the ordering asserted
+            # below, so neither can mask a regression.
+            with contextlib.suppress(Exception):
+                ws.close()
+
+    asyncio.run(run())
+    thread.join(timeout=2)
+    kinds = [k for k, _ in calls]
+    assert kinds[0] == "write"
+    assert _decode_client_frame(calls[0][1]) == (0xA, b"bye-ping")
+    assert "close" in kinds
+    assert kinds.index("close") > kinds.index("write")
+
+
+def test_buffered_window_ping_across_chunk_boundary_emits_single_pong():
+    """A ping frame split across two buffer_updated windows answers exactly
+    once: the partial header parks in recv_buf, the rest completes it."""
+    port = 8854
+    thread = _start_raw_ws_server(port, [], hold_open=1)
+
+    class RecordingTransport:
+        def __init__(self):
+            self.writes = []
+
+        def get_extra_info(self, _name):
+            return None
+
+        def get_write_buffer_size(self):
+            return 0
+
+        def write(self, data):
+            self.writes.append(bytes(data))
+
+        def close(self):
+            pass
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        transport = RecordingTransport()
+        ws.connection_made(transport)
+        try:
+            whole = _server_frame(0x89, b"split-ping")
+            _feed_client(ws, whole[:3], "buffered")
+            _feed_client(ws, whole[3:], "buffered")
+            assert len(transport.writes) == 1
+            assert _decode_client_frame(transport.writes[0]) == (0xA, b"split-ping")
         finally:
             ws.close()
 
