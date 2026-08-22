@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] - 2026-08-22
+
+### Fixed
+
+- **Unfragmented server pings are now answered on every receive path**: the three receive fast paths — plain `data_received` chunks, the zero-copy `PyBytes` variant, and the buffered `parse_recv_data` window — skipped opcode 0x9 entirely, while the `ProtocolCore` slow path answered pings with a masked pong. Whether a ping got a reply depended on which path the frame happened to take (buffered transports, TLS chunk sizes, and paused writers all route differently). The fast paths now queue a masked pong built by the same `encode_control_frame` used elsewhere, written after the `State` borrow is released. The strict xfail test that pinned this gap is replaced by parametrized tests covering all three fast paths plus the existing slow-path coverage.
+
+### Documentation
+
+- The native module docstring still described the 0.1 MVP scope ("ping/pong, fragmented messages, permessage-deflate deliberately NOT in this commit") while the module implements all of them.
+- MIGRATION.md claimed SOCKS5 was "not yet ported to the native client"; it is available as `proxy=` on `websocket_rs.connect`.
+- The deprecated async client is now marked as such everywhere it is taught: a deprecation notice at the top of docs/API.md and on its reference section, a note in the `websocket_rs.async_client` type stub, and README quick-start examples switched to the canonical `websocket_rs.connect`.
+
 ## [0.7.5] - 2026-08-09
 
 ### Performance
