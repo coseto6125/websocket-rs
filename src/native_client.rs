@@ -1731,14 +1731,7 @@ impl NativeClient {
                     state.handshake_fut.take()
                 };
                 if let Some(future) = future {
-                    let future = future.bind(py);
-                    if !future
-                        .call_method0("done")?
-                        .extract::<bool>()
-                        .unwrap_or(false)
-                    {
-                        let _ = future.call_method1("set_result", (py.None(),));
-                    }
+                    Self::set_future_result(py, future.bind(py), py.None())?;
                 }
             }
             HandshakeOutcome::Complete => {}
@@ -1772,14 +1765,7 @@ impl NativeClient {
                     }
                 };
                 if let Some((future, message)) = pending {
-                    let future = future.bind(py);
-                    if !future
-                        .call_method0("done")?
-                        .extract::<bool>()
-                        .unwrap_or(false)
-                    {
-                        future.call_method1("set_result", (message,))?;
-                    }
+                    Self::set_future_result(py, future.bind(py), message.into_any())?;
                 }
                 Ok(EventFlow::Continue)
             }
@@ -1810,13 +1796,7 @@ impl NativeClient {
             ProtocolEvent::ProtocolError(reason) => {
                 let (pending, transport, frame) = {
                     let mut state = self.state.borrow_mut();
-                    state.close_code = Some(1002);
-                    state.close_reason = Some(reason.to_string());
-                    state.closed = true;
-                    let pending = std::mem::take(&mut state.pending_recv);
-                    let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-                    let frame = encode_control_frame(&mut state, OP_CLOSE, &1002u16.to_be_bytes());
-                    (pending, transport, frame)
+                    Self::begin_protocol_error(py, &mut state, reason)
                 };
                 Self::fail_pending(py, pending, reason);
                 if let Some(transport) = transport {
@@ -1829,19 +1809,44 @@ impl NativeClient {
         }
     }
 
+    /// Resolve `future` with `value` unless it reports done. Policy shared
+    /// by every set_result site: when the done() probe itself errors,
+    /// resolve anyway — losing a message is worse than asyncio's
+    /// InvalidStateError on a genuinely-settled future, and this path is
+    /// allowed to raise.
+    fn set_future_result(
+        py: Python<'_>,
+        future: &Bound<'_, PyAny>,
+        value: Py<PyAny>,
+    ) -> PyResult<()> {
+        if !future
+            .call_method0(pyo3::intern!(py, "done"))?
+            .extract::<bool>()
+            .unwrap_or(false)
+        {
+            future.call_method1(pyo3::intern!(py, "set_result"), (value,))?;
+        }
+        Ok(())
+    }
+
+    /// Fail `future` unless it reports done. Teardown policy, deliberately
+    /// the opposite default of `set_future_result`: when the probe errors,
+    /// assume settled and skip, and swallow the set_exception result —
+    /// cleanup must not throw over an already-dead connection.
+    fn set_future_exception(py: Python<'_>, future: &Bound<'_, PyAny>, error: PyErr) {
+        if !future
+            .call_method0(pyo3::intern!(py, "done"))
+            .and_then(|done| done.extract::<bool>())
+            .unwrap_or(true)
+        {
+            let _ = future.call_method1("set_exception", (error,));
+        }
+    }
+
     fn fail_pending(py: Python<'_>, mut pending: VecDeque<Py<PyAny>>, msg: &str) {
         while let Some(future) = pending.pop_front() {
-            let future = future.bind(py);
-            if !future
-                .call_method0("done")
-                .and_then(|done| done.extract::<bool>())
-                .unwrap_or(true)
-            {
-                let _ = future.call_method1(
-                    "set_exception",
-                    (PyConnectionError::new_err(msg.to_string()),),
-                );
-            }
+            let error = PyConnectionError::new_err(msg.to_string());
+            Self::set_future_exception(py, future.bind(py), error);
         }
     }
 
@@ -1854,18 +1859,29 @@ impl NativeClient {
             return Ok(());
         }
         if let Some(fut) = state.pending_recv.pop_front() {
-            let fb = fut.bind(py);
-            if !fb
-                .call_method0(pyo3::intern!(py, "done"))?
-                .extract::<bool>()
-                .unwrap_or(false)
-            {
-                fb.call_method1(pyo3::intern!(py, "set_result"), (msg,))?;
-            }
+            Self::set_future_result(py, fut.bind(py), msg.into_any())?;
         } else {
             state.backlog.push_back(msg);
         }
         Ok(())
+    }
+
+    /// Record a local protocol-error close in `state` and hand back the
+    /// effects the caller must apply AFTER releasing the State borrow — the
+    /// same reentrancy discipline as `begin_peer_close`, plus the 1002 close
+    /// frame this end puts on the wire because the peer did not send one.
+    fn begin_protocol_error(
+        py: Python<'_>,
+        state: &mut State,
+        reason: &str,
+    ) -> (VecDeque<Py<PyAny>>, Option<Py<PyAny>>, Vec<u8>) {
+        state.close_code = Some(1002);
+        state.close_reason = Some(reason.to_string());
+        state.closed = true;
+        let pending = std::mem::take(&mut state.pending_recv);
+        let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
+        let frame = encode_control_frame(state, OP_CLOSE, &1002u16.to_be_bytes());
+        (pending, transport, frame)
     }
 
     /// Record a peer-initiated close in `state` and hand back the effects the
