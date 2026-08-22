@@ -1,20 +1,5 @@
-//! Native asyncio.Protocol WebSocket client.
-//!
-//! Runs entirely on the asyncio event loop thread — no tokio runtime involvement
-//! post-handshake, no cross-thread wakeup (call_soon_threadsafe). Frame codec is
-//! in Rust with AVX2-friendly masking.
-//!
-//! Current scope:
-//! - ws:// plain TCP and wss:// TLS delegated to Python ssl; SOCKS5 via the
-//!   embedded connect helper
-//! - Binary + Text messages, fragmented messages, permessage-deflate when
-//!   negotiated
-//! - Control frames: close, client ping, and server pings answered with a
-//!   masked pong on every receive path (fast paths and ProtocolCore alike)
-//! - Client-side handshake (RFC 6455 §4.1) with subprotocol negotiation
-//! - Fire-and-forget send(), async recv() with optional receive_timeout
-//! - BufferedProtocol variant (NativeClientBuffered) sharing the same codec
-
+//! ProtocolCore state machine: handshake accept-key validation, opcode
+//! dispatch to protocol events, and permessage-deflate message decoding.
 use base64::Engine;
 use bytes::{Buf, Bytes, BytesMut};
 use flate2::read::DeflateDecoder;
@@ -240,7 +225,7 @@ pub(crate) fn build_handshake(
     }
     if compression {
         // no_context_takeover on both sides keeps decompressor state per-message,
-        // matching the DeflateCtx::reset calls in process_buffered_frames.
+        // matching the fresh per-message decoders built by decompress_message.
         req.push_str(
             "Sec-WebSocket-Extensions: permessage-deflate; \
              client_no_context_takeover; server_no_context_takeover\r\n",
