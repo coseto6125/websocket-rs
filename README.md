@@ -107,9 +107,9 @@ with connect("ws://localhost:8765") as ws:
 ```
 
 ```python
-# Async API
+# Async API (canonical native client)
 import asyncio
-from websocket_rs.async_client import connect
+from websocket_rs import connect
 
 async def main():
     async with await connect("ws://localhost:8765") as ws:
@@ -138,10 +138,9 @@ asyncio.run(main())
 from websocket_rs.sync.client import ClientConnection
 ws = ClientConnection(url, connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
 
-# Async
-from websocket_rs.async_client import ClientConnection
-ws = ClientConnection(url, headers={"Key": "val"}, proxy="socks5://host:port",
-                      connect_timeout=10.0, receive_timeout=10.0, tcp_nodelay=True)
+# Canonical async (`websocket_rs.connect`; TCP_NODELAY is always on)
+ws = await connect(url, headers=[("Key", "val")], proxy="socks5://host:port",
+                   connect_timeout=10.0, receive_timeout=10.0)
 ```
 
 For the canonical async `websocket_rs.connect`, `connect_timeout` defaults to

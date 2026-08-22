@@ -1,7 +1,10 @@
+"""Deprecated: use ``websocket_rs.connect`` instead. Removed in 2.0."""
+
 from types import TracebackType
 
 class ClientConnection:
-    """Async WebSocket client connection backed by tokio-tungstenite."""
+    """Deprecated async client backed by tokio-tungstenite. Use
+    ``websocket_rs.connect`` instead. Removed in 2.0."""
 
     def __init__(
         self,

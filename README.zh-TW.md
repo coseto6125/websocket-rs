@@ -120,7 +120,7 @@ with connect("ws://localhost:8765") as ws:
 ```python
 # 直接使用 - 異步 API
 import asyncio
-from websocket_rs.async_client import connect
+from websocket_rs import connect
 
 async def main():
     ws = await connect("ws://localhost:8765")

@@ -2,6 +2,9 @@
 
 Complete API reference for websocket-rs.
 
+> **Deprecation notice:** `websocket_rs.async_client` is deprecated and will be
+> removed in 2.0. Use the canonical `websocket_rs.connect` (native client) instead.
+
 ## Installation
 
 ```bash
@@ -20,9 +23,9 @@ with connect("ws://localhost:8765") as ws:
 ```
 
 ```python
-# Async API
+# Async API (canonical native client)
 import asyncio
-from websocket_rs.async_client import connect
+from websocket_rs import connect
 
 async def main():
     ws = await connect("ws://localhost:8765")
@@ -160,6 +163,9 @@ with connect("ws://localhost:8765") as ws:
 ## Async API
 
 ### `websocket_rs.async_client.connect()`
+
+> **Deprecated**, removed in 2.0. Emits a `DeprecationWarning`;
+> use `websocket_rs.connect` instead.
 
 Create and connect to a WebSocket server (async).
 

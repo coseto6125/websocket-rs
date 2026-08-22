@@ -57,7 +57,6 @@ async def handler():
 ## When to stay on the old client (for now)
 
 - You rely on `await ws.send(...)` semantics in code you can't change.
-- You need SOCKS5 proxy — not yet ported to the native client.
 - You're testing a regression and want to compare.
 
 Everyone else should migrate.
