@@ -950,7 +950,8 @@ impl NativeClient {
     }
 
     /// Single pass over frame-aligned `data` — THE opcode dispatch shared by
-    /// every receive path: deliver TEXT/BINARY per `mode`, queue one masked
+    /// the three frame-aligned receive paths; ProtocolCore::next_event walks
+    /// its own loop for fragmented/compressed traffic. Deliver TEXT/BINARY per `mode`, queue one masked
     /// pong per unfragmented PING, stop at the first peer CLOSE.
     ///
     /// Borrow discipline: queued pongs are written and peer-close effects
@@ -1076,12 +1077,11 @@ impl NativeClient {
         pb: &Bound<'py, PyBytes>,
         data: &[u8],
     ) -> PyResult<()> {
-        if self.fast_path_eligible() {
-            let outcome = self.scan_frame_aligned(py, data, PayloadMode::ZeroCopy { pb })?;
-            return self.park_tail_and_drain(py, outcome, data);
+        if !self.fast_path_eligible() {
+            return self.data_received_inner(py, data);
         }
-        self.state.borrow_mut().buf.extend_from_slice(data);
-        self.process_buffered_frames(py)
+        let outcome = self.scan_frame_aligned(py, data, PayloadMode::ZeroCopy { pb })?;
+        self.park_tail_and_drain(py, outcome, data)
     }
 
     fn data_received_inner(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {

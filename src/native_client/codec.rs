@@ -1,5 +1,7 @@
 //! Frame codec primitives: AVX-512/AVX2 masking kernels, WebSocket header
-//! parsing, and the shared frame walker used by every receive path.
+//! parsing, and the shared frame walker used by the frame-aligned receive
+//! fast paths (ProtocolCore::next_event keeps its own walk for fragmented
+//! and compressed traffic).
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 

@@ -33,15 +33,15 @@ build:
 	@echo "🚀 Building in release mode..."
 	. .venv/bin/activate && maturin develop --release
 
-# Run tests
+# Run tests (matches CI and AGENTS.md: pytest over the whole suite)
 test: build
 	@echo "🧪 Running tests..."
-	. .venv/bin/activate && python tests/test_compatibility.py
+	. .venv/bin/activate && pytest tests/
 
-# Run benchmarks
+# Run the paired A/B benchmark harness
 bench: build
 	@echo "📊 Running benchmarks..."
-	. .venv/bin/activate && python tests/benchmark_server_timestamp.py
+	. .venv/bin/activate && python tests/bench_ab.py --help
 
 # Build the echo servers the A/B harness drives
 bench-servers:

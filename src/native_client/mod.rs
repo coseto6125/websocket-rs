@@ -182,11 +182,18 @@ fn parse_ws_uri(uri: &str) -> PyResult<(&'static str, String, u16, String)> {
         "ws" => ("ws", 80),
         _ => return Err(PyValueError::new_err("URI must start with ws:// or wss://")),
     };
-    let host = parsed
+    // url keeps IPv6 literals bracketed ([::1]); getaddrinfo and the SOCKS5
+    // helper need the bare literal. build_handshake re-brackets it for the
+    // Host header.
+    let raw_host = parsed
         .host_str()
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| PyValueError::new_err("URI must include a host"))?
-        .to_string();
+        .ok_or_else(|| PyValueError::new_err("URI must include a host"))?;
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .map(|h| h.to_string())
+        .unwrap_or_else(|| raw_host.to_string());
     let port = parsed.port().unwrap_or(default_port);
     let mut path = parsed.path().to_string();
     if path.is_empty() {
@@ -237,9 +244,10 @@ mod tests {
 
     use bytes::BytesMut;
 
-    use super::{
-        emit_protocol_events, parse_header, parse_ws_uri, walk_frames, EventFlow, HandshakeOutcome,
-        ProtocolCore, ProtocolEvent, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING,
+    use super::codec::{parse_header, walk_frames, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING};
+    use super::parse_ws_uri;
+    use super::protocol::{
+        emit_protocol_events, EventFlow, HandshakeOutcome, ProtocolCore, ProtocolEvent,
     };
 
     struct CoreState {

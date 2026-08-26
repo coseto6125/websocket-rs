@@ -210,9 +210,17 @@ pub(crate) fn build_handshake(
     hasher.update(accept_src.as_bytes());
     let expected = base64::engine::general_purpose::STANDARD.encode(hasher.finalize());
 
+    // RFC 6874: IPv6 literals stay bracketed in the Host header even though
+    // parse_ws_uri hands us the bare literal.
+    let host_header = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+
     let mut req = format!(
         "GET {path} HTTP/1.1\r\n\
-         Host: {host}:{port}\r\n\
+         Host: {host_header}:{port}\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\n\
