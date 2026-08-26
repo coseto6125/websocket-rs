@@ -15,7 +15,7 @@ pip install websocket-rs
 
 ```python
 # Sync API
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 
 with connect("ws://localhost:8765") as ws:
     ws.send("Hello")
@@ -42,30 +42,40 @@ asyncio.run(main())
 
 ## Sync API
 
-### `websocket_rs.sync_client.connect()`
+### `websocket_rs.sync.client.connect()`
 
-Create and connect to a WebSocket server (blocking).
+Connect to a WebSocket server (blocking). The connection dials immediately —
+the returned object is already connected, with or without a `with` block.
 
 **Signature:**
 ```python
 def connect(
-    url: str,
-    connect_timeout: float = 30.0,
-    receive_timeout: float = 30.0
-) -> WebSocket
+    uri: str,
+    subprotocols: list[str] | None = None,
+    connect_timeout: float | None = None,   # default 10.0
+    receive_timeout: float | None = None,   # default 10.0
+    close_timeout: float | None = None,     # default 10.0
+    tcp_nodelay: bool | None = None,        # default True
+) -> ClientConnection
 ```
 
 **Parameters:**
-- `url` (str): WebSocket server URL (e.g., `"ws://localhost:8765"`)
-- `connect_timeout` (float, optional): Connection timeout in seconds. Default: 30.0
-- `receive_timeout` (float, optional): Receive timeout in seconds. Default: 30.0
+- `uri` (str): WebSocket server URL (e.g., `"ws://localhost:8765"`)
+- `subprotocols` (list[str], optional): Offered as `Sec-WebSocket-Protocol`; negotiated value on `.subprotocol`
+- `connect_timeout` (float, optional): Connection timeout in seconds. Default: 10.0
+- `receive_timeout` (float, optional): Receive timeout in seconds. Default: 10.0
+- `close_timeout` (float, optional): Close-handshake timeout in seconds. Default: 10.0
+- `tcp_nodelay` (bool, optional): Disable Nagle's algorithm. Default: True
+
+Any other keyword argument raises `TypeError`: headers, ssl_context,
+proxy, compression and on_message are native-client features.
 
 **Returns:**
-- `WebSocket`: Connected WebSocket client
+- `ClientConnection`: Connected WebSocket client
 
 **Example:**
 ```python
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 
 # Basic connection
 ws = connect("ws://echo.websocket.org")
@@ -173,15 +183,15 @@ Create and connect to a WebSocket server (async).
 ```python
 async def connect(
     url: str,
-    connect_timeout: float = 30.0,
-    receive_timeout: float = 30.0
+    connect_timeout: float | None = None,   # default 10.0
+    receive_timeout: float | None = None,   # default 10.0
 ) -> AsyncWebSocket
 ```
 
 **Parameters:**
 - `url` (str): WebSocket server URL
-- `connect_timeout` (float, optional): Connection timeout in seconds. Default: 30.0
-- `receive_timeout` (float, optional): Receive timeout in seconds. Default: 30.0
+- `connect_timeout` (float, optional): Connection timeout in seconds. Default: 10.0
+- `receive_timeout` (float, optional): Receive timeout in seconds. Default: 10.0
 
 **Returns:**
 - `AsyncWebSocket`: Connected async WebSocket client
@@ -291,7 +301,7 @@ async with connect("ws://localhost:8765") as ws:
 ### Echo Client (Sync)
 
 ```python
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 
 def echo_client():
     with connect("ws://echo.websocket.org") as ws:
@@ -329,7 +339,7 @@ asyncio.run(echo_client())
 ### Request-Response Pattern (Sync)
 
 ```python
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 import json
 
 def api_request(endpoint, data):
@@ -424,7 +434,7 @@ asyncio.run(main())
 ### Example
 
 ```python
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 
 try:
     with connect("ws://localhost:8765", connect_timeout=5.0) as ws:
@@ -447,7 +457,7 @@ except Exception as e:
 Use **Sync API** for best performance:
 ```python
 # Fastest for request-response
-from websocket_rs.sync_client import connect
+from websocket_rs.sync.client import connect
 ```
 
 ### For High Concurrency / Pipelining

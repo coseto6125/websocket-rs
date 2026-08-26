@@ -147,6 +147,17 @@ For the canonical async `websocket_rs.connect`, `connect_timeout` defaults to
 10 seconds when omitted or set to `None`. `receive_timeout` defaults to `None`,
 which waits indefinitely for each receive operation.
 
+### Proxy and Close Semantics
+
+- `proxy="socks5h://host:port"` (or `socks5://`) routes the connection through
+  a SOCKS5 proxy. Both schemes resolve the target hostname at the **proxy**;
+  use whichever your proxy operator documents.
+- Native client `close()` is fire-and-forget: it writes the close frame and
+  closes the transport immediately. `close_timeout` bounds the close handshake
+  on the sync client only.
+- Every client exposes `subprotocol`, `local_address`, `remote_address` and
+  (native/sync) a `closed` flag; the native client also has `pong()`.
+
 ## 🔧 Advanced Installation
 
 ### From GitHub Releases (Pre-built wheels)

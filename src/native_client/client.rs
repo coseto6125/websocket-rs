@@ -865,6 +865,31 @@ impl NativeClient {
         self.state.borrow().close_reason.clone()
     }
 
+    /// True once the client has torn the connection down; mirrors
+    /// `SyncClientConnection.closed`.
+    #[getter]
+    fn closed(&self) -> bool {
+        self.state.borrow().closed
+    }
+
+    #[getter]
+    fn local_address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.borrow();
+        match state.transport.as_ref() {
+            Some(t) => t.bind(py).call_method1("get_extra_info", ("sockname",)),
+            None => Ok(py.None().into_bound(py)),
+        }
+    }
+
+    #[getter]
+    fn remote_address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = self.state.borrow();
+        match state.transport.as_ref() {
+            Some(t) => t.bind(py).call_method1("get_extra_info", ("peername",)),
+            None => Ok(py.None().into_bound(py)),
+        }
+    }
+
     /// Send a ping frame. Payload must be ≤125 bytes (control-frame limit).
     #[pyo3(signature = (data=None))]
     fn ping(&self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
@@ -884,6 +909,32 @@ impl NativeClient {
             .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
             .clone_ref(py);
         let frame = encode_control_frame(&mut state, OP_PING, &payload);
+        drop(state);
+        transport
+            .bind(py)
+            .call_method1("write", (PyBytes::new(py, &frame),))?;
+        Ok(())
+    }
+
+    /// Send a pong frame proactively. Same limits as `ping`.
+    #[pyo3(signature = (data=None))]
+    fn pong(&self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
+        let payload = data.unwrap_or_default();
+        if payload.len() > 125 {
+            return Err(PyValueError::new_err(
+                "pong payload exceeds 125 bytes (WS control-frame limit)",
+            ));
+        }
+        let mut state = self.state.borrow_mut();
+        if state.closed {
+            return Err(PyRuntimeError::new_err("WebSocket is closed"));
+        }
+        let transport = state
+            .transport
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
+            .clone_ref(py);
+        let frame = encode_control_frame(&mut state, OP_PONG, &payload);
         drop(state);
         transport
             .bind(py)

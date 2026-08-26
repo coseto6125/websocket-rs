@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.8] - 2026-08-26
+
+### Fixed
+
+- **`ws://[::1]:port/...` URIs are now connectable on every client.** `parse_ws_uri` kept the URL crate's bracketed IPv6 literal, and `getaddrinfo("[::1]")` fails — so IPv6 loopback (and any literal IPv6 host) raised `gaierror` before a socket was ever opened. `parse_ws_uri` now strips the brackets; `build_handshake` re-brackets the literal for the `Host` header as RFC 6874 requires. The unit test asserting this had existed since the monolith but was unrunnable (below), so the drift went unnoticed.
+
+- **Rust unit tests revived**: the #44 module split left `mod.rs`'s test imports pointing at pre-split paths (`cargo test --lib` failed with E0432; all 13 tests dead). Imports now name their `codec::` / `protocol::` homes. pyo3's `extension-module` moved behind a default feature so `cargo test --lib --no-default-features` can link libpython; maturin builds keep the default and behave identically. CI now runs the suite in both workflows.
+
+### Changed
+
+- **Sync client dials eagerly**: `websocket_rs.sync.client.connect()` returns a connected client, matching native/async semantics. Re-entering `with` is a no-op instead of re-dialing over the live socket.
+- **Sync client rejects unknown keyword arguments** with `TypeError`. It previously accepted `**kwargs` silently, so `headers=`, `proxy=` etc. disappeared without effect.
+- **Sync client accepts `subprotocols=`**, matching native/async; the negotiated value surfaces on the new `subprotocol` property. Previously a silent no-op.
+
+### Added
+
+- **Native client surface parity**: `NativeClient` gains `pong()` (same 125-byte limit as `ping()`), plus `closed`, `local_address`, `remote_address` properties. `SyncClientConnection` gains `subprotocol` (captured from the handshake response). All three clients now expose the same core introspection surface; differences that remain are deliberate and documented (native close is fire-and-forget, so `close_timeout` applies only to sync).
+
+### Internal
+
+- `scripts/test.sh` no longer references deleted files (`test_monkeypatch.py`, `benchmark_optimized.py`, `benchmark_latency.py`); it runs the same pytest suite as CI. `make bench` points at the existing `tests/bench_ab.py`. Docs corrected: API.md module paths (`websocket_rs.sync.client`), timeout defaults (10.0), README proxy/close semantics. Benchmarks use `inspect.iscoroutinefunction` ahead of the `asyncio` deprecation.
+
 ## [0.7.7] - 2026-08-23
 
 ### Internal

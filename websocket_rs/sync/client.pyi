@@ -6,6 +6,7 @@ class ClientConnection:
     def __init__(
         self,
         url: str,
+        subprotocols: list[str] | None = None,
         connect_timeout: float | None = None,
         receive_timeout: float | None = None,
         close_timeout: float | None = None,
@@ -26,11 +27,15 @@ class ClientConnection:
     @property
     def remote_address(self) -> tuple[str, int] | None: ...
     @property
+    def subprotocol(self) -> str | None: ...
+    @property
     def close_code(self) -> int | None: ...
     @property
     def close_reason(self) -> str | None: ...
 
-    def __enter__(self) -> ClientConnection: ...
+    def __enter__(self) -> ClientConnection:
+        """Re-enters the existing connection; dialing happened in connect()."""
+        ...
     def __exit__(
         self,
         exc_type: type[BaseException] | None = None,
@@ -42,20 +47,26 @@ class ClientConnection:
 
 def connect(
     uri: str,
+    subprotocols: list[str] | None = None,
     connect_timeout: float | None = None,
     receive_timeout: float | None = None,
     close_timeout: float | None = None,
     tcp_nodelay: bool | None = None,
-    **kwargs: object,
 ) -> ClientConnection:
-    """Create a sync WebSocket client connection.
+    """Create a connected sync WebSocket client (dials immediately).
 
     Args:
         uri: WebSocket server URL (e.g., ``"ws://localhost:8765"``).
+        subprotocols: Protocols to offer via Sec-WebSocket-Protocol; the
+            negotiated value lands on :attr:`ClientConnection.subprotocol`.
         connect_timeout: Connection timeout in seconds. Default: 10.0.
         receive_timeout: Receive timeout in seconds. Default: 10.0.
         close_timeout: Close handshake timeout in seconds. Default: 10.0.
         tcp_nodelay: Disable Nagle's algorithm. Default: True.
-        **kwargs: Accepted for compatibility.
+
+    Raises:
+        TypeError: on any other keyword argument — headers, proxy,
+            ssl_context, compression and on_message are native-client
+            features; the sync client never accepted them silently.
     """
     ...

@@ -8,6 +8,7 @@ Set BENCH_JSONL=1 to emit exact counts and RPS as JSON Lines.
 """
 
 import asyncio
+import inspect
 import gc
 import json
 import os
@@ -293,7 +294,7 @@ async def main():
             cells = []
             for name, fn in enabled:
                 try:
-                    if asyncio.iscoroutinefunction(fn):
+                    if inspect.iscoroutinefunction(fn):
                         n = await run_one_async(fn, size, DURATION)
                     else:
                         n = await asyncio.to_thread(run_one_sync, fn, size, DURATION)

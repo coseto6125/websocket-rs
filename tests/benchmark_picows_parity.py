@@ -16,6 +16,7 @@ Run:
 """
 
 import asyncio
+import inspect
 import gc
 import json
 import multiprocessing as mp
@@ -357,7 +358,7 @@ async def run_matrix(label: str):
         cells = []
         for name, fn in enabled:
             try:
-                if asyncio.iscoroutinefunction(fn):
+                if inspect.iscoroutinefunction(fn):
                     n = await run_one_async(fn, size, DURATION)
                 else:
                     n = await asyncio.to_thread(run_one_sync, fn, size, DURATION)
