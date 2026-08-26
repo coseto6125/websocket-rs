@@ -340,9 +340,15 @@ impl SyncClientConnection {
                 );
             }
             let uri = request.uri().clone();
+            // http keeps IPv6 brackets in host(); both to_socket_addrs and
+            // rustls' ServerName need the bare literal.
             let host = uri
                 .host()
-                .ok_or_else(|| PyConnectionError::new_err("Missing host in URL"))?
+                .ok_or_else(|| PyConnectionError::new_err("Missing host in URL"))?;
+            let host = host
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(host)
                 .to_string();
             let is_tls = uri.scheme_str() == Some("wss");
             let port = uri.port_u16().unwrap_or(if is_tls { 443 } else { 80 });

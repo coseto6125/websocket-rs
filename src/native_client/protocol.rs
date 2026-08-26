@@ -282,3 +282,30 @@ pub(crate) fn decompress_message(
         .map_err(|e| ProtocolCoreError(format!("deflate decode error: {e}")))?;
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_handshake_ipv6_host_header_rebrackets_bare_literal() {
+        // parse_ws_uri hands us the bare literal; the wire needs [::1].
+        let (req, _) = build_handshake("::1", 8860, "/path", &[], &[], false);
+        let req = std::str::from_utf8(&req).unwrap();
+        assert!(
+            req.contains("Host: [::1]:8860\r\n"),
+            "Host header must re-bracket IPv6 literals, got: {req}"
+        );
+        assert!(!req.contains("Host: ::1:"), "bare literal must not leak");
+    }
+
+    #[test]
+    fn test_build_handshake_ipv4_and_hostname_untouched() {
+        for host in ["127.0.0.1", "example.com"] {
+            let (req, _) = build_handshake(host, 80, "/", &[], &[], false);
+            let req = std::str::from_utf8(&req).unwrap();
+            assert!(req.contains(&format!("Host: {host}:80\r\n")));
+            assert!(!req.contains("["), "no brackets expected for {host}");
+        }
+    }
+}
