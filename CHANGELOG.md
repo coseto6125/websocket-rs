@@ -9,15 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`ws://[::1]:port/...` URIs are now connectable on every client.** `parse_ws_uri` kept the URL crate's bracketed IPv6 literal, and `getaddrinfo("[::1]")` fails — so IPv6 loopback (and any literal IPv6 host) raised `gaierror` before a socket was ever opened. `parse_ws_uri` now strips the brackets; `build_handshake` re-brackets the literal for the `Host` header as RFC 6874 requires. The unit test asserting this had existed since the monolith but was unrunnable (below), so the drift went unnoticed.
+- **`ws://[::1]:port/...` URIs are now connectable on every client.** `parse_ws_uri` kept the URL crate's bracketed IPv6 literal, and `getaddrinfo("[::1]")` fails — so IPv6 loopback (and any literal IPv6 host) raised `gaierror` before a socket was ever opened. `parse_ws_uri` now strips the brackets; `build_handshake` re-brackets the literal for the `Host` header as RFC 6874 requires. The sync client had the same failure through a second path — `http::Uri::host()` keeps the brackets, so its dialer fed `"[::1]"` to `getaddrinfo` and rustls; both now get the bare literal. The unit test asserting this had existed since the monolith but was unrunnable (below), so the drift went unnoticed.
 
-- **Rust unit tests revived**: the #44 module split left `mod.rs`'s test imports pointing at pre-split paths (`cargo test --lib` failed with E0432; all 13 tests dead). Imports now name their `codec::` / `protocol::` homes. pyo3's `extension-module` moved behind a default feature so `cargo test --lib --no-default-features` can link libpython; maturin builds keep the default and behave identically. CI now runs the suite in both workflows.
+- **Rust unit tests revived**: the #44 module split left `mod.rs`'s test imports pointing at pre-split paths (`cargo test --lib` failed with E0432; all 13 pre-existing tests dead, plus two new `build_handshake` Host-header tests). Imports now name their `codec::` / `protocol::` homes. pyo3's `extension-module` moved behind a default feature so `cargo test --lib --no-default-features` can link libpython; maturin builds keep the default and behave identically. CI now runs the suite in both workflows.
 
 ### Changed
 
 - **Sync client dials eagerly**: `websocket_rs.sync.client.connect()` returns a connected client, matching native/async semantics. Re-entering `with` is a no-op instead of re-dialing over the live socket.
 - **Sync client rejects unknown keyword arguments** with `TypeError`. It previously accepted `**kwargs` silently, so `headers=`, `proxy=` etc. disappeared without effect.
-- **Sync client accepts `subprotocols=`**, matching native/async; the negotiated value surfaces on the new `subprotocol` property. Previously a silent no-op.
+- **Sync client accepts `subprotocols=`**, matching native/async; the negotiated value surfaces on the new `subprotocol` property. Previously a silent no-op. On `SyncClientConnection` and `sync.client.connect()` it sits **last** in the parameter list; keyword callers are unaffected.
+- **Sync `ping()`/`pong()` reject payloads over 125 bytes** with `ValueError`, matching native. tungstenite only validates control-frame size on read, so oversized pings used to go on the wire until an RFC-compliant server killed the connection with 1002.
 
 ### Added
 

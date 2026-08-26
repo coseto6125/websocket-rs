@@ -76,6 +76,8 @@ jobs:
         run: |
           export PYO3_PYTHON="$(which python3)"
           export LD_LIBRARY_PATH="$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # dyld ignores LD_LIBRARY_PATH; give macOS the same search path.
+          export DYLD_FALLBACK_LIBRARY_PATH="$LD_LIBRARY_PATH"
           cargo test --lib --no-default-features
 
       - name: Run rustfmt

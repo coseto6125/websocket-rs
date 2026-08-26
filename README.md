@@ -155,8 +155,8 @@ which waits indefinitely for each receive operation.
 - Native client `close()` is fire-and-forget: it writes the close frame and
   closes the transport immediately. `close_timeout` bounds the close handshake
   on the sync client only.
-- Every client exposes `subprotocol`, `local_address`, `remote_address` and
-  (native/sync) a `closed` flag; the native client also has `pong()`.
+- Every client exposes `subprotocol`, `local_address`, `remote_address`,
+  a `closed` flag and `pong()`.
 
 ## 🔧 Advanced Installation
 

@@ -26,10 +26,12 @@ import time
 # ---------- Tiny self-contained SOCKS5 no-auth proxy ----------
 
 
-def _serve_socks5(port: int, ready: threading.Event, fragment_replies: bool = False):
+def _serve_socks5(port: int, ready: threading.Event, fragment_replies: bool = False, bound: list | None = None):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
+    if bound is not None:
+        bound.append(srv.getsockname()[1])
     srv.listen(64)
     ready.set()
     while True:
@@ -107,10 +109,12 @@ def _handle_socks5(conn: socket.socket, fragment_replies: bool = False):
             pass
 
 
-def _serve_tcp_target(port: int, ready: threading.Event):
+def _serve_tcp_target(port: int, ready: threading.Event, bound: list | None = None):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
+    if bound is not None:
+        bound.append(srv.getsockname()[1])
     srv.listen(64)
     ready.set()
     while True:
@@ -232,12 +236,16 @@ def summary(label: str, lats: list[float]):
 
 
 async def main():
+    global SOCKS5_PORT, TARGET_PORT
     sock_ready = threading.Event()
     tgt_ready = threading.Event()
-    threading.Thread(target=_serve_socks5, args=(SOCKS5_PORT, sock_ready), daemon=True).start()
-    threading.Thread(target=_serve_tcp_target, args=(TARGET_PORT, tgt_ready), daemon=True).start()
+    # Port 0 kills the TIME_WAIT flake between consecutive runs.
+    bound: list[int] = []
+    threading.Thread(target=_serve_socks5, args=(0, sock_ready), kwargs={"bound": bound}, daemon=True).start()
+    threading.Thread(target=_serve_tcp_target, args=(0, tgt_ready), kwargs={"bound": bound}, daemon=True).start()
     sock_ready.wait(2)
     tgt_ready.wait(2)
+    SOCKS5_PORT, TARGET_PORT = bound[0], bound[1]
     await asyncio.sleep(0.1)
 
     N = 200

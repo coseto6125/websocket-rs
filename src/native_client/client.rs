@@ -874,8 +874,15 @@ impl NativeClient {
 
     #[getter]
     fn local_address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.borrow();
-        match state.transport.as_ref() {
+        // Clone the transport out first: call_method1 may run arbitrary
+        // Python, which must not reenter a live RefCell borrow.
+        let transport = self
+            .state
+            .borrow()
+            .transport
+            .as_ref()
+            .map(|t| t.clone_ref(py));
+        match transport {
             Some(t) => t.bind(py).call_method1("get_extra_info", ("sockname",)),
             None => Ok(py.None().into_bound(py)),
         }
@@ -883,8 +890,13 @@ impl NativeClient {
 
     #[getter]
     fn remote_address<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = self.state.borrow();
-        match state.transport.as_ref() {
+        let transport = self
+            .state
+            .borrow()
+            .transport
+            .as_ref()
+            .map(|t| t.clone_ref(py));
+        match transport {
             Some(t) => t.bind(py).call_method1("get_extra_info", ("peername",)),
             None => Ok(py.None().into_bound(py)),
         }

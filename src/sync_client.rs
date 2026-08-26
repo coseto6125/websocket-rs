@@ -285,14 +285,14 @@ pub struct SyncClientConnection {
 #[pymethods]
 impl SyncClientConnection {
     #[new]
-    #[pyo3(signature = (url, subprotocols=None, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None))]
+    #[pyo3(signature = (url, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None, subprotocols=None))]
     fn new(
         url: String,
-        subprotocols: Option<Vec<String>>,
         connect_timeout: Option<f64>,
         receive_timeout: Option<f64>,
         close_timeout: Option<f64>,
         tcp_nodelay: Option<bool>,
+        subprotocols: Option<Vec<String>>,
     ) -> Self {
         SyncClientConnection {
             url,
@@ -535,6 +535,11 @@ impl SyncClientConnection {
 
     fn ping(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
+        if data.len() > 125 {
+            return Err(PyValueError::new_err(
+                "ping payload exceeds 125 bytes (WS control-frame limit)",
+            ));
+        }
         py.detach(|| {
             let ws = self
                 .ws
@@ -547,6 +552,11 @@ impl SyncClientConnection {
 
     fn pong(&mut self, py: Python<'_>, data: Option<Vec<u8>>) -> PyResult<()> {
         let data = data.unwrap_or_default();
+        if data.len() > 125 {
+            return Err(PyValueError::new_err(
+                "pong payload exceeds 125 bytes (WS control-frame limit)",
+            ));
+        }
         py.detach(|| {
             let ws = self
                 .ws
@@ -630,23 +640,23 @@ impl SyncClientConnection {
 // never disappear into a silent sink. headers/subprotocols/ssl_context/proxy/
 // compression/on_message are native-client features.
 #[pyfunction]
-#[pyo3(signature = (uri, subprotocols=None, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None))]
+#[pyo3(signature = (uri, connect_timeout=None, receive_timeout=None, close_timeout=None, tcp_nodelay=None, subprotocols=None))]
 pub fn connect(
     py: Python<'_>,
     uri: String,
-    subprotocols: Option<Vec<String>>,
     connect_timeout: Option<f64>,
     receive_timeout: Option<f64>,
     close_timeout: Option<f64>,
     tcp_nodelay: Option<bool>,
+    subprotocols: Option<Vec<String>>,
 ) -> PyResult<SyncClientConnection> {
     let mut conn = SyncClientConnection::new(
         uri,
-        subprotocols,
         connect_timeout,
         receive_timeout,
         close_timeout,
         tcp_nodelay,
+        subprotocols,
     );
     conn.__connect(py)?;
     Ok(conn)

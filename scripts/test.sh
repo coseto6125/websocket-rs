@@ -17,7 +17,7 @@ source .venv/bin/activate || . .venv/Scripts/activate
 # Install dependencies
 echo "📦 Installing dependencies..."
 uv pip install --upgrade pip
-uv pip install maturin pytest websockets
+uv pip install maturin pytest pytest-asyncio websockets
 
 # Build the Rust extension
 echo "🔨 Building websocket-rs..."

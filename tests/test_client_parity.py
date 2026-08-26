@@ -244,6 +244,18 @@ async def test_pong_payload_limit_matches_ping_guard(echo_server):
         ws.close()
 
 
+def test_sync_pong_payload_limit_matches_native(echo_server):
+    """Same control-frame guard on the sync client; no silent RFC violation."""
+    ws = sync_connect(f"ws://127.0.0.1:{echo_server.v4}")
+    try:
+        with pytest.raises(ValueError, match="125 bytes"):
+            ws.pong(b"x" * 126)
+        with pytest.raises(ValueError, match="125 bytes"):
+            ws.ping(b"x" * 126)
+    finally:
+        ws.close()
+
+
 @pytest.mark.asyncio
 async def test_pong_after_close_raises_runtime_error(echo_server):
     """Closed client -> explicit error, not a silent drop."""

@@ -6,11 +6,11 @@ class ClientConnection:
     def __init__(
         self,
         url: str,
-        subprotocols: list[str] | None = None,
         connect_timeout: float | None = None,
         receive_timeout: float | None = None,
         close_timeout: float | None = None,
         tcp_nodelay: bool | None = None,
+        subprotocols: list[str] | None = None,
     ) -> None: ...
     def send(self, message: str | bytes) -> None: ...
     def recv(self) -> str | bytes: ...
@@ -34,7 +34,7 @@ class ClientConnection:
     def close_reason(self) -> str | None: ...
 
     def __enter__(self) -> ClientConnection:
-        """Re-enters the existing connection; dialing happened in connect()."""
+        """Re-enter an open connection; dials again only if it was closed."""
         ...
     def __exit__(
         self,
@@ -47,11 +47,11 @@ class ClientConnection:
 
 def connect(
     uri: str,
-    subprotocols: list[str] | None = None,
     connect_timeout: float | None = None,
     receive_timeout: float | None = None,
     close_timeout: float | None = None,
     tcp_nodelay: bool | None = None,
+    subprotocols: list[str] | None = None,
 ) -> ClientConnection:
     """Create a connected sync WebSocket client (dials immediately).
 

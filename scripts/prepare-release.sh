@@ -86,7 +86,6 @@ fi
 
 maturin develop --release
 python tests/test_compatibility.py
-python tests/test_monkeypatch.py
 
 echo -e "\n${GREEN}✅ Tests passed!${NC}"
 

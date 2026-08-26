@@ -40,7 +40,7 @@ test: build
 
 # Run the paired A/B benchmark harness
 bench: build
-	@echo "📊 Running benchmarks..."
+	@echo "📊 Benchmark harness usage (run a scenario to actually benchmark):"
 	. .venv/bin/activate && python tests/bench_ab.py --help
 
 # Build the echo servers the A/B harness drives

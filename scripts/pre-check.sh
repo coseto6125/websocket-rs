@@ -124,15 +124,6 @@ else
     FAILED=1
 fi
 
-# Monkeypatch tests (allow warnings)
-echo -e "  Running monkeypatch tests..."
-if python tests/test_monkeypatch.py 2>&1 | grep -q "FAILED"; then
-    echo -e "  ${YELLOW}⚠ Monkeypatch tests have issues (non-critical)${NC}"
-    WARNINGS=1
-else
-    echo -e "  ${GREEN}✓ Monkeypatch tests passed${NC}"
-fi
-
 # 9. Check Python code with ruff (if installed)
 print_section "Python Linting"
 
