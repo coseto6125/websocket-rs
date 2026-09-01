@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.9] - 2026-09-01
+
+### Fixed
+
+- **A signal delivered during the sync client's handshake no longer fails the connection with a phantom `read deadline elapsed` (#34 regression).** `SignalAwareTcpStream::read` switched `enforce_read_deadline` on after every `EINTR` retry, but only `recv()` calls `begin_read_deadline` — during connect and close, `read_deadline` is `None`, so the next loop iteration hit `apply_remaining_read_timeout`'s `ok_or_else` and returned `TimedOut` without ever touching the socket. Any signal that arrived while the client waited for the 101 response (SIGCHLD from a child process, a profiler's SIGPROF, an application's own timers) surfaced as `ConnectionError: WebSocket handshake failed: IO error: read deadline elapsed`, and the flag stayed on for the rest of the connection. It now tracks the deadline it enforces: `self.enforce_read_deadline = self.read_deadline.is_some()`. Present since 0.7.3; 0.7.8's eager sync dial widened the window enough to break CI on `ubuntu-24.04-arm` / Python 3.14 (`test_client_parity.py::test_subprotocol_negotiated_parity_all_clients` and `test_compatibility.py::test_rust_sync_api`, both green on every other matrix cell). Covered by `test_sync_connect_eintr_during_handshake_does_not_fake_a_timeout`, which drives a 0.3 s delayed handshake under a 100 Hz SIGUSR1 storm and fails on 0.7.8 with the exact CI error.
+
 ## [0.7.8] - 2026-08-26
 
 ### Fixed

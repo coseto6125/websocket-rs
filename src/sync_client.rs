@@ -127,7 +127,9 @@ impl Read for SignalAwareTcpStream {
             match self.stream.read(buf) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                     check_python_signals()?;
-                    self.enforce_read_deadline = true;
+                    // Only recv() begins a deadline. Enforcing one that was
+                    // never begun makes the retry read a bogus timeout.
+                    self.enforce_read_deadline = self.read_deadline.is_some();
                 }
                 result => return result,
             }

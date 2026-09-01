@@ -235,6 +235,79 @@ def test_sync_recv_eintr_propagates_keyboard_interrupt():
         signal.signal(signal.SIGINT, previous_handler)
 
 
+def _serve_delayed_handshake(listener, delay):
+    """Complete one WebSocket handshake, but only after `delay` seconds."""
+    listener.settimeout(5)  # never block the thread forever on a client that never dials
+    conn, _ = listener.accept()
+    with conn:
+        request = b""
+        while b"\r\n\r\n" not in request:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            request += chunk
+        time.sleep(delay)
+        conn.sendall(
+            "\r\n".join([
+                "HTTP/1.1 101 Switching Protocols",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                f"Sec-WebSocket-Accept: {_ws_accept_key(request)}",
+                "",
+                "",
+            ]).encode()
+        )
+        conn.recv(4096)  # hold the connection open until the client closes
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR1"), reason="SIGUSR1 is unavailable")
+def test_sync_connect_eintr_during_handshake_does_not_fake_a_timeout():
+    """No deadline is begun before recv(), so an interrupted handshake read
+    must resume instead of reporting `read deadline elapsed`."""
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    server_errors = []
+
+    def serve():
+        try:
+            _serve_delayed_handshake(listener, delay=0.3)
+        except Exception as exc:  # surfaced below, never swallowed
+            server_errors.append(exc)
+
+    previous_handler = signal.signal(signal.SIGUSR1, lambda *_: None)
+    stop = threading.Event()
+    signals_sent = 0
+
+    def send_signals():
+        nonlocal signals_sent
+        while not stop.wait(0.01):
+            os.kill(os.getpid(), signal.SIGUSR1)
+            signals_sent += 1
+
+    server_thread = threading.Thread(target=serve, daemon=True)
+    server_thread.start()
+    signal_thread = threading.Thread(target=send_signals, daemon=True)
+    signal_thread.start()
+    try:
+        with websocket_rs.sync.client.ClientConnection(
+            f"ws://127.0.0.1:{port}", connect_timeout=5.0, receive_timeout=1.0
+        ) as ws:
+            assert ws.remote_address[1] == port
+    finally:
+        stop.set()
+        signal_thread.join(timeout=1)
+        server_thread.join(timeout=5)
+        listener.close()
+        signal.signal(signal.SIGUSR1, previous_handler)
+
+    assert signals_sent > 0
+    assert server_errors == [], f"server failed: {server_errors}"
+
+
 async def test_async_send_after_close():
     """Async: sending after close should raise RuntimeError."""
     ws = await websocket_rs.async_client.connect("ws://localhost:8766")
