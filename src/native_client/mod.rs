@@ -244,10 +244,13 @@ mod tests {
 
     use bytes::BytesMut;
 
-    use super::codec::{parse_header, walk_frames, ScanOutcome, VisitOutcome, OP_BINARY, OP_PING};
+    use super::codec::{
+        parse_header, walk_frames, ScanOutcome, VisitOutcome, MAX_FRAME_SIZE, OP_BINARY, OP_PING,
+    };
     use super::parse_ws_uri;
     use super::protocol::{
-        emit_protocol_events, EventFlow, HandshakeOutcome, ProtocolCore, ProtocolEvent,
+        decompress_message, emit_protocol_events, EventFlow, HandshakeOutcome, ProtocolCore,
+        ProtocolEvent,
     };
 
     struct CoreState {
@@ -359,6 +362,77 @@ mod tests {
         assert_eq!(outcome, ScanOutcome::Fallback { consumed: 0 });
     }
 
+    /// Binary frame header declaring a payload length of `u64::MAX`: with
+    /// overflow checks off, `hdr + plen` used to wrap and index past the
+    /// buffer, aborting the process under `panic = "abort"`.
+    const OVERSIZED_FRAME: [u8; 12] = [
+        0x82, 0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x02,
+    ];
+
+    #[test]
+    fn test_walk_frames_oversized_length_falls_back_without_visiting() {
+        let mut visited = false;
+
+        let outcome = walk_frames(&OVERSIZED_FRAME, |_| {
+            visited = true;
+            Ok::<_, ()>(VisitOutcome::Continue)
+        })
+        .unwrap();
+
+        assert!(!visited);
+        assert_eq!(outcome, ScanOutcome::Fallback { consumed: 0 });
+    }
+
+    #[test]
+    fn test_protocol_core_oversized_frame_emits_1009_before_buffering() {
+        let core = frame_core(&OVERSIZED_FRAME);
+
+        let event = core.borrow_mut().core().next_event().unwrap();
+
+        assert!(matches!(
+            event,
+            ProtocolEvent::ProtocolError { code: 1009, .. }
+        ));
+    }
+
+    #[test]
+    fn test_protocol_core_fragments_over_message_cap_emit_1009() {
+        // First fragment: 1 byte, then a continuation declaring 64 MiB; the
+        // sum crosses MAX_MESSAGE_SIZE before any payload bytes arrive.
+        let mut data = vec![0x02, 0x01, b'a', 0x80, 0x7F];
+        data.extend_from_slice(&(64u64 << 20).to_be_bytes());
+        let core = frame_core(&data);
+
+        let event = core.borrow_mut().core().next_event().unwrap();
+
+        assert!(matches!(
+            event,
+            ProtocolEvent::ProtocolError { code: 1009, .. }
+        ));
+    }
+
+    #[test]
+    fn test_decompress_message_inflating_past_message_cap_emits_1009() {
+        // 64 MiB + 1 of zeros deflates to a few KiB; the inflated size is what
+        // must trip the cap, not the on-wire frame length.
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        let zeros = vec![0u8; 1 << 20];
+        for _ in 0..64 {
+            std::io::Write::write_all(&mut encoder, &zeros).unwrap();
+        }
+        std::io::Write::write_all(&mut encoder, &[0u8]).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < MAX_FRAME_SIZE);
+
+        let event = decompress_message(true, &compressed).unwrap_err();
+
+        assert!(matches!(
+            event,
+            ProtocolEvent::ProtocolError { code: 1009, .. }
+        ));
+    }
+
     #[test]
     fn test_protocol_handshake_accepts_subprotocol_and_compression() {
         let mut state = CoreState {
@@ -420,11 +494,14 @@ mod tests {
     fn test_protocol_core_continuation_without_fragment_emits_protocol_error() {
         let core = frame_core(b"\x80\x01x");
 
-        let event = core.borrow_mut().core().next_event().unwrap().unwrap();
+        let event = core.borrow_mut().core().next_event().unwrap();
 
         assert!(matches!(
             event,
-            ProtocolEvent::ProtocolError("continuation frame without fragmented message")
+            ProtocolEvent::ProtocolError {
+                code: 1002,
+                reason: "continuation frame without fragmented message"
+            }
         ));
     }
 
@@ -432,7 +509,7 @@ mod tests {
     fn test_protocol_core_close_emits_code_and_reason() {
         let core = frame_core(b"\x88\x05\x03\xe9bye");
 
-        let event = core.borrow_mut().core().next_event().unwrap().unwrap();
+        let event = core.borrow_mut().core().next_event().unwrap();
 
         assert!(matches!(
             event,

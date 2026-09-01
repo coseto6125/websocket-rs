@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "websocket-rs"
-version = "0.7.9"
+version = "0.7.10"
 description = "High-performance WebSocket client library for Python using Rust"
 readme = "README.pypi.md"
 authors = [
@@ -86,7 +86,6 @@ dev = [
     "pytest>=7.0",
     "websockets>=12.0",
     "ruff>=0.1.0",
-    "websocket",
     "uvloop>=0.22.1; sys_platform != 'win32'",
     # rloop + granian are optional benchmark-only deps; Windows wheels aren't
     # published and the native crates use Unix-only fd primitives.

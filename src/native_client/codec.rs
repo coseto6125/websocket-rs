@@ -109,6 +109,16 @@ unsafe fn copy_masked_avx512(dst: &mut [u8], src: &[u8], mask: [u8; 4]) {
 /// Minimum bytes needed before a frame header can be (potentially) fully parsed.
 pub(crate) const MIN_HDR: usize = 2;
 
+/// Largest payload one frame may declare; a larger length fails the
+/// connection with close code 1009. Matches tungstenite's `max_frame_size`
+/// so the sync and native clients reject the same peers. The check also
+/// keeps `hdr + plen` from wrapping when the 64-bit length has its MSB set
+/// (release builds run with overflow checks off).
+pub(crate) const MAX_FRAME_SIZE: usize = 16 << 20;
+/// Largest reassembled fragmented message; matches tungstenite's
+/// `max_message_size`.
+pub(crate) const MAX_MESSAGE_SIZE: usize = 64 << 20;
+
 /// Parse a single server frame header (no mask — server->client frames are never masked).
 /// Returns (fin, opcode, payload_len, header_size) or None if not enough data.
 pub(crate) fn parse_header(buf: &[u8]) -> Option<(bool, bool, u8, usize, usize)> {
@@ -187,6 +197,10 @@ pub(crate) fn walk_frames<'a, E>(
 ) -> Result<ScanOutcome, E> {
     let mut off = 0usize;
     while let Some((fin, rsv1, opcode, plen, hdr)) = parse_header(&data[off..]) {
+        // Oversized frames take the slow path, which owns the 1009 close.
+        if plen > MAX_FRAME_SIZE {
+            return Ok(ScanOutcome::Fallback { consumed: off });
+        }
         if data.len() - off < hdr + plen {
             return Ok(ScanOutcome::Partial {
                 consumed: off,

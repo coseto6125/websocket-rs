@@ -179,6 +179,52 @@ def test_sync_send_exact_bytes_owner_survives_allocator_pressure():
     assert churn_cycles > 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param("ascii payload", id="ascii-compact"),
+        pytest.param("中文 payload ✓", id="non-ascii-utf8-slot"),
+        pytest.param("x" * 100_000, id="large-ascii"),
+        pytest.param("é" * 100_000, id="large-non-ascii"),
+    ],
+)
+def test_sync_send_str_owner_round_trips(payload):
+    """The text send path hands tungstenite the str's own UTF-8 buffer (inline
+    for compact ASCII, the `utf8` slot otherwise); both must echo back intact."""
+    with sync_connect("ws://localhost:8765") as ws:
+        ws.send(payload)
+        assert ws.recv() == payload
+
+
+def test_sync_send_str_owner_survives_allocator_pressure():
+    stop = threading.Event()
+    churn_cycles = 0
+
+    def churn_allocator():
+        nonlocal churn_cycles
+        while not stop.is_set():
+            blocks = [("z" * (64 * 1024)) + str(cycle) for cycle in range(8)]
+            churn_cycles += 1
+            del blocks
+
+    churn_thread = threading.Thread(target=churn_allocator, daemon=True)
+    churn_thread.start()
+    try:
+        with sync_connect("ws://localhost:8765") as ws:
+            for marker in range(16):
+                expected = chr(0x4E00 + marker) * (128 * 1024)
+                payload = "".join(list(expected))
+                assert payload is not expected
+                ws.send(payload)
+                del payload
+                assert ws.recv() == expected
+    finally:
+        stop.set()
+        churn_thread.join(timeout=2)
+
+    assert churn_cycles > 0
+
+
 async def test_python_async_api():
     """測試 Python 原生 async API"""
     print("測試 Python websockets 異步 API...")

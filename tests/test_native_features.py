@@ -56,6 +56,7 @@ def test_native_client_python_visibility_exposes_only_protocol_hooks():
     ):
         assert not hasattr(NativeClient, helper)
 
+
 def _server_frame(first_byte, payload):
     if len(payload) <= 125:
         return bytes([first_byte, len(payload)]) + payload
@@ -755,6 +756,28 @@ def test_protocol_error_for_unmatched_continuation_frame():
     t.join(timeout=2)
     assert captured
     assert _decode_client_frame(captured[0]) == (0x8, (1002).to_bytes(2, "big"))
+
+
+@pytest.mark.parametrize("path", ["buffered", "pybytes", "bytearray"])
+def test_oversized_frame_length_closes_1009_instead_of_aborting(path):
+    """A header declaring a 2^64-1 payload used to wrap `hdr + plen` and abort
+    the process; every receive path now fails the connection with 1009."""
+    port = 8855 + ["buffered", "pybytes", "bytearray"].index(path)
+    captured = []
+    oversized = bytes([0x82, 0x7F]) + ((1 << 64) - 1).to_bytes(8, "big") + b"\x01\x02"
+    t = _start_raw_ws_server(port, [], capture_client_data=captured)
+
+    async def run():
+        ws = await connect(f"ws://127.0.0.1:{port}")
+        _feed_client(ws, oversized, path)
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(ws.recv(), timeout=2)
+        assert ws.close_code == 1009
+
+    asyncio.run(run())
+    t.join(timeout=2)
+    assert captured
+    assert _decode_client_frame(captured[0]) == (0x8, (1009).to_bytes(2, "big"))
 
 
 def test_protocol_error_for_new_data_frame_during_fragment():

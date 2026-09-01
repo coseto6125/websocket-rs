@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.10] - 2026-09-02
+
+### Fixed
+
+- **A frame header declaring a payload over 2^63 bytes no longer aborts the process.** `parse_header` took the 64-bit length as-is and `hdr + plen` wrapped (release builds run with overflow checks off), so `walk_frames` sliced past the buffer, panicked, and `panic = "abort"` took the whole interpreter down with SIGABRT: twelve bytes from a hostile or broken server, `82 7F FF FF FF FF FF FF FF FF 01 02`, were enough. Lengths that did not wrap were no better: `next_frame_needed` became unsatisfiable and `recv_buf` grew without bound waiting for a payload that never arrives. The native client now enforces the same caps as tungstenite in the sync client: 16 MiB per frame (`MAX_FRAME_SIZE`) and 64 MiB per reassembled message (`MAX_MESSAGE_SIZE`), checked before any payload is buffered, and fails the connection with close code 1009 (Message Too Big) instead of 1002. The message cap also bounds permessage-deflate output: DEFLATE inflates up to 1032:1, so a 1 MiB compressed frame of zeros used to `read_to_end` towards 1 GiB and abort on allocation failure; `decompress_message` now reads through `take(MAX_MESSAGE_SIZE + 1)` and closes with 1009 past the cap. Its other two failures (compressed frame without a negotiated extension, undecodable DEFLATE) used to surface as a `RuntimeError` thrown out of `data_received` into the event loop's exception handler with the socket left open; they now close with 1002 like every other protocol error, which let `ProtocolCoreError` / `EmitError` go. `ProtocolEvent::ProtocolError` carries the close code. Covered on all three receive paths (`data_received` with `bytes` and `bytearray`, `BufferedProtocol`) by `test_oversized_frame_length_closes_1009_instead_of_aborting` (verified against the 0.7.9 build: SIGABRT, exit 134), plus unit tests for `walk_frames`, `next_event`, the fragment sum, and the inflate cap.
+
+### Changed
+
+- **Hot-path allocations deleted, no behaviour change.** Every item keeps the same wire output. Merged under the documented micro-optimization exception: the +2% performance gate was **not** met on any cell, and this entry must not be cited as a perf-gate pass. Paired interleaved medians (`tests/bench_ab.py`, 15 rounds unless noted, bootstrap 95% CI; every interval straddles zero, so no cell resolved a direction either way): native plain 256 B +0.43% [-6.16, +1.22], 8 KiB +0.29% [-3.52, +2.09], 100 KiB -0.31% [-1.64, +3.73], 1 MiB -1.38% [-9.12, +3.88] (21 rounds, 8/21 wins); native TLS 256 B +1.05% [-1.65, +5.03], 8 KiB -3.27% [-7.63, +8.30], 100 KiB +1.71% [-3.44, +10.10], 1 MiB -2.44% [-4.83, +2.13]; sync text 256 B -1.78% [-2.68, +2.38], 8 KiB -1.77% [-9.27, +2.79], 64 KiB -0.09% [-2.02, +1.84]; native permessage-deflate 8 KiB +4.28% [-1.37, +7.02] (10/15 wins), 64 KiB -3.54% [-6.41, +7.30]. Peak RSS single-shot, baseline vs candidate: native plain 8 KiB 28388 vs 28424 KiB, sync text 8 KiB 19900 vs 19900 KiB, compressed 8 KiB 28588 vs 28648 KiB. What each item removes is stated from the source, not from those figures.
+  - Native `send()`: `transport.write` is cloned only on the two slow branches that call into Python after the State borrow ends; the full-write `native_send` path no longer pays an INCREF/DECREF per message.
+  - Native `recv()`: the `wait_for` handle is cloned only when `receive_timeout` is set (the default is `None`).
+  - Native `flush_pending_callbacks`: `on_message` is cloned once per drain instead of once per message; close() from inside the callback still stops delivery.
+  - `_ReadyMessage` drops `unsendable`, which removes a `thread::current().id()` check on every backlog hit; its only field is already `Send`.
+  - `decompress_message`: `bufread::DeflateDecoder` over `compressed.chain(&[00 00 FF FF])` reads both slices in place. The old `read::DeflateDecoder` copied the payload once to splice the tail marker in and then allocated a 32 KiB `BufReader` to copy it again.
+  - Sync `send(str)`: the `str`'s own cached UTF-8 buffer is handed to tungstenite through an owner-backed `Utf8Bytes` (the #30 `bytes` owner, generalised to `send_owner::PyBufferOwner<T>` and shared by both paths), so text goes to the wire with one copy (the mask pass) instead of three. Covered by `test_sync_send_str_owner_round_trips` (compact ASCII, non-ASCII `utf8` slot, 100 kB each) and `test_sync_send_str_owner_survives_allocator_pressure`.
+  - Sync `recv()` text: the `Utf8Bytes` tungstenite returns is passed straight to `PyString::new`; it used to be copied into a `String` first.
+  - Handshake: the response is scanned as a borrowed `Cow` with `eq_ignore_ascii_case` on header names (no per-line lowercase allocations); the accept key is hashed with two `update()` calls instead of a `format!`; the sync dialer drops two dead `url` clones, a `Uri` clone, and a host `String` clone; the rustls `ClientConfig` cache uses `get_or_init` (the `set`-then-return pair could build two configs under a race).
+  - `next_event`: the "data frame while fragmented" check runs before the frame is consumed, so the protocol error no longer discards the offending payload first.
+  - Sync getters `local_address` / `remote_address` / `subprotocol` / `close_reason` return borrowed `&str`; the read-deadline error is `io::Error::from(ErrorKind::TimedOut)` (only `.kind()` is ever read).
+  - `futures` removed from `Cargo.toml` (no `futures::` use in `src/`; `futures-util` stays).
+
+### Internal
+
+- The `dev` dependency group listed `websocket` (a 2010 gevent-based PyPI package, a typo for `websockets`, which sits on the line above). Removed, which also drops gevent, greenlet, cffi, pycparser and zope-* from `uv.lock`.
+
 ## [0.7.9] - 2026-09-01
 
 ### Fixed

@@ -7,6 +7,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::Message;
+use tungstenite::Utf8Bytes;
 use tungstenite::WebSocket;
 
 use crate::{
@@ -46,48 +47,59 @@ pub(crate) fn build_rustls_client_config() -> PyResult<std::sync::Arc<rustls::Cl
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let arc = std::sync::Arc::new(config);
-    let _ = CONFIG.set(arc.clone());
-    Ok(arc)
+    Ok(CONFIG.get_or_init(|| std::sync::Arc::new(config)).clone())
 }
 
 enum RecvResult {
-    Text(String),
+    Text(Utf8Bytes),
     Binary(Bytes),
 }
 
-mod send_pybytes_owner {
+mod send_owner {
     use super::*;
 
-    struct SendPyBytesOwner {
-        _bytes: Py<PyBytes>,
+    /// Backs a `Bytes` with a Python object's own immutable buffer, so the
+    /// payload reaches tungstenite's write path with no extraction copy.
+    struct PyBufferOwner<T> {
+        _obj: Py<T>,
         ptr: *const u8,
         len: usize,
     }
 
-    // SAFETY: this owner is constructed only from an exact CPython `bytes`, whose
-    // buffer is immutable and pointer-stable. `_bytes` is an owned reference cloned
-    // while the GIL is held before `py.detach`; it keeps the allocation alive until
-    // tungstenite drops the owner-backed `Bytes`. PyO3 permits `Py<PyBytes>` to cross
+    // SAFETY: `ptr`/`len` describe a buffer owned by `_obj` that CPython keeps
+    // immutable and pointer-stable for the object's lifetime: the payload of an
+    // exact `bytes`, or the UTF-8 cache `to_str()` returns for a `str` (compact
+    // inline or the `utf8` slot). `_obj` is an owned reference cloned while the
+    // GIL is held before `py.detach`; it keeps the allocation alive until
+    // tungstenite drops the owner-backed `Bytes`. PyO3 permits `Py<T>` to cross
     // threads and defers its decref until the GIL can be acquired.
-    unsafe impl Send for SendPyBytesOwner {}
-    unsafe impl Sync for SendPyBytesOwner {}
+    unsafe impl<T> Send for PyBufferOwner<T> {}
+    unsafe impl<T> Sync for PyBufferOwner<T> {}
 
-    impl AsRef<[u8]> for SendPyBytesOwner {
+    impl<T> AsRef<[u8]> for PyBufferOwner<T> {
         fn as_ref(&self) -> &[u8] {
-            // SAFETY: `ptr` and `len` describe the immutable buffer owned by
-            // `_bytes`, which remains alive for this owner's entire lifetime.
+            // SAFETY: see the struct-level invariant above.
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
     }
 
-    pub(super) fn new(bytes: &Bound<'_, PyBytes>) -> Bytes {
-        let data = bytes.as_bytes();
-        Bytes::from_owner(SendPyBytesOwner {
-            _bytes: bytes.clone().unbind(),
+    fn owned<T: 'static>(obj: &Bound<'_, T>, data: &[u8]) -> Bytes {
+        Bytes::from_owner(PyBufferOwner {
+            _obj: obj.clone().unbind(),
             ptr: data.as_ptr(),
             len: data.len(),
         })
+    }
+
+    /// Exact CPython `bytes` only; subclasses may override the buffer.
+    pub(super) fn bytes(bytes: &Bound<'_, PyBytes>) -> Bytes {
+        owned(bytes, bytes.as_bytes())
+    }
+
+    pub(super) fn text(s: &Bound<'_, PyString>) -> PyResult<Utf8Bytes> {
+        let data = s.to_str()?;
+        // SAFETY: `data` came from `to_str()`, so the bytes are valid UTF-8.
+        Ok(unsafe { Utf8Bytes::from_bytes_unchecked(owned(s, data.as_bytes())) })
     }
 }
 
@@ -113,7 +125,7 @@ impl SignalAwareTcpStream {
             .read_deadline
             .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
             .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "read deadline elapsed"))?;
+            .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
         self.stream.set_read_timeout(Some(remaining))
     }
 }
@@ -321,15 +333,15 @@ impl SyncClientConnection {
         if self.ws.is_some() {
             return Ok(());
         }
-        let url = self.url.clone();
         let connect_timeout = self.connect_timeout;
         let receive_timeout = self.receive_timeout;
         let tcp_nodelay = self.tcp_nodelay;
 
         py.detach(|| {
             // Parse URL and resolve address
-            let mut request = url
-                .clone()
+            let mut request = self
+                .url
+                .as_str()
                 .into_client_request()
                 .map_err(|e| PyConnectionError::new_err(format!("Invalid URL: {}", e)))?;
             if !self.subprotocols.is_empty() {
@@ -341,7 +353,7 @@ impl SyncClientConnection {
                         })?,
                 );
             }
-            let uri = request.uri().clone();
+            let uri = request.uri();
             // http keeps IPv6 brackets in host(); both to_socket_addrs and
             // rustls' ServerName need the bare literal.
             let host = uri
@@ -383,10 +395,9 @@ impl SyncClientConnection {
             // with Python's _ssl when both libraries co-exist in process).
             let ws_stream = if is_tls {
                 let config = build_rustls_client_config()?;
-                let server_name =
-                    rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| {
-                        PyConnectionError::new_err(format!("Invalid server name: {}", e))
-                    })?;
+                let server_name = rustls::pki_types::ServerName::try_from(host).map_err(|e| {
+                    PyConnectionError::new_err(format!("Invalid server name: {}", e))
+                })?;
                 let conn = rustls::ClientConnection::new(config, server_name)
                     .map_err(|e| PyConnectionError::new_err(format!("TLS init failed: {}", e)))?;
                 WsStream::tls(conn, tcp)
@@ -433,9 +444,9 @@ impl SyncClientConnection {
 
     fn send<'py>(&mut self, py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<()> {
         let msg = if let Ok(s) = message.cast::<PyString>() {
-            Message::Text(s.to_str()?.into())
+            Message::Text(send_owner::text(s)?)
         } else if let Ok(bytes) = message.cast_exact::<PyBytes>() {
-            Message::Binary(send_pybytes_owner::new(bytes))
+            Message::Binary(send_owner::bytes(bytes))
         } else if let Ok(bytes) = message.extract::<Vec<u8>>() {
             Message::Binary(bytes.into())
         } else {
@@ -471,7 +482,7 @@ impl SyncClientConnection {
                 };
 
                 match msg {
-                    Message::Text(text) => break Ok(RecvResult::Text(text.to_string())),
+                    Message::Text(text) => break Ok(RecvResult::Text(text)),
                     Message::Binary(data) => break Ok(RecvResult::Binary(data)),
                     Message::Ping(_) | Message::Pong(_) => continue,
                     Message::Close(frame) => {
@@ -495,7 +506,7 @@ impl SyncClientConnection {
         })?;
 
         match result {
-            RecvResult::Text(s) => Ok(PyString::new(py, &s).into_any().unbind()),
+            RecvResult::Text(s) => Ok(PyString::new(py, s.as_str()).into_any().unbind()),
             RecvResult::Binary(b) => Ok(PyBytes::new(py, b.as_ref()).into_any().unbind()),
         }
     }
@@ -578,24 +589,24 @@ impl SyncClientConnection {
         self.ws.is_none()
     }
     #[getter]
-    fn local_address(&self) -> Option<(String, u16)> {
-        self.local_addr.clone()
+    fn local_address(&self) -> Option<(&str, u16)> {
+        self.local_addr.as_ref().map(|(h, p)| (h.as_str(), *p))
     }
     #[getter]
-    fn remote_address(&self) -> Option<(String, u16)> {
-        self.remote_addr.clone()
+    fn remote_address(&self) -> Option<(&str, u16)> {
+        self.remote_addr.as_ref().map(|(h, p)| (h.as_str(), *p))
     }
     #[getter]
-    fn subprotocol(&self) -> Option<String> {
-        self.subprotocol.clone()
+    fn subprotocol(&self) -> Option<&str> {
+        self.subprotocol.as_deref()
     }
     #[getter]
     fn close_code(&self) -> Option<u16> {
         self.close_code
     }
     #[getter]
-    fn close_reason(&self) -> Option<String> {
-        self.close_reason.clone()
+    fn close_reason(&self) -> Option<&str> {
+        self.close_reason.as_deref()
     }
 
     fn __enter__<'py>(

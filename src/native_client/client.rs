@@ -104,6 +104,16 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// Owned handle to `transport.write`, cloned only on the slow send paths
+    /// that must call into Python after the State borrow is released.
+    /// `send()` checks presence up front, so the unwrap cannot fail.
+    fn transport_write(&self, py: Python<'_>) -> Py<PyAny> {
+        self.transport_write
+            .as_ref()
+            .expect("send() checked transport_write")
+            .clone_ref(py)
+    }
+
     #[inline]
     fn protocol_core(&mut self) -> ProtocolCore<'_> {
         ProtocolCore {
@@ -125,11 +135,7 @@ impl State {
 /// `__next__`, bypassing asyncio.Future entirely. Used by recv() when a message
 /// is already available in the backlog — saves one create_future + one set_result
 /// per call.
-#[pyclass(
-    name = "_ReadyMessage",
-    module = "websocket_rs.native_client",
-    unsendable
-)]
+#[pyclass(name = "_ReadyMessage", module = "websocket_rs.native_client")]
 pub(crate) struct ReadyMessage {
     result: Option<PyResult<Py<PyAny>>>,
 }
@@ -602,11 +608,9 @@ impl NativeClient {
         if !st.handshake_done {
             return Err(PyRuntimeError::new_err("WebSocket handshake not complete"));
         }
-        let write = st
-            .transport_write
-            .as_ref()
-            .ok_or_else(|| PyRuntimeError::new_err("No transport"))?
-            .clone_ref(py);
+        if st.transport_write.is_none() {
+            return Err(PyRuntimeError::new_err("No transport"));
+        }
         let raw_fd = st.raw_fd;
 
         // Borrow payload as slice — single memcpy into the PyBytes output below.
@@ -744,6 +748,7 @@ impl NativeClient {
                     let n = written as usize;
                     let tail = PyBytes::new(py, &st.send_buf[n..total]);
                     st.buf_known_empty = false;
+                    let write = st.transport_write(py);
                     drop(st);
                     write.bind(py).call1((tail,))?;
                     return Ok(());
@@ -752,6 +757,7 @@ impl NativeClient {
         }
         let out = self.build_merged_frame(py, header, payload, mask_key)?;
         st.buf_known_empty = false;
+        let write = st.transport_write(py);
         drop(st);
         write.bind(py).call1((out,))?;
         Ok(())
@@ -777,8 +783,9 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
-        let wait_for_cached = state.wait_for.as_ref().map(|w| w.clone_ref(py));
         let timeout = state.receive_timeout;
+        let wait_for_cached =
+            timeout.and_then(|_| state.wait_for.as_ref().map(|w| w.clone_ref(py)));
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
@@ -819,8 +826,9 @@ impl NativeClient {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Event loop not bound"))?
             .clone_ref(py);
-        let wait_for_cached = state.wait_for.as_ref().map(|w| w.clone_ref(py));
         let timeout = state.receive_timeout;
+        let wait_for_cached =
+            timeout.and_then(|_| state.wait_for.as_ref().map(|w| w.clone_ref(py)));
         drop(state);
         let fut = create_future.bind(py).call0()?;
         self.state
@@ -1162,26 +1170,34 @@ impl NativeClient {
     /// Drain pending_callback_msgs and invoke the user callback for each.
     /// Must be called with no outstanding borrow on State.
     fn flush_pending_callbacks(&self, py: Python<'_>) -> PyResult<()> {
+        // `on_message` is fixed for the life of the connection (set in
+        // connect(), cleared only by close()), so one clone covers the loop.
+        let cb = {
+            let st = self.state.borrow();
+            if st.pending_callback_msgs.is_empty() {
+                return Ok(());
+            }
+            match st.on_message.as_ref() {
+                Some(c) => c.clone_ref(py),
+                None => return Ok(()),
+            }
+        };
+        let cb = cb.bind(py);
+        // Pop one message at a time; the user callback may push new frames
+        // (e.g. by triggering re-entrant data_received) or call close(),
+        // which clears `on_message` and stops delivery.
         loop {
-            // Pop one message at a time; the user callback may push new frames
-            // (e.g. by triggering re-entrant data_received) — unlikely on
-            // single-thread asyncio but cheap to handle.
-            let (cb, msg) = {
+            let msg = {
                 let mut st = self.state.borrow_mut();
-                if st.pending_callback_msgs.is_empty() {
+                if st.on_message.is_none() {
                     return Ok(());
                 }
-                let msg = match st.pending_callback_msgs.pop_front() {
+                match st.pending_callback_msgs.pop_front() {
                     Some(m) => m,
                     None => return Ok(()),
-                };
-                let cb = match st.on_message.as_ref() {
-                    Some(c) => c.clone_ref(py),
-                    None => return Ok(()),
-                };
-                (cb, msg)
+                }
             };
-            cb.bind(py).call1((msg,))?;
+            cb.call1((msg,))?;
         }
     }
 
@@ -1311,14 +1327,10 @@ impl NativeClient {
             HandshakeOutcome::Complete => {}
         }
 
-        match emit_protocol_events(
+        emit_protocol_events(
             || self.state.borrow_mut().protocol_core().next_event(),
             |event| self.handle_protocol_event(py, event),
-        ) {
-            Ok(()) => Ok(()),
-            Err(EmitError::Core(error)) => Err(PyRuntimeError::new_err(error.0)),
-            Err(EmitError::Sink(error)) => Err(error),
-        }
+        )
     }
 
     #[cold]
@@ -1367,10 +1379,10 @@ impl NativeClient {
                 Self::apply_peer_close(py, pending, transport);
                 Ok(EventFlow::Stop)
             }
-            ProtocolEvent::ProtocolError(reason) => {
+            ProtocolEvent::ProtocolError { code, reason } => {
                 let (pending, transport, frame) = {
                     let mut state = self.state.borrow_mut();
-                    Self::begin_protocol_error(py, &mut state, reason)
+                    Self::begin_protocol_error(py, &mut state, code, reason)
                 };
                 Self::fail_pending(py, pending, reason);
                 if let Some(transport) = transport {
@@ -1442,19 +1454,20 @@ impl NativeClient {
 
     /// Record a local protocol-error close in `state` and hand back the
     /// effects the caller must apply AFTER releasing the State borrow — the
-    /// same reentrancy discipline as `begin_peer_close`, plus the 1002 close
+    /// same reentrancy discipline as `begin_peer_close`, plus the close
     /// frame this end puts on the wire because the peer did not send one.
     fn begin_protocol_error(
         py: Python<'_>,
         state: &mut State,
+        code: u16,
         reason: &str,
     ) -> (VecDeque<Py<PyAny>>, Option<Py<PyAny>>, Vec<u8>) {
-        state.close_code = Some(1002);
+        state.close_code = Some(code);
         state.close_reason = Some(reason.to_string());
         state.closed = true;
         let pending = std::mem::take(&mut state.pending_recv);
         let transport = state.transport.as_ref().map(|t| t.clone_ref(py));
-        let frame = encode_control_frame(state, OP_CLOSE, &1002u16.to_be_bytes());
+        let frame = encode_control_frame(state, OP_CLOSE, &code.to_be_bytes());
         (pending, transport, frame)
     }
 
