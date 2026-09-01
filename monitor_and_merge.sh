@@ -57,20 +57,31 @@ while true; do
     fi
 
     # 檢查 CI 狀態
-    CI_STATUS=$(gh pr checks "$PR_NUMBER" --json state,conclusion -q '.[].state' 2>/dev/null || echo "PENDING")
-    CI_CONCLUSION=$(gh pr checks "$PR_NUMBER" --json state,conclusion -q '.[].conclusion' 2>/dev/null || echo "")
+    # gh 2.79 只認 `state`,不認 `conclusion`:問錯欄位整個查詢會失敗,
+    # CI_CONCLUSION 因此永遠是空字串,迴圈永遠走不到合併那一步。
+    # `|| true` 讓將來欄位再改名時是停下來報錯,不是靜靜地不合併。
+    CI_RESULTS=$(gh pr checks "$PR_NUMBER" --json state --jq '.[].state' 2>/dev/null || true)
 
-    echo -e "[${TIMESTAMP}] 檢查 #${ATTEMPT} - CI 狀態: ${CI_STATUS}"
+    echo -e "[${TIMESTAMP}] 檢查 #${ATTEMPT} - CI 狀態: $(echo "$CI_RESULTS" | sort | uniq -c | tr '\n' ' ')"
 
-    # 檢查是否全部成功
+    # 一次把每個 check 分成三類:已完成且沒問題、還在跑、已完成但不是成功。
+    # 只列還在跑的狀態,其餘終局狀態一律當失敗,就不必窮舉 gh 的失敗名稱。
     ALL_SUCCESS=true
-    if [ -n "$CI_CONCLUSION" ]; then
-        while IFS= read -r conclusion; do
-            if [ "$conclusion" != "SUCCESS" ] && [ "$conclusion" != "SKIPPED" ]; then
-                ALL_SUCCESS=false
-                break
-            fi
-        done <<< "$(gh pr checks "$PR_NUMBER" --json conclusion -q '.[].conclusion')"
+    CI_FAILED=false
+    if [ -n "$CI_RESULTS" ]; then
+        while IFS= read -r state; do
+            case "$state" in
+                SUCCESS | SKIPPED | NEUTRAL) ;;
+                PENDING | QUEUED | IN_PROGRESS | EXPECTED | WAITING | REQUESTED)
+                    ALL_SUCCESS=false
+                    ;;
+                *)
+                    ALL_SUCCESS=false
+                    CI_FAILED=true
+                    break
+                    ;;
+            esac
+        done <<< "$CI_RESULTS"
     else
         ALL_SUCCESS=false
     fi
@@ -86,13 +97,32 @@ while true; do
             echo -e "${YELLOW}正在合併...${NC}"
 
             # 執行合併
-            if gh pr merge "$PR_NUMBER" --squash --delete-branch; then
-                echo -e "\n${GREEN}🎉 PR #${PR_NUMBER} 已成功合併!${NC}\n"
-                exit 0
-            else
+            if ! gh pr merge "$PR_NUMBER" --squash; then
                 echo -e "\n${RED}❌ 合併失敗${NC}"
                 exit 1
             fi
+            echo -e "\n${GREEN}🎉 PR #${PR_NUMBER} 已成功合併!${NC}"
+
+            # 刪分支是善後,不算合併結果的一部分。單一句
+            # `gh pr merge --delete-branch` 在本機分支被 worktree 佔住時
+            # 會讓整條指令失敗,曾把已經合併的 PR 誤報成合併失敗。
+            # 現在兩邊各自回報,刪不掉只警告。
+            HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName -q .headRefName)
+            if gh api --silent -X DELETE "repos/{owner}/{repo}/git/refs/heads/${HEAD_BRANCH}" 2>/dev/null; then
+                echo -e "${GREEN}✓ 已刪除遠端分支 ${HEAD_BRANCH}${NC}"
+            else
+                echo -e "${YELLOW}⚠ 遠端分支 ${HEAD_BRANCH} 未刪除,請手動確認${NC}"
+            fi
+
+            # 用 -D 不用 -d:squash merge 之後 git 看這條分支永遠是未合併,
+            # 而上面的 PR 狀態已經證明它合併了。
+            if git branch -D "$HEAD_BRANCH" 2>/dev/null; then
+                echo -e "${GREEN}✓ 已刪除本地分支 ${HEAD_BRANCH}${NC}"
+            else
+                echo -e "${YELLOW}⚠ 本地分支 ${HEAD_BRANCH} 未刪除(不存在,或被 worktree 佔用)${NC}"
+            fi
+            echo
+            exit 0
         else
             echo -e "${RED}✗ PR 無法合併 (mergeable=${MERGEABLE})${NC}"
             echo -e "${YELLOW}可能有衝突需要解決${NC}"
@@ -101,7 +131,7 @@ while true; do
     fi
 
     # 檢查是否有失敗
-    if echo "$CI_CONCLUSION" | grep -q "FAILURE"; then
+    if [ "$CI_FAILED" = true ]; then
         echo -e "\n${RED}❌ CI 檢查失敗!${NC}"
         echo -e "${YELLOW}請檢查失敗原因:${NC}"
         gh pr checks "$PR_NUMBER"
